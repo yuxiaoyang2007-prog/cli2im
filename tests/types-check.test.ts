@@ -10,7 +10,9 @@ import type {
 
 describe('Type definitions', () => {
   it('AgentEvent discriminated union', () => {
-    const event: AgentEvent = { type: 'text', content: 'hello' };
+    const event: AgentEvent = Math.random() > 0.5
+      ? { type: 'text', content: 'hello' }
+      : { type: 'tool_use', id: 'tu_1', name: 'Bash', input: {} };
     if (event.type === 'text') {
       expectTypeOf(event.content).toBeString();
     }
