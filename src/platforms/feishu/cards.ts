@@ -23,6 +23,7 @@ interface ThrottleConfig {
 export class StreamingCardController {
   private adapter: FeishuAdapter;
   private cards = new Map<string, StreamingCardState>();
+  private showThinkingBySession = new Map<string, boolean>();
   private throttle: ThrottleConfig;
 
   constructor(
@@ -80,6 +81,10 @@ export class StreamingCardController {
         this.scheduleUpdate(sessionKey);
         break;
 
+      case 'status':
+        // Metadata only. Status events must not finalize the streaming card.
+        break;
+
       case 'result':
         void this.finalizeCard(sessionKey, 'completed');
         break;
@@ -93,6 +98,15 @@ export class StreamingCardController {
 
   interruptCard(sessionKey: string): void {
     void this.finalizeCard(sessionKey, 'interrupted');
+  }
+
+  isThinkingVisible(sessionKey: string): boolean {
+    return this.showThinkingBySession.get(sessionKey) ?? true;
+  }
+
+  setThinkingVisible(sessionKey: string, visible: boolean): void {
+    this.showThinkingBySession.set(sessionKey, visible);
+    void this.flushUpdate(sessionKey);
   }
 
   private scheduleUpdate(sessionKey: string): void {
@@ -116,7 +130,7 @@ export class StreamingCardController {
     const card = this.cards.get(sessionKey);
     if (!card || card.finalized || !card.messageId) return;
 
-    const display = this.buildDisplayContent(card);
+    const display = this.buildDisplayContent(sessionKey, card);
     card.updateSeq++;
     card.lastUpdateAt = Date.now();
     card.lastUpdateLength = card.content.length;
@@ -146,7 +160,7 @@ export class StreamingCardController {
       status === 'completed' ? 'Completed' : status === 'error' ? 'Error' : 'Interrupted';
 
     const footer = `\n\n---\n${statusText} · ${this.formatDuration(elapsed)}`;
-    const display = this.buildDisplayContent(card) + footer;
+    const display = this.buildDisplayContent(sessionKey, card) + footer;
 
     if (card.messageId) {
       try {
@@ -159,10 +173,10 @@ export class StreamingCardController {
     this.cards.delete(sessionKey);
   }
 
-  private buildDisplayContent(card: StreamingCardState): string {
+  private buildDisplayContent(sessionKey: string, card: StreamingCardState): string {
     const parts: string[] = [];
 
-    if (card.thinking) {
+    if (card.thinking && this.isThinkingVisible(sessionKey)) {
       parts.push('*Thinking...*');
     }
 

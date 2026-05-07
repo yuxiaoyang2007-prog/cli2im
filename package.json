@@ -11,6 +11,7 @@
   },
   "dependencies": {
     "@larksuiteoapi/node-sdk": "^1.60.0",
+    "content-guard": "file:../content-guard",
     "sql.js": "^1.11.0",
     "yaml": "^2.6.0"
   },
@@ -20,5 +21,8 @@
     "tsx": "^4.19.0",
     "typescript": "^5.7.0",
     "vitest": "^3.0.0"
+  },
+  "optionalDependencies": {
+    "@openai/codex-sdk": "^0.128.0"
   }
 }

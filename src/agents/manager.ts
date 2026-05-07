@@ -8,6 +8,7 @@ import type {
   UserMessage,
 } from '../types.js';
 import { ToolGate } from './tool-gate.js';
+import { scanToolResult } from '../security/content-guard.js';
 import type { Transform } from 'node:stream';
 
 const PERMISSION_TIMEOUT_MS = 60_000;
@@ -24,6 +25,7 @@ export class AgentManager {
   private plugins = new Map<string, AgentPlugin>();
   private processes = new Map<SessionKey, AgentProcess>();
   private parsers = new Map<SessionKey, Transform>();
+  private sessionAgentMap = new Map<SessionKey, string>();
   private pendingPermissions = new Map<string, PendingPermission>();
   private toolGate: ToolGate;
 
@@ -54,12 +56,15 @@ export class AgentManager {
 
     const proc = plugin.spawn(opts);
     this.processes.set(sessionKey, proc);
+    this.sessionAgentMap.set(sessionKey, agentName);
 
-    this.setupOutputStream(sessionKey, plugin, proc, handlers);
+    const disposeOutput = this.setupOutputStream(sessionKey, plugin, proc, opts, handlers);
 
     proc.on('exit', (code) => {
+      disposeOutput();
       this.processes.delete(sessionKey);
       this.parsers.delete(sessionKey);
+      this.sessionAgentMap.delete(sessionKey);
       handlers.onProcessExit(sessionKey, code);
     });
 
@@ -78,12 +83,15 @@ export class AgentManager {
 
     const proc = plugin.resume(sessionId, opts);
     this.processes.set(sessionKey, proc);
+    this.sessionAgentMap.set(sessionKey, agentName);
 
-    this.setupOutputStream(sessionKey, plugin, proc, handlers);
+    const disposeOutput = this.setupOutputStream(sessionKey, plugin, proc, opts, handlers);
 
     proc.on('exit', (code) => {
+      disposeOutput();
       this.processes.delete(sessionKey);
       this.parsers.delete(sessionKey);
+      this.sessionAgentMap.delete(sessionKey);
       handlers.onProcessExit(sessionKey, code);
     });
 
@@ -107,10 +115,24 @@ export class AgentManager {
     this.pendingPermissions.delete(requestId);
 
     const proc = this.processes.get(pending.sessionKey);
-    const agentName = pending.sessionKey.split(':')[2];
-    const plugin = this.plugins.get(agentName);
+    const plugin = this.plugins.get(pending.agentName);
     if (proc && plugin) {
       proc.stdin.write(plugin.formatPermissionResponse(requestId, 'allow'));
+    }
+    return true;
+  }
+
+  denyPermission(requestId: string): boolean {
+    const pending = this.pendingPermissions.get(requestId);
+    if (!pending) return false;
+
+    clearTimeout(pending.timer);
+    this.pendingPermissions.delete(requestId);
+
+    const proc = this.processes.get(pending.sessionKey);
+    const plugin = this.plugins.get(pending.agentName);
+    if (proc && plugin) {
+      proc.stdin.write(plugin.formatPermissionResponse(requestId, 'deny'));
     }
     return true;
   }
@@ -126,8 +148,8 @@ export class AgentManager {
     const proc = this.processes.get(sessionKey);
     if (!proc) return;
 
-    const agentName = sessionKey.split(':')[2];
-    const plugin = this.plugins.get(agentName);
+    const agentName = this.sessionAgentMap.get(sessionKey);
+    const plugin = agentName ? this.plugins.get(agentName) : undefined;
 
     if (plugin?.capabilities.gracefulCancel && plugin.formatCancelMessage) {
       proc.stdin.write(plugin.formatCancelMessage());
@@ -170,19 +192,61 @@ export class AgentManager {
     return this.processes.get(sessionKey);
   }
 
+  setupWatchdog(
+    sessionKey: SessionKey,
+    turnTimeoutMs?: number,
+    idleTimeoutMs?: number,
+  ): { markActivity: () => void; dispose: () => void } {
+    let disposed = false;
+    let idleTimer: ReturnType<typeof setTimeout> | undefined;
+
+    const expire = () => {
+      if (disposed) return;
+      this.killAgent(sessionKey);
+    };
+
+    const turnTimer = turnTimeoutMs ? setTimeout(expire, turnTimeoutMs) : undefined;
+    const markActivity = () => {
+      if (!idleTimeoutMs || disposed) return;
+      if (idleTimer) clearTimeout(idleTimer);
+      idleTimer = setTimeout(expire, idleTimeoutMs);
+    };
+
+    return {
+      markActivity,
+      dispose: () => {
+        disposed = true;
+        if (turnTimer) clearTimeout(turnTimer);
+        if (idleTimer) clearTimeout(idleTimer);
+      },
+    };
+  }
+
   private setupOutputStream(
     sessionKey: SessionKey,
     plugin: AgentPlugin,
     proc: AgentProcess,
+    opts: SpawnOpts,
     handlers: AgentManagerEvents,
-  ): void {
+  ): () => void {
     const parser = plugin.createStdoutParser();
+    const watchdog = this.setupWatchdog(sessionKey, opts.turnTimeoutMs, opts.idleTimeoutMs);
     this.parsers.set(sessionKey, parser);
 
+    const markRawActivity = () => watchdog.markActivity();
+    proc.stdout.on('data', markRawActivity);
     proc.stdout.pipe(parser);
 
     parser.on('data', (event: AgentEvent) => {
+      watchdog.markActivity();
+
       if (event.type === 'permission_request') {
+        if (opts.autoApprove) {
+          proc.stdin.write(plugin.formatPermissionResponse(event.id, 'allow'));
+          handlers.onEvent(sessionKey, event);
+          return;
+        }
+
         const gateResult = this.toolGate.check(event.tool, event.input);
 
         if (gateResult.action === 'block') {
@@ -198,6 +262,7 @@ export class AgentManager {
             command: gateResult.command ?? '',
             chatId: sessionKey.split(':')[1],
             sessionKey,
+            agentName: plugin.name,
             timer,
             createdAt: Date.now(),
           });
@@ -214,7 +279,18 @@ export class AgentManager {
         proc.sessionId = event.sessionId;
       }
 
+      if (event.type === 'tool_result') {
+        event.output = scanToolResult(event.name, event.output);
+      }
+
       handlers.onEvent(sessionKey, event);
     });
+
+    return () => {
+      watchdog.dispose();
+      proc.stdout.off('data', markRawActivity);
+      proc.stdout.unpipe(parser);
+      parser.removeAllListeners();
+    };
   }
 }

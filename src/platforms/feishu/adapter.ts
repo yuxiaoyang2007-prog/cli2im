@@ -1,4 +1,6 @@
 import * as lark from '@larksuiteoapi/node-sdk';
+import { extname } from 'node:path';
+import type { Readable } from 'node:stream';
 import type {
   PlatformAdapter,
   InboundMessage,
@@ -22,6 +24,7 @@ export class FeishuAdapter implements PlatformAdapter {
   private callbackHandler?: (cb: CallbackQuery) => void;
   private config: FeishuAdapterConfig;
   private processedMessageIds = new Set<string>();
+  private botOpenId?: string;
 
   constructor(config: FeishuAdapterConfig) {
     this.config = config;
@@ -39,6 +42,8 @@ export class FeishuAdapter implements PlatformAdapter {
   }
 
   async connect(): Promise<void> {
+    await this.resolveBotIdentity();
+
     const eventDispatcher = new lark.EventDispatcher({}).register({
       'im.message.receive_v1': (data: unknown) => this.handleMessage(data),
     });
@@ -99,6 +104,29 @@ export class FeishuAdapter implements PlatformAdapter {
     const { createReadStream } = await import('node:fs');
     const stream = createReadStream(file.path);
 
+    if (isImageFile(file.name || file.path)) {
+      const uploadResp = await this.client.im.image.create({
+        data: {
+          image_type: 'message',
+          image: stream,
+        },
+      });
+
+      const imageKey = readNestedString(uploadResp, ['image_key'])
+        ?? readNestedString(uploadResp, ['data', 'image_key']);
+      if (!imageKey) return;
+
+      await this.client.im.message.create({
+        params: { receive_id_type: 'chat_id' },
+        data: {
+          receive_id: chatId,
+          msg_type: 'image',
+          content: JSON.stringify({ image_key: imageKey }),
+        },
+      });
+      return;
+    }
+
     const uploadResp = await this.client.im.file.create({
       data: {
         file_type: 'stream',
@@ -107,7 +135,8 @@ export class FeishuAdapter implements PlatformAdapter {
       },
     });
 
-    const fileKey = uploadResp?.file_key;
+    const fileKey = readNestedString(uploadResp, ['file_key'])
+      ?? readNestedString(uploadResp, ['data', 'file_key']);
     if (!fileKey) return;
 
     await this.client.im.message.create({
@@ -118,6 +147,15 @@ export class FeishuAdapter implements PlatformAdapter {
         content: JSON.stringify({ file_key: fileKey }),
       },
     });
+  }
+
+  async downloadFile(messageId: string, fileKey: string, type: string): Promise<Buffer> {
+    const resp = await this.client.im.messageResource.get({
+      path: { message_id: messageId, file_key: fileKey },
+      params: { type },
+    });
+    const readable = await getReadableStreamFromResponse(resp);
+    return streamToBuffer(readable);
   }
 
   async sendCard(chatId: string, card: CardPayload): Promise<string> {
@@ -146,6 +184,61 @@ export class FeishuAdapter implements PlatformAdapter {
     return this.client;
   }
 
+  getBotOpenId(): string | undefined {
+    return this.botOpenId;
+  }
+
+  private async resolveBotIdentity(): Promise<void> {
+    try {
+      const tokenResp = await fetch(
+        'https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal',
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json; charset=utf-8' },
+          body: JSON.stringify({
+            app_id: this.config.appId,
+            app_secret: this.config.appSecret,
+          }),
+          signal: AbortSignal.timeout(10_000),
+        },
+      );
+      const tokenBody = await readJsonResponse(tokenResp);
+      if (!tokenResp.ok) {
+        throw new Error(`Failed to resolve Feishu tenant token: ${formatFeishuError(tokenBody)}`);
+      }
+
+      const tenantAccessToken = readNestedString(tokenBody, ['tenant_access_token']);
+      if (!tenantAccessToken) {
+        throw new Error(`Feishu tenant token response missing tenant_access_token: ${formatFeishuError(tokenBody)}`);
+      }
+
+      const botResp = await fetch('https://open.feishu.cn/open-apis/bot/v3/info/', {
+        headers: { Authorization: `Bearer ${tenantAccessToken}` },
+        signal: AbortSignal.timeout(10_000),
+      });
+      const botBody = await readJsonResponse(botResp);
+      if (!botResp.ok) {
+        throw new Error(`Failed to resolve Feishu bot identity: ${formatFeishuError(botBody)}`);
+      }
+
+      const openId = readNestedString(botBody, ['bot', 'open_id'])
+        ?? readNestedString(botBody, ['data', 'bot', 'open_id'])
+        ?? readNestedString(botBody, ['data', 'open_id'])
+        ?? readNestedString(botBody, ['open_id']);
+      if (!openId) {
+        throw new Error(`Feishu bot info response missing open_id: ${formatFeishuError(botBody)}`);
+      }
+
+      this.botOpenId = openId;
+    } catch (err) {
+      this.botOpenId = undefined;
+      console.warn(
+        `[cli2im] Failed to resolve Feishu bot identity: bot=${this.config.botName}`,
+        err,
+      );
+    }
+  }
+
   private handleMessage(data: unknown): void {
     if (!this.messageHandler) return;
 
@@ -167,12 +260,33 @@ export class FeishuAdapter implements PlatformAdapter {
     if (sender?.sender_type === 'app') return;
 
     let text = '';
+    const attachments = [];
     if (message.message_type === 'text') {
       try {
         const content = JSON.parse(message.content ?? '{}');
         text = content.text ?? '';
       } catch {
         text = message.content ?? '';
+      }
+    } else if (message.message_type === 'image') {
+      const content = parseMessageContent(message.content);
+      if (typeof content.image_key === 'string') {
+        attachments.push({
+          type: 'image' as const,
+          fileKey: content.image_key,
+          messageId: message.message_id,
+          mimeType: 'image/png',
+        });
+      }
+    } else if (message.message_type === 'file') {
+      const content = parseMessageContent(message.content);
+      if (typeof content.file_key === 'string') {
+        attachments.push({
+          type: 'file' as const,
+          fileKey: content.file_key,
+          messageId: message.message_id,
+          fileName: typeof content.file_name === 'string' ? content.file_name : undefined,
+        });
       }
     }
 
@@ -188,6 +302,8 @@ export class FeishuAdapter implements PlatformAdapter {
       userId: sender?.sender_id?.open_id ?? '',
       userName: sender?.sender_id?.open_id,
       text,
+      chatType: message.chat_type,
+      attachments: attachments.length > 0 ? attachments : undefined,
       mentions,
       raw: data,
     });
@@ -262,6 +378,7 @@ interface FeishuMessageEvent {
   message?: {
     message_id?: string;
     chat_id: string;
+    chat_type?: string;
     message_type?: string;
     content?: string;
     mentions?: FeishuMention[];
@@ -271,4 +388,65 @@ interface FeishuMessageEvent {
 function unwrapEvent(data: unknown): FeishuMessageEvent {
   const root = data as { event?: FeishuMessageEvent };
   return root.event ?? (data as FeishuMessageEvent);
+}
+
+function parseMessageContent(raw: string | undefined): Record<string, unknown> {
+  try {
+    const parsed = JSON.parse(raw ?? '{}');
+    return parsed && typeof parsed === 'object' ? parsed as Record<string, unknown> : {};
+  } catch {
+    return {};
+  }
+}
+
+function isImageFile(pathOrName: string): boolean {
+  return ['.png', '.jpg', '.jpeg', '.gif', '.webp'].includes(extname(pathOrName).toLowerCase());
+}
+
+function readNestedString(obj: unknown, path: string[]): string | undefined {
+  let current: unknown = obj;
+  for (const key of path) {
+    if (!current || typeof current !== 'object') return undefined;
+    current = (current as Record<string, unknown>)[key];
+  }
+  return typeof current === 'string' ? current : undefined;
+}
+
+async function readJsonResponse(resp: Response): Promise<unknown> {
+  try {
+    return await resp.json();
+  } catch {
+    return {};
+  }
+}
+
+function formatFeishuError(body: unknown): string {
+  if (!body || typeof body !== 'object') return String(body);
+  const code = (body as Record<string, unknown>).code;
+  const msg = (body as Record<string, unknown>).msg;
+  return JSON.stringify({ code, msg });
+}
+
+async function getReadableStreamFromResponse(resp: unknown): Promise<Readable> {
+  const direct = resp as { getReadableStream?: () => Readable | Promise<Readable> };
+  if (typeof direct.getReadableStream === 'function') {
+    return direct.getReadableStream();
+  }
+
+  const data = (resp as { data?: unknown })?.data as
+    | { getReadableStream?: () => Readable | Promise<Readable> }
+    | undefined;
+  if (typeof data?.getReadableStream === 'function') {
+    return data.getReadableStream();
+  }
+
+  throw new Error('Feishu messageResource.get response missing getReadableStream()');
+}
+
+async function streamToBuffer(stream: Readable): Promise<Buffer> {
+  const chunks: Buffer[] = [];
+  for await (const chunk of stream) {
+    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+  }
+  return Buffer.concat(chunks);
 }

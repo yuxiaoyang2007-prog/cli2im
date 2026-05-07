@@ -4,11 +4,18 @@ import { ChatQueue } from './session/queue.js';
 import { AgentManager, type AgentManagerEvents } from './agents/manager.js';
 import { ToolGate } from './agents/tool-gate.js';
 import { ClaudeCodePlugin } from './agents/claude-code.js';
+import { CodexPlugin } from './agents/codex.js';
 import { FeishuAdapter } from './platforms/feishu/adapter.js';
+import { TelegramAdapter } from './platforms/telegram/adapter.js';
 import { StreamingCardController } from './platforms/feishu/cards.js';
 import { HandoffService } from './services/handoff.js';
 import { HttpServer } from './services/server.js';
-import { InboundPipeline } from './pipeline.js';
+import {
+  InboundPipeline,
+  buildSenderHeader,
+  buildSenderEnv,
+  getGroupMessageSkipReason,
+} from './pipeline.js';
 import {
   buildPermissionBlockedCard,
   buildHandoffNotification,
@@ -16,23 +23,37 @@ import {
   buildCrashNotification,
 } from './platforms/feishu/markdown.js';
 import { validateWorkingDirectory } from './security/validators.js';
-import type { SessionKey, InboundMessage } from './types.js';
+import {
+  buildUserMessageForAgent,
+  downloadInboundAttachments,
+} from './media.js';
+import { initContentGuard } from './security/content-guard.js';
+import { handlePermissionCallback } from './runtime/callbacks.js';
+import type { SessionKey, InboundMessage, PlatformAdapter, BotConfig } from './types.js';
 import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { basename, join } from 'node:path';
 import { mkdirSync } from 'node:fs';
 
 const CONFIG_PATH = process.env.CLI2IM_CONFIG ?? join(homedir(), '.cli2im', 'config.yaml');
 const startedAt = Date.now();
+
+interface RuntimeCommandState {
+  fastModeBySession: Map<SessionKey, boolean>;
+}
 
 async function main(): Promise<void> {
   console.log('[cli2im] Starting...');
 
   const config = loadConfig(CONFIG_PATH);
   console.log(`[cli2im] Loaded config with ${Object.keys(config.bots).length} bot(s)`);
+  if (config.contentGuard?.enabled !== false) {
+    initContentGuard({ blockThreshold: config.contentGuard?.blockThreshold });
+  }
 
   const dataDir = join(homedir(), '.cli2im');
+  const mediaDir = join(dataDir, 'media');
   mkdirSync(dataDir, { recursive: true });
-  mkdirSync(join(dataDir, 'media'), { recursive: true });
+  mkdirSync(mediaDir, { recursive: true });
   mkdirSync(join(dataDir, 'logs'), { recursive: true });
 
   const store = await SessionStore.create(config.session.dbPath.replace('~', homedir()));
@@ -43,11 +64,16 @@ async function main(): Promise<void> {
   for (const [name, agentConfig] of Object.entries(config.agents)) {
     if (name === 'claude-code') {
       agentManager.registerPlugin(new ClaudeCodePlugin(agentConfig.binary));
+    } else if (name === 'codex') {
+      agentManager.registerPlugin(new CodexPlugin(agentConfig.binary));
     }
   }
 
-  const adapters = new Map<string, FeishuAdapter>();
+  const adapters = new Map<string, PlatformAdapter>();
   const cardControllers = new Map<string, StreamingCardController>();
+  const runtimeState: RuntimeCommandState = {
+    fastModeBySession: new Map(),
+  };
 
   for (const [botName, botConfig] of Object.entries(config.bots)) {
     if (botConfig.platform === 'feishu' && botConfig.feishu) {
@@ -63,6 +89,12 @@ async function main(): Promise<void> {
         minDeltaChars: config.streaming.minDeltaChars,
       });
       cardControllers.set(botName, cardController);
+    } else if (botConfig.platform === 'telegram' && botConfig.telegram) {
+      const adapter = new TelegramAdapter({
+        token: botConfig.telegram.token,
+        botName,
+      });
+      adapters.set(botName, adapter);
     }
   }
 
@@ -97,17 +129,53 @@ async function main(): Promise<void> {
       onEvent: async (_sk, event) => {
         cardController?.handleEvent(sessionKey, event);
 
+        if (!cardController && adapter) {
+          if (event.type === 'text' && event.content.trim()) {
+            await adapter.send(chatId, { text: event.content });
+          } else if (event.type === 'error') {
+            await adapter.send(chatId, { text: `Error: ${event.message}` });
+          }
+        }
+
         if (event.type === 'result' && event.sessionId) {
           const session = await store.getByKey(sessionKey);
           if (session) {
             await store.updateAgentSessionId(session.id, event.sessionId);
           }
         }
+
+        if (event.type === 'file' && adapter?.sendFile) {
+          await adapter.sendFile(chatId, {
+            path: event.path,
+            name: basename(event.path),
+            mimeType: event.mimeType,
+          });
+        }
+
+        if (event.type === 'result' && event.createdFiles?.length && adapter?.sendFile) {
+          for (const path of event.createdFiles) {
+            await adapter.sendFile(chatId, {
+              path,
+              name: basename(path),
+            });
+          }
+        }
       },
       onToolBlocked: async (_sk, command, requestId) => {
         if (adapter) {
           const content = buildPermissionBlockedCard(command, requestId);
-          await adapter.send(chatId, { text: content });
+          await adapter.send(chatId, {
+            card: {
+              type: 'permission',
+              title: '权限审批',
+              content,
+              buttons: [
+                { text: '允许一次', value: `perm:allow:${requestId}`, type: 'primary' },
+                { text: '本会话允许', value: `perm:allow_session:${requestId}`, type: 'primary' },
+                { text: '拒绝', value: `perm:deny:${requestId}`, type: 'danger' },
+              ],
+            },
+          });
         }
       },
       onPermissionTimeout: async () => {
@@ -126,87 +194,140 @@ async function main(): Promise<void> {
 
   for (const [botName, adapter] of adapters) {
     const botConfig = config.bots[botName];
+    const processMessage = createMessageProcessor(botName, botConfig, adapter);
 
     adapter.onMessage((msg: InboundMessage) => {
-      const processMessage = async () => {
-        const ctx = pipeline.process(msg, botName);
-        if ('rejected' in ctx) {
-          console.log(`[pipeline] Rejected: ${ctx.reason}`);
-          return;
-        }
-
-        if (ctx.bridgeCommand) {
-          await handleBridgeCommand(
-            ctx.bridgeCommand,
-            ctx.sessionKey,
-            botName,
-            msg.chatId,
-            adapter,
-            store,
-            agentManager,
-            handoffService,
-            cardControllers.get(botName)!,
-          );
-          return;
-        }
-
-        const sessionKey = ctx.sessionKey;
-        const session = await store.getOrCreate(sessionKey, {
-          agentName: botConfig.agent,
-          workingDirectory: botConfig.workingDirectory.replace('~', homedir()),
-        });
-
-        await store.touch(session.id);
-
-        if (config.newMessageBehavior === 'interrupt' && agentManager.hasProcess(sessionKey)) {
-          agentManager.cancelAgent(sessionKey);
-          cardControllers.get(botName)?.interruptCard(sessionKey);
-        }
-
-        const cardController = cardControllers.get(botName);
-        await cardController?.startCard(msg.chatId, sessionKey, botConfig.agent);
-
-        if (!agentManager.hasProcess(sessionKey)) {
-          const handlers = createEventHandlers(sessionKey);
-
-          if (session.agentSessionId) {
-            agentManager.resumeAgent(
-              sessionKey,
-              botConfig.agent,
-              session.agentSessionId,
-              {
-                workingDirectory: session.workingDirectory,
-                permissionMode: botConfig.permissionMode,
-                env: config.agents[botConfig.agent]?.env,
-                model: config.agents[botConfig.agent]?.defaultModel,
-              },
-              handlers,
-            );
-          } else {
-            agentManager.spawnAgent(
-              sessionKey,
-              botConfig.agent,
-              {
-                workingDirectory: session.workingDirectory,
-                permissionMode: botConfig.permissionMode,
-                env: config.agents[botConfig.agent]?.env,
-                model: config.agents[botConfig.agent]?.defaultModel,
-              },
-              handlers,
-            );
-          }
-        }
-
-        agentManager.sendMessage(sessionKey, botConfig.agent, {
-          role: 'user',
-          content: msg.text,
-        });
-      };
-
-      void queue.enqueue(msg.chatId, processMessage).catch((err) => {
+      void queue.enqueue(msg.chatId, () => processMessage(msg)).catch((err) => {
         console.error('[pipeline] Message processing failed:', err);
       });
     });
+
+    adapter.onCallback?.((callback) => {
+      const accepted = handlePermissionCallback(callback, agentManager);
+      if (!accepted) {
+        console.log(`[pipeline] Ignored callback: ${callback.data}`);
+      }
+    });
+  }
+
+  function createMessageProcessor(
+    botName: string,
+    botConfig: BotConfig,
+    adapter: PlatformAdapter,
+  ): (msg: InboundMessage) => Promise<void> {
+    return async (msg) => {
+      const groupSkipReason = getGroupMessageSkipReason(
+        msg,
+        botConfig,
+        getAdapterBotOpenId(adapter),
+      );
+      if (groupSkipReason) {
+        console.log(`[pipeline] Rejected: ${groupSkipReason}`);
+        return;
+      }
+
+      const ctx = pipeline.process(msg, botName);
+      if ('rejected' in ctx) {
+        console.log(`[pipeline] Rejected: ${ctx.reason}`);
+        return;
+      }
+
+      if (ctx.bridgeCommand) {
+        await handleBridgeCommand(
+          ctx.bridgeCommand,
+          ctx.sessionKey,
+          botName,
+          msg.chatId,
+          adapter,
+          store,
+          agentManager,
+          handoffService,
+          cardControllers.get(botName),
+          runtimeState,
+        );
+        return;
+      }
+
+      const sessionKey = ctx.sessionKey;
+      const workingDirectory = (
+        botConfig.userOverrides?.[msg.userId]?.workingDirectory
+        ?? botConfig.workingDirectory
+      ).replace('~', homedir());
+      const session = await store.getOrCreate(sessionKey, {
+        agentName: botConfig.agent,
+        workingDirectory,
+      });
+
+      await store.touch(session.id);
+
+      if (config.newMessageBehavior === 'interrupt' && agentManager.hasProcess(sessionKey)) {
+        agentManager.cancelAgent(sessionKey);
+        cardControllers.get(botName)?.interruptCard(sessionKey);
+      }
+
+      const sender = { channel: msg.platform, userId: msg.userId, userName: msg.userName };
+
+      const cardController = cardControllers.get(botName);
+      await cardController?.startCard(msg.chatId, sessionKey, botConfig.agent);
+
+      if (!agentManager.hasProcess(sessionKey)) {
+        const handlers = createEventHandlers(sessionKey);
+
+        const senderEnv = buildSenderEnv(sender);
+        const larkCliEnv: Record<string, string> = botConfig.larkCliConfigDir
+          ? { LARKSUITE_CLI_CONFIG_DIR: botConfig.larkCliConfigDir }
+          : {};
+        const spawnEnv = { ...config.agents[botConfig.agent]?.env, ...senderEnv, ...larkCliEnv };
+
+        if (session.agentSessionId) {
+          agentManager.resumeAgent(
+            sessionKey,
+            botConfig.agent,
+            session.agentSessionId,
+            {
+              workingDirectory: session.workingDirectory,
+              permissionMode: botConfig.permissionMode,
+              env: spawnEnv,
+              model: config.agents[botConfig.agent]?.defaultModel,
+              autoApprove: botConfig.autoApprove,
+              turnTimeoutMs: botConfig.turnTimeoutMs,
+              idleTimeoutMs: botConfig.idleTimeoutMs,
+              sandboxMode: botConfig.sandboxMode,
+              reasoningEffort: runtimeState.fastModeBySession.get(sessionKey) ? 'low' : undefined,
+            },
+            handlers,
+          );
+        } else {
+          agentManager.spawnAgent(
+            sessionKey,
+            botConfig.agent,
+            {
+              workingDirectory: session.workingDirectory,
+              permissionMode: botConfig.permissionMode,
+              env: spawnEnv,
+              model: config.agents[botConfig.agent]?.defaultModel,
+              autoApprove: botConfig.autoApprove,
+              turnTimeoutMs: botConfig.turnTimeoutMs,
+              idleTimeoutMs: botConfig.idleTimeoutMs,
+              sandboxMode: botConfig.sandboxMode,
+              reasoningEffort: runtimeState.fastModeBySession.get(sessionKey) ? 'low' : undefined,
+            },
+            handlers,
+          );
+        }
+      }
+
+      const senderHeader = buildSenderHeader(sender);
+      const messageText = senderHeader + msg.text;
+      await downloadInboundAttachments(msg, adapter, mediaDir);
+      const userMessage = await buildUserMessageForAgent(
+        botConfig.agent,
+        messageText,
+        msg.attachments,
+      );
+
+      agentManager.sendMessage(sessionKey, botConfig.agent, userMessage);
+    };
   }
 
   const httpServer = new HttpServer(config.server.token, {
@@ -227,7 +348,7 @@ async function main(): Promise<void> {
   for (const [botName, adapter] of adapters) {
     try {
       await adapter.connect();
-      console.log(`[cli2im] Bot "${botName}" connected to Feishu`);
+      console.log(`[cli2im] Bot "${botName}" connected to ${adapter.name}`);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       console.error(`[cli2im] Failed to connect bot "${botName}": ${message}`);
@@ -255,11 +376,12 @@ async function handleBridgeCommand(
   sessionKey: SessionKey,
   botName: string,
   chatId: string,
-  adapter: FeishuAdapter,
+  adapter: PlatformAdapter,
   store: SessionStore,
   agentManager: AgentManager,
   handoffService: HandoffService,
-  cardController: StreamingCardController,
+  cardController: StreamingCardController | undefined,
+  runtimeState: RuntimeCommandState,
 ): Promise<void> {
   switch (cmd.command) {
     case 'new': {
@@ -285,16 +407,44 @@ async function handleBridgeCommand(
       break;
     }
 
+    case 'thinking': {
+      if (!cardController) {
+        await adapter.send(chatId, { text: '当前平台不支持思考卡片显示切换' });
+        break;
+      }
+      const nextVisible = !cardController.isThinkingVisible(sessionKey);
+      cardController.setThinkingVisible(sessionKey, nextVisible);
+      await adapter.send(chatId, {
+        text: nextVisible ? '思考显示已开启' : '思考显示已关闭',
+      });
+      break;
+    }
+
+    case 'fast': {
+      const nextFastMode = !(runtimeState.fastModeBySession.get(sessionKey) ?? false);
+      if (nextFastMode) {
+        runtimeState.fastModeBySession.set(sessionKey, true);
+      } else {
+        runtimeState.fastModeBySession.delete(sessionKey);
+      }
+
+      const suffix = agentManager.hasProcess(sessionKey) ? '，下次进程启动生效' : '';
+      await adapter.send(chatId, {
+        text: nextFastMode ? `快速模式已开启${suffix}` : `快速模式已关闭${suffix}`,
+      });
+      break;
+    }
+
     case 'stop': {
       agentManager.cancelAgent(sessionKey);
-      cardController.interruptCard(sessionKey);
+      cardController?.interruptCard(sessionKey);
       await adapter.send(chatId, { text: '已发送中断信号' });
       break;
     }
 
     case 'kill': {
       agentManager.killAgent(sessionKey);
-      cardController.interruptCard(sessionKey);
+      cardController?.interruptCard(sessionKey);
       await adapter.send(chatId, { text: '已强制终止进程' });
       break;
     }
@@ -358,6 +508,29 @@ async function handleBridgeCommand(
       break;
     }
 
+    case 'perm': {
+      const [decision, requestId] = cmd.args;
+      if (!decision || !requestId || !['allow', 'allow_session', 'deny'].includes(decision)) {
+        await adapter.send(chatId, { text: '用法: /perm allow|allow_session|deny <requestId>' });
+        break;
+      }
+
+      const accepted = decision === 'deny'
+        ? agentManager.denyPermission(requestId)
+        : agentManager.approvePermission(requestId);
+      if (!accepted) {
+        await adapter.send(chatId, { text: `审批失败或已过期: \`${requestId}\`` });
+        break;
+      }
+
+      await adapter.send(chatId, {
+        text: decision === 'deny'
+          ? `已拒绝权限请求: \`${requestId}\``
+          : `已批准权限请求: \`${requestId}\``,
+      });
+      break;
+    }
+
     case 'force-approve': {
       const pending = agentManager.getPendingPermissionForChat(chatId);
       if (!pending) {
@@ -386,6 +559,29 @@ async function handleBridgeCommand(
       break;
     }
 
+    case 'sessions': {
+      const sessions = await store.listByBot(botName);
+      if (sessions.length === 0) {
+        await adapter.send(chatId, { text: '没有活跃会话' });
+        break;
+      }
+      const lines = sessions.map((session) => {
+        const [, sessionChatId] = session.key.split(':');
+        const processState = agentManager.hasProcess(session.key) ? 'Running' : 'Idle';
+        const lastActive = formatDateTime(session.lastActiveAt);
+        return [
+          `- \`${session.agentSessionId ?? session.id}\``,
+          `${session.state}/${processState}`,
+          `chat: \`${sessionChatId}\``,
+          `agent: ${session.agentName}`,
+          `cwd: \`${session.workingDirectory}\``,
+          `last: ${lastActive}`,
+        ].join(' | ');
+      });
+      await adapter.send(chatId, { text: `**会话列表:**\n${lines.join('\n')}` });
+      break;
+    }
+
     case 'switch': {
       const targetId = cmd.args[0];
       if (!targetId) {
@@ -409,6 +605,15 @@ async function handleBridgeCommand(
     default:
       await adapter.send(chatId, { text: `未知指令: /${cmd.command}` });
   }
+}
+
+function formatDateTime(value: number): string {
+  return new Date(value).toLocaleString('zh-CN', { hour12: false });
+}
+
+function getAdapterBotOpenId(adapter: PlatformAdapter): string | undefined {
+  const candidate = adapter as PlatformAdapter & { getBotOpenId?: () => string | undefined };
+  return candidate.getBotOpenId?.();
 }
 
 main().catch((err) => {

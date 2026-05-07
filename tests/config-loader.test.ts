@@ -81,6 +81,102 @@ newMessageBehavior: queue
     expect(config.session.maxActive).toBe(64);
   });
 
+  it('loads new phase 2 config fields', () => {
+    const yaml = `
+bots:
+  tgbot:
+    agent: claude-code
+    platform: telegram
+    telegram:
+      token: tg_token
+    workingDirectory: ~/projects
+    allowFrom: []
+    permissionMode: blacklist
+    larkCliConfigDir: ~/.lark-cli-ccbot
+    autoApprove: true
+    turnTimeoutMs: 600000
+    idleTimeoutMs: 300000
+    requireMention: true
+    groupPolicy: allowlist
+    groupAllowFrom:
+      - oc_group
+    userOverrides:
+      ou_user:
+        workingDirectory: ~/projects/user
+    sandboxMode: workspace-write
+agents:
+  claude-code:
+    binary: /usr/local/bin/claude
+session:
+  maxActive: 64
+  idleResetMinutes: 120
+  dbPath: ~/.cli2im/cli2im.db
+dangerousPatterns: []
+streaming:
+  intervalMs: 200
+  minDeltaChars: 30
+  highWaterMark: 1048576
+server:
+  port: 3900
+  host: 127.0.0.1
+  token: tok_xyz
+newMessageBehavior: queue
+contentGuard:
+  enabled: true
+  blockThreshold: 15
+`;
+    const configPath = join(tmpDir, 'phase2.yaml');
+    writeFileSync(configPath, yaml);
+
+    const config = loadConfig(configPath);
+
+    expect(config.bots.tgbot.telegram?.token).toBe('tg_token');
+    expect(config.bots.tgbot.autoApprove).toBe(true);
+    expect(config.bots.tgbot.groupPolicy).toBe('allowlist');
+    expect(config.bots.tgbot.groupAllowFrom).toEqual(['oc_group']);
+    expect(config.bots.tgbot.userOverrides?.ou_user.workingDirectory).toBe('~/projects/user');
+    expect(config.contentGuard).toEqual({ enabled: true, blockThreshold: 15 });
+  });
+
+  it('validates new phase 2 config fields', () => {
+    const yaml = `
+bots:
+  ccbot:
+    agent: claude-code
+    platform: feishu
+    feishu:
+      appId: cli_abc
+      appSecret: secret123
+    workingDirectory: ~/projects
+    allowFrom: []
+    permissionMode: blacklist
+    turnTimeoutMs: 0
+agents:
+  claude-code:
+    binary: /usr/local/bin/claude
+session:
+  maxActive: 64
+  idleResetMinutes: 120
+  dbPath: ~/.cli2im/cli2im.db
+dangerousPatterns: []
+streaming:
+  intervalMs: 200
+  minDeltaChars: 30
+  highWaterMark: 1048576
+server:
+  port: 3900
+  host: 127.0.0.1
+  token: tok_xyz
+newMessageBehavior: queue
+`;
+    const configPath = join(tmpDir, 'invalid-phase2.yaml');
+    writeFileSync(configPath, yaml);
+
+    expect(() => loadConfig(configPath)).toThrow(
+      'Config error: bot "ccbot" turnTimeoutMs must be a positive number',
+    );
+  });
+
   it('throws on missing config file', () => {
     expect(() => loadConfig('/nonexistent/config.yaml')).toThrow();
   });

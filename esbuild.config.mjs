@@ -13,7 +13,7 @@ async function main() {
     target: 'node22',
     format: 'esm',
     outfile: 'dist/index.js',
-    external: ['sql.js', '@larksuiteoapi/node-sdk'],
+    external: ['sql.js', '@larksuiteoapi/node-sdk', '@openai/codex-sdk'],
     sourcemap: true,
     banner: { js: "import { createRequire } from 'module'; const require = createRequire(import.meta.url);" },
   });

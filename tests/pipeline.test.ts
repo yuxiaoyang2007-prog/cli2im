@@ -1,5 +1,11 @@
 import { describe, it, expect } from 'vitest';
-import { parseBridgeCommand, isBridgeCommand } from '../src/pipeline.js';
+import {
+  InboundPipeline,
+  getGroupMessageSkipReason,
+  parseBridgeCommand,
+  isBridgeCommand,
+} from '../src/pipeline.js';
+import type { AppConfig, InboundMessage } from '../src/types.js';
 
 describe('isBridgeCommand', () => {
   it('recognizes bridge commands', () => {
@@ -14,6 +20,10 @@ describe('isBridgeCommand', () => {
     expect(isBridgeCommand('/handoff')).toBe(true);
     expect(isBridgeCommand('/force-approve')).toBe(true);
     expect(isBridgeCommand('/model opus')).toBe(true);
+    expect(isBridgeCommand('/thinking')).toBe(true);
+    expect(isBridgeCommand('/fast')).toBe(true);
+    expect(isBridgeCommand('/perm allow req_123')).toBe(true);
+    expect(isBridgeCommand('/sessions')).toBe(true);
   });
 
   it('does not recognize CLI passthrough commands', () => {
@@ -50,8 +60,114 @@ describe('parseBridgeCommand', () => {
     expect(cmd).toEqual({ command: 'model', args: ['claude-sonnet-4-20250514'] });
   });
 
+  it('parses /perm with decision and request id', () => {
+    const cmd = parseBridgeCommand('/perm allow req_123');
+    expect(cmd).toEqual({ command: 'perm', args: ['allow', 'req_123'] });
+  });
+
   it('returns null for non-bridge commands', () => {
     expect(parseBridgeCommand('/compact')).toBeNull();
     expect(parseBridgeCommand('hello')).toBeNull();
+  });
+});
+
+describe('InboundPipeline authorization', () => {
+  const config: AppConfig = {
+    bots: {
+      ccbot: {
+        agent: 'claude-code',
+        platform: 'feishu',
+        feishu: { appId: 'cli_abc', appSecret: 'secret' },
+        workingDirectory: '/Users/test/project',
+        allowFrom: ['ou_allowed'],
+        permissionMode: 'blacklist',
+      },
+    },
+    agents: {
+      'claude-code': { binary: '/usr/local/bin/claude' },
+    },
+    session: {
+      maxActive: 64,
+      idleResetMinutes: 120,
+      dbPath: ':memory:',
+    },
+    dangerousPatterns: [],
+    streaming: {
+      intervalMs: 200,
+      minDeltaChars: 30,
+      highWaterMark: 1048576,
+    },
+    server: {
+      port: 3900,
+      host: '127.0.0.1',
+      token: 'token',
+    },
+    newMessageBehavior: 'queue',
+  };
+
+  function message(overrides: Partial<InboundMessage>): InboundMessage {
+    return {
+      platform: 'feishu',
+      chatId: 'chat_1',
+      userId: 'ou_unknown',
+      text: 'hello',
+      ...overrides,
+    };
+  }
+
+  it('rejects unauthorized direct messages', () => {
+    const pipeline = new InboundPipeline(config);
+    const result = pipeline.process(message({ chatType: 'p2p' }), 'ccbot');
+
+    expect(result).toEqual({ rejected: true, reason: 'Unauthorized user' });
+  });
+
+  it('skips DM allowFrom checks for group chats', () => {
+    const pipeline = new InboundPipeline(config);
+    const result = pipeline.process(message({ chatType: 'group' }), 'ccbot');
+
+    expect('rejected' in result).toBe(false);
+  });
+
+  it('requires group allowlist to match chat id', () => {
+    const botConfig = {
+      ...config.bots.ccbot,
+      groupPolicy: 'allowlist' as const,
+      groupAllowFrom: ['oc_allowed'],
+    };
+
+    expect(getGroupMessageSkipReason(message({
+      chatType: 'group',
+      chatId: 'oc_blocked',
+      userId: 'oc_allowed',
+    }), botConfig, 'ou_bot')).toBe('Unauthorized group');
+    expect(getGroupMessageSkipReason(message({
+      chatType: 'group',
+      chatId: 'oc_allowed',
+      userId: 'ou_other',
+    }), botConfig, 'ou_bot')).toBeUndefined();
+  });
+
+  it('requires bot mention in groups but exempts bridge commands', () => {
+    const botConfig = {
+      ...config.bots.ccbot,
+      requireMention: true,
+    };
+
+    expect(getGroupMessageSkipReason(message({
+      chatType: 'group',
+      text: 'hello',
+      mentions: ['ou_other'],
+    }), botConfig, 'ou_bot')).toBe('Bot mention required');
+    expect(getGroupMessageSkipReason(message({
+      chatType: 'group',
+      text: 'hello',
+      mentions: ['ou_bot'],
+    }), botConfig, 'ou_bot')).toBeUndefined();
+    expect(getGroupMessageSkipReason(message({
+      chatType: 'group',
+      text: '/status',
+      mentions: [],
+    }), botConfig, 'ou_bot')).toBeUndefined();
   });
 });

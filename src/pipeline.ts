@@ -4,9 +4,29 @@ import type {
   AppConfig,
   BotConfig,
   Session,
+  SenderInfo,
 } from './types.js';
 import { sanitizeInput } from './security/validators.js';
 import { RateLimiter } from './security/rate-limiter.js';
+
+function xmlAttr(s: string): string {
+  return s.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+export function buildSenderHeader(sender: SenderInfo): string {
+  const parts: string[] = [`channel="${xmlAttr(sender.channel)}"`];
+  if (sender.userId) parts.push(`user_id="${xmlAttr(sender.userId)}"`);
+  if (sender.userName) parts.push(`name="${xmlAttr(sender.userName)}"`);
+  return `<cti-sender ${parts.join(' ')}/>\n\n`;
+}
+
+export function buildSenderEnv(sender: SenderInfo): Record<string, string> {
+  const env: Record<string, string> = {};
+  if (sender.channel) env.CTI_SENDER_CHANNEL = sender.channel;
+  if (sender.userId) env.CTI_SENDER_USER_ID = sender.userId;
+  if (sender.userName) env.CTI_SENDER_NAME = sender.userName;
+  return env;
+}
 
 const BRIDGE_COMMANDS = new Set([
   'new',
@@ -20,6 +40,10 @@ const BRIDGE_COMMANDS = new Set([
   'handoff',
   'force-approve',
   'model',
+  'thinking',
+  'fast',
+  'perm',
+  'sessions',
 ]);
 
 export interface BridgeCommand {
@@ -39,6 +63,27 @@ export function parseBridgeCommand(text: string): BridgeCommand | null {
   const command = parts[0];
   if (!BRIDGE_COMMANDS.has(command)) return null;
   return { command, args: parts.slice(1) };
+}
+
+export function getGroupMessageSkipReason(
+  msg: InboundMessage,
+  botConfig: BotConfig,
+  botOpenId?: string,
+): string | undefined {
+  if (msg.chatType !== 'group') return undefined;
+
+  const groupAllowFrom = botConfig.groupAllowFrom ?? [];
+  const requiresAllowlist = botConfig.groupPolicy === 'allowlist' || groupAllowFrom.length > 0;
+  if (requiresAllowlist && !groupAllowFrom.includes(msg.chatId)) {
+    return 'Unauthorized group';
+  }
+
+  if (botConfig.requireMention && !isBridgeCommand(msg.text)) {
+    const mentioned = Boolean(botOpenId && (msg.mentions ?? []).includes(botOpenId));
+    if (!mentioned) return 'Bot mention required';
+  }
+
+  return undefined;
 }
 
 export interface PipelineContext {
@@ -80,7 +125,8 @@ export class InboundPipeline {
       return { rejected: true, reason: `Unknown bot: ${botName}` };
     }
 
-    if (botConfig.allowFrom.length > 0 && !botConfig.allowFrom.includes(msg.userId)) {
+    const isGroup = msg.chatType === 'group';
+    if (!isGroup && botConfig.allowFrom.length > 0 && !botConfig.allowFrom.includes(msg.userId)) {
       return { rejected: true, reason: 'Unauthorized user' };
     }
 

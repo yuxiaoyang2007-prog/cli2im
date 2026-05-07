@@ -16,6 +16,11 @@ export interface SpawnOpts {
   permissionMode: 'bypass' | 'blacklist';
   env?: Record<string, string>;
   systemPrompt?: string;
+  reasoningEffort?: 'low' | 'medium' | 'high';
+  sandboxMode?: string;
+  autoApprove?: boolean;
+  turnTimeoutMs?: number;
+  idleTimeoutMs?: number;
 }
 
 export interface AgentProcess {
@@ -50,7 +55,8 @@ export type AgentEvent =
   | { type: 'tool_use'; id: string; name: string; input: Record<string, unknown> }
   | { type: 'tool_result'; id: string; name: string; output: string; isError?: boolean }
   | { type: 'permission_request'; id: string; tool: string; input: Record<string, unknown> }
-  | { type: 'result'; sessionId: string; usage?: TokenUsage }
+  | { type: 'status'; sessionId?: string; message?: string }
+  | { type: 'result'; sessionId: string; usage?: TokenUsage; createdFiles?: string[] }
   | { type: 'error'; message: string }
   | { type: 'file'; path: string; mimeType?: string };
 
@@ -70,6 +76,14 @@ export interface FileAttachment {
   mimeType?: string;
   fileName?: string;
   size?: number;
+  fileKey?: string;
+  messageId?: string;
+}
+
+export interface SenderInfo {
+  channel: string;
+  userId?: string;
+  userName?: string;
 }
 
 export interface InboundMessage {
@@ -78,6 +92,7 @@ export interface InboundMessage {
   userId: string;
   userName?: string;
   text: string;
+  chatType?: string;
   attachments?: FileAttachment[];
   replyTo?: string;
   mentions?: string[];
@@ -121,6 +136,7 @@ export interface PlatformAdapter {
   sendFile?(chatId: string, file: FilePayload): Promise<void>;
   sendCard?(chatId: string, card: CardPayload): Promise<string>;
   updateCard?(messageId: string, content: string, seq: number): Promise<void>;
+  downloadFile?(messageId: string, fileKey: string, type: string): Promise<Buffer>;
 }
 
 export interface CallbackQuery {
@@ -141,6 +157,7 @@ export interface UserMessage {
         | { type: 'text'; text: string }
         | { type: 'image'; source: { type: 'base64'; media_type: string; data: string } }
       >;
+  attachments?: FileAttachment[];
 }
 
 // === Session ===
@@ -173,6 +190,7 @@ export interface PendingPermission {
   command: string;
   chatId: string;
   sessionKey: SessionKey;
+  agentName: string;
   timer: ReturnType<typeof setTimeout>;
   createdAt: number;
 }
@@ -212,6 +230,15 @@ export interface BotConfig {
   workingDirectory: string;
   allowFrom: string[];
   permissionMode: 'bypass' | 'blacklist';
+  larkCliConfigDir?: string;
+  autoApprove?: boolean;
+  turnTimeoutMs?: number;
+  idleTimeoutMs?: number;
+  requireMention?: boolean;
+  groupPolicy?: 'all' | 'allowlist';
+  groupAllowFrom?: string[];
+  userOverrides?: Record<string, { workingDirectory?: string }>;
+  sandboxMode?: string;
 }
 
 export interface AgentConfig {
@@ -240,4 +267,8 @@ export interface AppConfig {
     token: string;
   };
   newMessageBehavior: 'queue' | 'interrupt';
+  contentGuard?: {
+    enabled: boolean;
+    blockThreshold?: number;
+  };
 }
