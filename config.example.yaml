@@ -1,0 +1,53 @@
+# CLI2IM Configuration
+# Copy to ~/.cli2im/config.yaml and fill in real values
+
+bots:
+  ccbot:
+    agent: claude-code
+    platform: feishu
+    feishu:
+      appId: ${CCBOT_FEISHU_APP_ID}
+      appSecret: ${CCBOT_FEISHU_APP_SECRET}
+    workingDirectory: ~/projects
+    allowFrom:
+      - ou_xxxx
+    permissionMode: blacklist
+
+agents:
+  claude-code:
+    binary: /Users/xiaoyangyu/.claude/local/claude
+    defaultModel: claude-sonnet-4-20250514
+    env:
+      DISABLE_AUTOUPDATER: "1"
+
+session:
+  maxActive: 64
+  idleResetMinutes: 120
+  dbPath: ~/.cli2im/cli2im.db
+
+dangerousPatterns:
+  - 'rm\s+(-[a-zA-Z]*f[a-zA-Z]*\s+|.*--force).*\/'
+  - 'mkfs\.'
+  - 'dd\s+.*of=\/dev\/'
+  - 'git\s+push\s+.*--force'
+  - 'git\s+reset\s+--hard'
+  - 'git\s+clean\s+-[a-zA-Z]*f'
+  - 'kill\s+-9'
+  - 'killall'
+  - 'pkill'
+  - 'sudo\s+'
+  - 'shutdown|reboot'
+  - '>\s*\/etc\/'
+  - 'rm\s+.*\.(env|credentials)'
+
+streaming:
+  intervalMs: 200
+  minDeltaChars: 30
+  highWaterMark: 1048576
+
+server:
+  port: 3900
+  host: 127.0.0.1
+  token: ${CLI2IM_WEB_TOKEN}
+
+newMessageBehavior: queue
