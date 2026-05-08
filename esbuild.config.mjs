@@ -15,7 +15,7 @@ async function main() {
     outfile: 'dist/index.js',
     external: ['sql.js', '@larksuiteoapi/node-sdk', '@openai/codex-sdk'],
     sourcemap: true,
-    banner: { js: "import { createRequire } from 'module'; const require = createRequire(import.meta.url);" },
+    banner: { js: "import { createRequire as _cR } from 'module'; const require = _cR(import.meta.url);" },
   });
 
   await build({
