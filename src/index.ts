@@ -794,18 +794,19 @@ async function handleBridgeCommand(
       }
 
       const useCodex = sub === 'codex' || (!sub && botConfig.agent === 'codex');
+      const agentLabel = useCodex ? 'Codex' : 'Claude Code';
       const sessions = useCodex
         ? await new CodexSessionScanner(join(homedir(), '.codex')).scan()
         : await new CLISessionScanner(join(homedir(), '.claude')).scan();
 
       if (sessions.length === 0) {
-        await adapter.send(chatId, { text: useCodex ? '没有找到 Codex CLI 会话' : '没有找到 Claude Code CLI 会话' });
+        await adapter.send(chatId, { text: `没有找到 ${agentLabel} CLI 会话` });
         break;
       }
       if (adapter.name === 'telegram') {
-        await adapter.send(chatId, { card: buildCLISessionText(sessions) });
+        await adapter.send(chatId, { card: buildCLISessionText(sessions, agentLabel) });
       } else {
-        await adapter.send(chatId, { card: buildCLISessionCard(sessions) });
+        await adapter.send(chatId, { card: buildCLISessionCard(sessions, agentLabel) });
       }
       break;
     }

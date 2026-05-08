@@ -47,8 +47,8 @@ export function toTelegramMarkdownV2(text: string): string {
   return result;
 }
 
-export function buildCLISessionText(sessions: CLISession[]): CardPayload {
-  const lines: string[] = ['CLI Sessions', ''];
+export function buildCLISessionText(sessions: CLISession[], agentLabel?: string): CardPayload {
+  const lines: string[] = [`${agentLabel ?? 'CLI'} Sessions`, ''];
 
   for (const session of sessions) {
     const cwd = shortenPath(session.cwd);
@@ -66,7 +66,7 @@ export function buildCLISessionText(sessions: CLISession[]): CardPayload {
     lines.push('');
   }
 
-  lines.push(`Showing ${sessions.length} sessions`);
+  lines.push(`Showing ${sessions.length} sessions · ${agentLabel ?? 'CLI'} only`);
 
   const buttons = sessions.map((session) => {
     const label = previewText(session.title, 30);

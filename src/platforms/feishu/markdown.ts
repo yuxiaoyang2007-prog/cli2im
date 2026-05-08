@@ -56,7 +56,7 @@ export function buildCrashNotification(code: number | null): string {
   return `**Agent 进程异常退出** (code: ${code ?? 'unknown'})\n\n发送新消息重新启动`;
 }
 
-export function buildCLISessionCard(sessions: CLISession[]): CardPayload {
+export function buildCLISessionCard(sessions: CLISession[], agentLabel?: string): CardPayload {
   const rawElements: object[] = [];
   const fallbackLines: string[] = ['**CLI Sessions**'];
 
@@ -106,7 +106,7 @@ export function buildCLISessionCard(sessions: CLISession[]): CardPayload {
     elements: [
       {
         tag: 'plain_text',
-        content: `Showing ${sessions.length} sessions · Claude Code only`,
+        content: `Showing ${sessions.length} sessions · ${agentLabel ?? 'CLI'} only`,
       },
     ],
   });
