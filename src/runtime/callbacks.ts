@@ -93,13 +93,11 @@ function parseResumeObject(rawData: string): SessionResumeCallbackData | null {
     if (
       record.action !== 'resume_cli'
       || typeof record.sessionId !== 'string'
-      || typeof record.cwd !== 'string'
       || !record.sessionId
-      || !record.cwd
     ) {
       return null;
     }
-    return { action: 'resume_cli', sessionId: record.sessionId, cwd: record.cwd };
+    return { action: 'resume_cli', sessionId: record.sessionId, cwd: typeof record.cwd === 'string' ? record.cwd : '' };
   } catch {
     return null;
   }

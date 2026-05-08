@@ -77,8 +77,11 @@ describe('parseSessionResumeCallback', () => {
 
   it('rejects malformed resume callback payloads', () => {
     expect(parseSessionResumeCallback('resume_cli:abc:/tmp')).toBeNull();
-    expect(parseSessionResumeCallback(JSON.stringify({ action: 'resume_cli', sessionId: 'abc' }))).toBeNull();
     expect(parseSessionResumeCallback(JSON.stringify({ action: 'other', sessionId: 'abc', cwd: '/tmp' }))).toBeNull();
+    expect(parseSessionResumeCallback(JSON.stringify({ action: 'resume_cli' }))).toBeNull();
+    expect(parseSessionResumeCallback(JSON.stringify({ action: 'resume_cli', sessionId: 'abc' }))).toEqual({
+      action: 'resume_cli', sessionId: 'abc', cwd: '',
+    });
   });
 
   it('parses compact Telegram resume format "resume:<sessionId>"', () => {

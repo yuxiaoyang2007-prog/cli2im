@@ -387,6 +387,7 @@ export class FeishuAdapter implements PlatformAdapter {
   }
 
   private handleCardAction(data: unknown): unknown {
+    console.log('[feishu] card.action.trigger received:', JSON.stringify(data).slice(0, 300));
     if (!this.callbackHandler) return undefined;
 
     const raw = data as Record<string, unknown>;
