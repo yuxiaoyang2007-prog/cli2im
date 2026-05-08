@@ -5,6 +5,7 @@ import { AgentManager, type AgentManagerEvents } from './agents/manager.js';
 import { ToolGate } from './agents/tool-gate.js';
 import { ClaudeCodePlugin } from './agents/claude-code.js';
 import { CodexPlugin } from './agents/codex.js';
+import { GeminiPlugin } from './agents/gemini.js';
 import { FeishuAdapter } from './platforms/feishu/adapter.js';
 import { TelegramAdapter } from './platforms/telegram/adapter.js';
 import { StreamingCardController } from './platforms/feishu/cards.js';
@@ -29,7 +30,7 @@ import {
 } from './media.js';
 import { initContentGuard } from './security/content-guard.js';
 import { handlePermissionCallback } from './runtime/callbacks.js';
-import type { SessionKey, InboundMessage, PlatformAdapter, BotConfig } from './types.js';
+import type { SessionKey, InboundMessage, PlatformAdapter, BotConfig, SpawnOpts } from './types.js';
 import { homedir } from 'node:os';
 import { basename, join } from 'node:path';
 import { mkdirSync } from 'node:fs';
@@ -66,6 +67,8 @@ async function main(): Promise<void> {
       agentManager.registerPlugin(new ClaudeCodePlugin(agentConfig.binary));
     } else if (name === 'codex') {
       agentManager.registerPlugin(new CodexPlugin(agentConfig.binary));
+    } else if (name === 'gemini') {
+      agentManager.registerPlugin(new GeminiPlugin(agentConfig.binary));
     }
   }
 
@@ -127,6 +130,7 @@ async function main(): Promise<void> {
 
     return {
       onEvent: async (_sk, event) => {
+        console.log(`[pipeline] ${sessionKey}: event type=${event.type}`);
         cardController?.handleEvent(sessionKey, event);
 
         if (!cardController && adapter) {
@@ -267,6 +271,14 @@ async function main(): Promise<void> {
       }
 
       const sender = { channel: msg.platform, userId: msg.userId, userName: msg.userName };
+      const senderHeader = buildSenderHeader(sender);
+      const messageText = senderHeader + msg.text;
+      await downloadInboundAttachments(msg, adapter, mediaDir);
+      const userMessage = await buildUserMessageForAgent(
+        botConfig.agent,
+        messageText,
+        msg.attachments,
+      );
 
       const cardController = cardControllers.get(botName);
       const isNewProcess = !agentManager.hasProcess(sessionKey);
@@ -287,52 +299,37 @@ async function main(): Promise<void> {
           : {};
         const spawnEnv = { ...config.agents[botConfig.agent]?.env, ...senderEnv, ...larkCliEnv };
 
-        if (session.agentSessionId) {
+        const spawnOpts: SpawnOpts = {
+          workingDirectory: session.workingDirectory,
+          permissionMode: botConfig.permissionMode,
+          env: spawnEnv,
+          model: config.agents[botConfig.agent]?.defaultModel,
+          autoApprove: botConfig.autoApprove,
+          turnTimeoutMs: botConfig.turnTimeoutMs,
+          idleTimeoutMs: botConfig.idleTimeoutMs,
+          sandboxMode: botConfig.sandboxMode,
+          reasoningEffort: runtimeState.fastModeBySession.get(sessionKey) ? 'low' : undefined,
+          initialPrompt: messageText,
+        };
+
+        const plugin = agentManager.getPlugin(botConfig.agent);
+        if (session.agentSessionId && plugin?.capabilities.sessionResume) {
           agentManager.resumeAgent(
             sessionKey,
             botConfig.agent,
             session.agentSessionId,
-            {
-              workingDirectory: session.workingDirectory,
-              permissionMode: botConfig.permissionMode,
-              env: spawnEnv,
-              model: config.agents[botConfig.agent]?.defaultModel,
-              autoApprove: botConfig.autoApprove,
-              turnTimeoutMs: botConfig.turnTimeoutMs,
-              idleTimeoutMs: botConfig.idleTimeoutMs,
-              sandboxMode: botConfig.sandboxMode,
-              reasoningEffort: runtimeState.fastModeBySession.get(sessionKey) ? 'low' : undefined,
-            },
+            spawnOpts,
             handlers,
           );
         } else {
           agentManager.spawnAgent(
             sessionKey,
             botConfig.agent,
-            {
-              workingDirectory: session.workingDirectory,
-              permissionMode: botConfig.permissionMode,
-              env: spawnEnv,
-              model: config.agents[botConfig.agent]?.defaultModel,
-              autoApprove: botConfig.autoApprove,
-              turnTimeoutMs: botConfig.turnTimeoutMs,
-              idleTimeoutMs: botConfig.idleTimeoutMs,
-              sandboxMode: botConfig.sandboxMode,
-              reasoningEffort: runtimeState.fastModeBySession.get(sessionKey) ? 'low' : undefined,
-            },
+            spawnOpts,
             handlers,
           );
         }
       }
-
-      const senderHeader = buildSenderHeader(sender);
-      const messageText = senderHeader + msg.text;
-      await downloadInboundAttachments(msg, adapter, mediaDir);
-      const userMessage = await buildUserMessageForAgent(
-        botConfig.agent,
-        messageText,
-        msg.attachments,
-      );
 
       agentManager.sendMessage(sessionKey, botConfig.agent, userMessage);
     };

@@ -21,6 +21,7 @@ export interface SpawnOpts {
   autoApprove?: boolean;
   turnTimeoutMs?: number;
   idleTimeoutMs?: number;
+  initialPrompt?: string;
 }
 
 export interface AgentProcess {
