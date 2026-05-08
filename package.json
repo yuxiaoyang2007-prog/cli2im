@@ -1,7 +1,28 @@
 {
   "name": "cli2im",
   "version": "1.0.0",
+  "description": "Bridge CLI AI agents (Claude Code, Codex, Gemini) to IM platforms (Feishu, Telegram) with streaming output, permission gating, and session resume",
   "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/yuxiaoyang2007-prog/cli2im.git"
+  },
+  "keywords": [
+    "claude-code",
+    "codex",
+    "gemini",
+    "feishu",
+    "lark",
+    "telegram",
+    "bridge",
+    "ai-agent",
+    "cli",
+    "im"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
   "scripts": {
     "build": "node esbuild.config.mjs",
     "dev": "tsx src/index.ts",
@@ -12,7 +33,6 @@
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "^0.2.133",
     "@larksuiteoapi/node-sdk": "^1.60.0",
-    "content-guard": "file:../content-guard",
     "sql.js": "^1.11.0",
     "yaml": "^2.6.0"
   },
@@ -24,6 +44,7 @@
     "vitest": "^3.0.0"
   },
   "optionalDependencies": {
-    "@openai/codex-sdk": "^0.128.0"
+    "@openai/codex-sdk": "^0.128.0",
+    "content-guard": "^1.0.0"
   }
 }

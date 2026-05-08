@@ -1,4 +1,11 @@
-import { detectInjection } from 'content-guard';
+let detectInjection: ((text: string) => { detected: boolean; score: number; severity: string }) | undefined;
+
+try {
+  const mod = await import('content-guard');
+  detectInjection = mod.detectInjection;
+} catch {
+  // content-guard is optional — scanning disabled when not installed
+}
 
 const DEFAULT_BLOCK_THRESHOLD = 15;
 
@@ -13,7 +20,7 @@ export function initContentGuard(options: ContentGuardOptions = {}): void {
 }
 
 export function scanToolResult(toolName: string, output: string): string {
-  if (!toolName.startsWith('mcp__')) return output;
+  if (!detectInjection || !toolName.startsWith('mcp__')) return output;
 
   const result = detectInjection(output);
   if (result.score >= blockThreshold) {
