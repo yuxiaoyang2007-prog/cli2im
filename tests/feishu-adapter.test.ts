@@ -142,6 +142,40 @@ describe('FeishuAdapter file handling', () => {
     });
   });
 
+  it('uses raw card elements directly when provided', async () => {
+    const adapter = new FeishuAdapter({ appId: 'app', appSecret: 'secret', botName: 'bot' });
+    const client = larkMocks.clients[0];
+    const rawElements = [
+      { tag: 'markdown', content: '**CLI Sessions**' },
+      {
+        tag: 'action',
+        actions: [
+          {
+            tag: 'button',
+            text: { tag: 'plain_text', content: 'Resume' },
+            value: { action: 'resume_cli', sessionId: 'ses_1', cwd: '/tmp/project' },
+          },
+        ],
+      },
+    ];
+
+    await adapter.sendCard('oc_1', {
+      type: 'session_list',
+      title: 'CLI Sessions',
+      content: 'fallback',
+      rawElements,
+    });
+
+    const createMock = client.im.message.create as ReturnType<typeof vi.fn>;
+    const firstCall = createMock.mock.calls[0]?.[0] as { data: { content: string } } | undefined;
+    expect(firstCall).toBeDefined();
+    const content = firstCall!.data.content;
+    expect(JSON.parse(content)).toMatchObject({
+      elements: rawElements,
+      header: { title: { tag: 'plain_text', content: 'CLI Sessions' } },
+    });
+  });
+
   it('sends image paths as image messages and other paths as file messages', async () => {
     const adapter = new FeishuAdapter({ appId: 'app', appSecret: 'secret', botName: 'bot' });
     const client = larkMocks.clients[0];

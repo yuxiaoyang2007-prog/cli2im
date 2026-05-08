@@ -44,17 +44,15 @@ export class FeishuAdapter implements PlatformAdapter {
   async connect(): Promise<void> {
     await this.resolveBotIdentity();
 
-    const eventDispatcher = new lark.EventDispatcher({}).register({
+    const eventDispatcher = new lark.EventDispatcher({
+      loggerLevel: lark.LoggerLevel.warn,
+    }).register({
       'im.message.receive_v1': (data: unknown) => this.handleMessage(data),
+      'card.action.trigger': (data: unknown) => this.handleCardAction(data),
     });
-
-    const cardActionHandler = new lark.CardActionHandler({}, (data: unknown) =>
-      this.handleCardAction(data),
-    );
 
     await (this.wsClient.start as (params: unknown) => Promise<void>)({
       eventDispatcher,
-      cardActionHandler,
     });
   }
 
@@ -149,10 +147,65 @@ export class FeishuAdapter implements PlatformAdapter {
     });
   }
 
+  async sendAudio(chatId: string, audioBuffer: Buffer): Promise<void> {
+    const { spawn } = await import('node:child_process');
+    const { Readable } = await import('node:stream');
+
+    const opusBuffer = await new Promise<Buffer | null>((resolve) => {
+      try {
+        const proc = spawn('ffmpeg', [
+          '-i', 'pipe:0', '-c:a', 'libopus', '-b:a', '64k',
+          '-ar', '48000', '-ac', '1', '-f', 'ogg', 'pipe:1',
+        ], { stdio: ['pipe', 'pipe', 'pipe'] });
+        const chunks: Buffer[] = [];
+        proc.stdout.on('data', (chunk: Buffer) => chunks.push(chunk));
+        proc.on('close', (code) => resolve(code === 0 && chunks.length > 0 ? Buffer.concat(chunks) : null));
+        proc.on('error', () => resolve(null));
+        proc.stdin.write(audioBuffer);
+        proc.stdin.end();
+      } catch { resolve(null); }
+    });
+
+    if (!opusBuffer) {
+      console.error('[feishu] ffmpeg MP3→Opus conversion failed');
+      return;
+    }
+
+    const { createReadStream: createTmpRead } = await import('node:fs');
+    const { writeFile: writeTmp, rm: rmTmp } = await import('node:fs/promises');
+    const { join: joinPath } = await import('node:path');
+    const { tmpdir: getTmpdir } = await import('node:os');
+    const tmpPath = joinPath(getTmpdir(), `cli2im-opus-${Date.now()}.ogg`);
+    await writeTmp(tmpPath, opusBuffer);
+    const fileStream = createTmpRead(tmpPath);
+
+    const uploadResp = await this.client.im.file.create({
+      data: {
+        file_type: 'opus',
+        file_name: 'voice.opus',
+        file: fileStream,
+      },
+    });
+    void rmTmp(tmpPath, { force: true }).catch(() => {});
+
+    const fileKey = readNestedString(uploadResp, ['file_key'])
+      ?? readNestedString(uploadResp, ['data', 'file_key']);
+    if (!fileKey) return;
+
+    await this.client.im.message.create({
+      params: { receive_id_type: 'chat_id' },
+      data: {
+        receive_id: chatId,
+        msg_type: 'audio',
+        content: JSON.stringify({ file_key: fileKey }),
+      },
+    });
+  }
+
   async downloadFile(messageId: string, fileKey: string, type: string): Promise<Buffer> {
     const resp = await this.client.im.messageResource.get({
       path: { message_id: messageId, file_key: fileKey },
-      params: { type },
+      params: { type: type === 'image' ? 'image' : 'file' },
     });
     const readable = await getReadableStreamFromResponse(resp);
     return streamToBuffer(readable);
@@ -278,6 +331,17 @@ export class FeishuAdapter implements PlatformAdapter {
           mimeType: 'image/png',
         });
       }
+    } else if (message.message_type === 'audio') {
+      const content = parseMessageContent(message.content);
+      const fileKey = content.file_key ?? content.fileKey;
+      if (typeof fileKey === 'string') {
+        attachments.push({
+          type: 'audio' as const,
+          fileKey,
+          messageId: message.message_id,
+          mimeType: 'audio/ogg',
+        });
+      }
     } else if (message.message_type === 'file') {
       const content = parseMessageContent(message.content);
       if (typeof content.file_key === 'string') {
@@ -288,8 +352,20 @@ export class FeishuAdapter implements PlatformAdapter {
           fileName: typeof content.file_name === 'string' ? content.file_name : undefined,
         });
       }
+    } else if (message.message_type === 'post') {
+      const { extractedText, imageKeys } = parsePostContent(message.content);
+      text = extractedText;
+      for (const key of imageKeys) {
+        attachments.push({
+          type: 'image' as const,
+          fileKey: key,
+          messageId: message.message_id,
+          mimeType: 'image/png',
+        });
+      }
     }
 
+    let isVoice = message.message_type === 'audio';
     text = text.replace(/@_user_\d+\s*/g, '').trim();
 
     const mentions = (message.mentions ?? [])
@@ -304,6 +380,7 @@ export class FeishuAdapter implements PlatformAdapter {
       text,
       chatType: message.chat_type,
       attachments: attachments.length > 0 ? attachments : undefined,
+      isVoice,
       mentions,
       raw: data,
     });
@@ -312,16 +389,20 @@ export class FeishuAdapter implements PlatformAdapter {
   private handleCardAction(data: unknown): unknown {
     if (!this.callbackHandler) return undefined;
 
-    const action = data as FeishuCardAction;
+    const raw = data as Record<string, unknown>;
+    const ctx = (raw.context ?? raw) as Record<string, unknown>;
+    const operator = raw.operator as Record<string, unknown> | undefined;
+    const action = raw.action as Record<string, unknown> | undefined;
+
     this.callbackHandler({
       platform: 'feishu',
-      chatId: action.open_chat_id ?? '',
-      userId: action.open_id ?? '',
-      data: JSON.stringify(action.action?.value ?? {}),
-      messageId: action.open_message_id ?? '',
+      chatId: (ctx.open_chat_id as string) ?? '',
+      userId: (operator?.open_id as string) ?? (raw.open_id as string) ?? '',
+      data: JSON.stringify(action?.value ?? {}),
+      messageId: (ctx.open_message_id as string) ?? (raw.open_message_id as string) ?? '',
     });
 
-    return { toast: { type: 'success', content: 'OK' } };
+    return undefined;
   }
 
   private buildCardJson(card: CardPayload): object {
@@ -329,7 +410,7 @@ export class FeishuAdapter implements PlatformAdapter {
       config: {
         wide_screen_mode: true,
       },
-      elements: [
+      elements: card.rawElements ?? [
         {
           tag: 'markdown',
           content: card.content,
@@ -388,6 +469,33 @@ interface FeishuMessageEvent {
 function unwrapEvent(data: unknown): FeishuMessageEvent {
   const root = data as { event?: FeishuMessageEvent };
   return root.event ?? (data as FeishuMessageEvent);
+}
+
+function parsePostContent(content: string | undefined): { extractedText: string; imageKeys: string[] } {
+  const imageKeys: string[] = [];
+  const textParts: string[] = [];
+  try {
+    const parsed = JSON.parse(content ?? '{}');
+    if (parsed.title) textParts.push(parsed.title);
+    const paragraphs = parsed.content;
+    if (Array.isArray(paragraphs)) {
+      for (const paragraph of paragraphs) {
+        if (!Array.isArray(paragraph)) continue;
+        for (const element of paragraph) {
+          if (element.tag === 'text' && element.text) {
+            textParts.push(element.text);
+          } else if (element.tag === 'a' && element.text) {
+            textParts.push(element.text);
+          } else if (element.tag === 'img') {
+            const key = element.image_key || element.file_key || element.imageKey;
+            if (key) imageKeys.push(key);
+          }
+        }
+        textParts.push('\n');
+      }
+    }
+  } catch { /* ignore parse errors */ }
+  return { extractedText: textParts.join('').trim(), imageKeys };
 }
 
 function parseMessageContent(raw: string | undefined): Record<string, unknown> {

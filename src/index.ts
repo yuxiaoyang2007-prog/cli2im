@@ -1,5 +1,7 @@
 import { loadConfig } from './config/loader.js';
 import { SessionStore } from './session/store.js';
+import { CLISessionScanner } from './session/cli-scanner.js';
+import { CodexSessionScanner } from './session/codex-scanner.js';
 import { ChatQueue } from './session/queue.js';
 import { AgentManager, type AgentManagerEvents } from './agents/manager.js';
 import { ToolGate } from './agents/tool-gate.js';
@@ -22,24 +24,77 @@ import {
   buildHandoffNotification,
   buildHandoffReleaseNotification,
   buildCrashNotification,
+  buildCLISessionCard,
 } from './platforms/feishu/markdown.js';
+import { buildCLISessionText } from './platforms/telegram/markdown.js';
 import { validateWorkingDirectory } from './security/validators.js';
 import {
   buildUserMessageForAgent,
   downloadInboundAttachments,
 } from './media.js';
 import { initContentGuard } from './security/content-guard.js';
-import { handlePermissionCallback } from './runtime/callbacks.js';
-import type { SessionKey, InboundMessage, PlatformAdapter, BotConfig, SpawnOpts } from './types.js';
+import { handlePermissionCallback, parseSessionResumeCallback } from './runtime/callbacks.js';
+import { transcribeAudio, synthesizeSpeech } from './services/speech.js';
+import type {
+  SessionKey,
+  InboundMessage,
+  PlatformAdapter,
+  BotConfig,
+  SpawnOpts,
+  CallbackQuery,
+} from './types.js';
 import { homedir } from 'node:os';
 import { basename, join } from 'node:path';
 import { mkdirSync } from 'node:fs';
+import { readFile } from 'node:fs/promises';
 
 const CONFIG_PATH = process.env.CLI2IM_CONFIG ?? join(homedir(), '.cli2im', 'config.yaml');
 const startedAt = Date.now();
 
 interface RuntimeCommandState {
   fastModeBySession: Map<SessionKey, boolean>;
+}
+
+interface TelegramBufferState {
+  chatId: string;
+  buffer: string;
+}
+
+class TelegramStreamController {
+  private states = new Map<SessionKey, TelegramBufferState>();
+  private adapter: PlatformAdapter;
+
+  constructor(adapter: PlatformAdapter, _intervalMs?: number) {
+    this.adapter = adapter;
+  }
+
+  appendText(sessionKey: SessionKey, chatId: string, text: string): void {
+    let state = this.states.get(sessionKey);
+    if (!state) {
+      state = { chatId, buffer: '' };
+      this.states.set(sessionKey, state);
+    }
+    state.buffer += text;
+  }
+
+  async finalize(sessionKey: SessionKey): Promise<void> {
+    const state = this.states.get(sessionKey);
+    if (!state) return;
+
+    const text = state.buffer.trim();
+    this.states.delete(sessionKey);
+    if (!text) return;
+
+    try {
+      await this.adapter.send(state.chatId, { text });
+    } catch (err) {
+      console.error(`[tg-stream] send error for ${sessionKey}:`, err instanceof Error ? err.message : err);
+    }
+  }
+
+  interrupt(sessionKey: SessionKey): void {
+    this.states.delete(sessionKey);
+  }
 }
 
 async function main(): Promise<void> {
@@ -61,6 +116,58 @@ async function main(): Promise<void> {
   const queue = new ChatQueue();
   const toolGate = new ToolGate(config.dangerousPatterns);
   const agentManager = new AgentManager(toolGate);
+  const typingTimers = new Map<string, ReturnType<typeof setInterval>>();
+
+  function startTyping(chatId: string, adapter: PlatformAdapter): void {
+    stopTyping(chatId);
+    if (!adapter.sendTypingIndicator) return;
+    adapter.sendTypingIndicator(chatId).catch(() => {});
+    typingTimers.set(chatId, setInterval(() => {
+      adapter.sendTypingIndicator!(chatId).catch(() => {});
+    }, 4000));
+  }
+
+  function stopTyping(chatId: string): void {
+    const timer = typingTimers.get(chatId);
+    if (timer) {
+      clearInterval(timer);
+      typingTimers.delete(chatId);
+    }
+  }
+
+  async function sendVoiceReply(
+    adapter: PlatformAdapter,
+    chatId: string,
+    sessionKey: SessionKey,
+    text: string,
+  ): Promise<void> {
+    const trimmed = text.trim();
+    voiceSessions.delete(sessionKey);
+    if (!trimmed) return;
+
+    try {
+      const audioBuffer = await synthesizeSpeech(trimmed);
+      if (audioBuffer) {
+        const asTg = adapter as PlatformAdapter & { sendVoice?: (c: string, b: Buffer) => Promise<void> };
+        const asFs = adapter as PlatformAdapter & { sendAudio?: (c: string, b: Buffer) => Promise<void> };
+
+        if (typeof asTg.sendVoice === 'function') {
+          await asTg.sendVoice(chatId, audioBuffer);
+          console.log(`[voice] TTS voice sent for ${sessionKey}`);
+          return;
+        }
+        if (typeof asFs.sendAudio === 'function') {
+          await asFs.sendAudio(chatId, audioBuffer);
+          console.log(`[voice] TTS voice sent for ${sessionKey}`);
+          return;
+        }
+      }
+    } catch (err) {
+      console.error(`[voice] TTS failed for ${sessionKey}:`, err instanceof Error ? err.message : err);
+    }
+
+    await adapter.send(chatId, { text: trimmed });
+  }
 
   for (const [name, agentConfig] of Object.entries(config.agents)) {
     if (name === 'claude-code') {
@@ -74,6 +181,8 @@ async function main(): Promise<void> {
 
   const adapters = new Map<string, PlatformAdapter>();
   const cardControllers = new Map<string, StreamingCardController>();
+  const telegramStreams = new Map<string, TelegramStreamController>();
+  const voiceSessions = new Map<SessionKey, string>();
   const runtimeState: RuntimeCommandState = {
     fastModeBySession: new Map(),
   };
@@ -98,6 +207,7 @@ async function main(): Promise<void> {
         botName,
       });
       adapters.set(botName, adapter);
+      telegramStreams.set(botName, new TelegramStreamController(adapter, config.streaming.intervalMs));
     }
   }
 
@@ -126,18 +236,49 @@ async function main(): Promise<void> {
     const botName = sessionKey.split(':')[2];
     const chatId = sessionKey.split(':')[1];
     const cardController = cardControllers.get(botName);
+    const tgStream = telegramStreams.get(botName);
     const adapter = adapters.get(botName);
+    let voiceResponseBuffer = '';
 
     return {
       onEvent: async (_sk, event) => {
-        console.log(`[pipeline] ${sessionKey}: event type=${event.type}`);
-        cardController?.handleEvent(sessionKey, event);
+        const isVoiceSession = voiceSessions.has(sessionKey);
+        console.log(`[event] ${sessionKey}: type=${event.type} voice=${isVoiceSession} hasCard=${!!cardController} hasTgStream=${!!tgStream}`);
 
-        if (!cardController && adapter) {
+        if (isVoiceSession && adapter) {
           if (event.type === 'text' && event.content.trim()) {
-            await adapter.send(chatId, { text: event.content });
+            voiceResponseBuffer += event.content;
           } else if (event.type === 'error') {
-            await adapter.send(chatId, { text: `Error: ${event.message}` });
+            voiceResponseBuffer += `\n\nError: ${event.message}`;
+          }
+          cardController?.handleEvent(sessionKey, event);
+          if (event.type === 'result' || event.type === 'error') {
+            stopTyping(chatId);
+            await sendVoiceReply(adapter, chatId, sessionKey, voiceResponseBuffer);
+            voiceResponseBuffer = '';
+          }
+        } else if (cardController) {
+          cardController.handleEvent(sessionKey, event);
+        } else if (adapter) {
+          if (event.type === 'text' && event.content.trim()) {
+            if (tgStream) {
+              tgStream.appendText(sessionKey, chatId, event.content);
+            } else {
+              await adapter.send(chatId, { text: event.content });
+            }
+          } else if (event.type === 'error') {
+            stopTyping(chatId);
+            if (tgStream) {
+              tgStream.appendText(sessionKey, chatId, `\n\nError: ${event.message}`);
+              await tgStream.finalize(sessionKey);
+            } else {
+              await adapter.send(chatId, { text: `Error: ${event.message}` });
+            }
+          } else if (event.type === 'result') {
+            stopTyping(chatId);
+            if (tgStream) {
+              await tgStream.finalize(sessionKey);
+            }
           }
         }
 
@@ -189,8 +330,21 @@ async function main(): Promise<void> {
       },
       onProcessExit: async (sk, code) => {
         console.log(`[pipeline] ${sk}: process exited with code=${code}`);
+        stopTyping(chatId);
         cardControllers.get(botName)?.interruptCard(sk);
-        if (code !== 0 && adapter) {
+        const isVoiceSession = voiceSessions.has(sk);
+        if (isVoiceSession) {
+          if (code !== 0) voiceResponseBuffer += `\n\n${buildCrashNotification(code)}`;
+          if (voiceResponseBuffer.trim()) {
+            await sendVoiceReply(adapter!, chatId, sk, voiceResponseBuffer);
+          }
+          voiceResponseBuffer = '';
+        } else if (tgStream) {
+          if (code !== 0) {
+            tgStream.appendText(sk, chatId, `\n\n${buildCrashNotification(code)}`);
+          }
+          await tgStream.finalize(sk);
+        } else if (code !== 0 && adapter) {
           await adapter.send(chatId, { text: buildCrashNotification(code) });
         }
       },
@@ -209,9 +363,31 @@ async function main(): Promise<void> {
 
     adapter.onCallback?.((callback) => {
       const accepted = handlePermissionCallback(callback, agentManager);
-      if (!accepted) {
-        console.log(`[pipeline] Ignored callback: ${callback.data}`);
+      if (accepted) return;
+
+      const resume = parseSessionResumeCallback(callback.data);
+      if (resume) {
+        void handleCLISessionResume({
+          callback,
+          resume,
+          botName,
+          botConfig,
+          adapter,
+          store,
+          agentManager,
+          handoffService,
+          cardController: cardControllers.get(botName),
+          tgStreamController: telegramStreams.get(botName),
+        }).catch((err) => {
+          console.error('[pipeline] CLI session resume failed:', err);
+          void adapter.send(callback.chatId, {
+            text: `Resume failed: ${err instanceof Error ? err.message : String(err)}`,
+          });
+        });
+        return;
       }
+
+      console.log(`[pipeline] Ignored callback: ${callback.data}`);
     });
   }
 
@@ -248,7 +424,9 @@ async function main(): Promise<void> {
           agentManager,
           handoffService,
           cardControllers.get(botName),
+          telegramStreams.get(botName),
           runtimeState,
+          botConfig,
         );
         return;
       }
@@ -268,12 +446,31 @@ async function main(): Promise<void> {
       if (config.newMessageBehavior === 'interrupt' && agentManager.hasProcess(sessionKey)) {
         agentManager.cancelAgent(sessionKey);
         cardControllers.get(botName)?.interruptCard(sessionKey);
+        telegramStreams.get(botName)?.interrupt(sessionKey);
       }
 
       const sender = { channel: msg.platform, userId: msg.userId, userName: msg.userName };
       const senderHeader = buildSenderHeader(sender);
-      const messageText = senderHeader + msg.text;
       await downloadInboundAttachments(msg, adapter, mediaDir);
+
+      if (msg.isVoice) {
+        const audioAttachment = msg.attachments?.find(a => a.type === 'audio' && a.localPath);
+        if (audioAttachment?.localPath) {
+          const audioBuffer = await readFile(audioAttachment.localPath);
+          const format = audioAttachment.mimeType?.includes('ogg') ? 'ogg' : 'mp3';
+          const transcript = await transcribeAudio(audioBuffer, format);
+          if (transcript) {
+            msg.text = transcript;
+            msg.attachments = msg.attachments?.filter(a => a !== audioAttachment);
+            voiceSessions.set(sessionKey, msg.chatId);
+            console.log(`[voice] STT transcribed for ${sessionKey}: ${transcript.slice(0, 80)}`);
+          } else {
+            console.warn(`[voice] STT failed for ${sessionKey}, sending as attachment`);
+          }
+        }
+      }
+
+      const messageText = senderHeader + msg.text;
       const userMessage = await buildUserMessageForAgent(
         botConfig.agent,
         messageText,
@@ -281,8 +478,10 @@ async function main(): Promise<void> {
       );
 
       const cardController = cardControllers.get(botName);
+      if (!cardController && adapter) {
+        startTyping(msg.chatId, adapter);
+      }
       const isNewProcess = !agentManager.hasProcess(sessionKey);
-      console.log(`[pipeline] ${sessionKey}: isNewProcess=${isNewProcess}`);
       await cardController?.startCard(
         msg.chatId,
         sessionKey,
@@ -386,7 +585,9 @@ async function handleBridgeCommand(
   agentManager: AgentManager,
   handoffService: HandoffService,
   cardController: StreamingCardController | undefined,
+  tgStreamController: TelegramStreamController | undefined,
   runtimeState: RuntimeCommandState,
+  botConfig: BotConfig,
 ): Promise<void> {
   switch (cmd.command) {
     case 'new': {
@@ -443,6 +644,7 @@ async function handleBridgeCommand(
     case 'stop': {
       agentManager.cancelAgent(sessionKey);
       cardController?.interruptCard(sessionKey);
+      tgStreamController?.interrupt(sessionKey);
       await adapter.send(chatId, { text: '已发送中断信号' });
       break;
     }
@@ -450,6 +652,7 @@ async function handleBridgeCommand(
     case 'kill': {
       agentManager.killAgent(sessionKey);
       cardController?.interruptCard(sessionKey);
+      tgStreamController?.interrupt(sessionKey);
       await adapter.send(chatId, { text: '已强制终止进程' });
       break;
     }
@@ -565,25 +768,45 @@ async function handleBridgeCommand(
     }
 
     case 'sessions': {
-      const sessions = await store.listByBot(botName);
-      if (sessions.length === 0) {
-        await adapter.send(chatId, { text: '没有活跃会话' });
+      const sub = cmd.args[0];
+
+      if (sub === 'bot') {
+        const sessions = await store.listByBot(botName);
+        if (sessions.length === 0) {
+          await adapter.send(chatId, { text: '没有活跃会话' });
+          break;
+        }
+        const lines = sessions.map((session) => {
+          const [, sessionChatId] = session.key.split(':');
+          const processState = agentManager.hasProcess(session.key) ? 'Running' : 'Idle';
+          const lastActive = formatDateTime(session.lastActiveAt);
+          return [
+            `- \`${session.agentSessionId ?? session.id}\``,
+            `${session.state}/${processState}`,
+            `chat: \`${sessionChatId}\``,
+            `agent: ${session.agentName}`,
+            `cwd: \`${session.workingDirectory}\``,
+            `last: ${lastActive}`,
+          ].join(' | ');
+        });
+        await adapter.send(chatId, { text: `**会话列表:**\n${lines.join('\n')}` });
         break;
       }
-      const lines = sessions.map((session) => {
-        const [, sessionChatId] = session.key.split(':');
-        const processState = agentManager.hasProcess(session.key) ? 'Running' : 'Idle';
-        const lastActive = formatDateTime(session.lastActiveAt);
-        return [
-          `- \`${session.agentSessionId ?? session.id}\``,
-          `${session.state}/${processState}`,
-          `chat: \`${sessionChatId}\``,
-          `agent: ${session.agentName}`,
-          `cwd: \`${session.workingDirectory}\``,
-          `last: ${lastActive}`,
-        ].join(' | ');
-      });
-      await adapter.send(chatId, { text: `**会话列表:**\n${lines.join('\n')}` });
+
+      const useCodex = sub === 'codex' || (!sub && botConfig.agent === 'codex');
+      const sessions = useCodex
+        ? await new CodexSessionScanner(join(homedir(), '.codex')).scan()
+        : await new CLISessionScanner(join(homedir(), '.claude')).scan();
+
+      if (sessions.length === 0) {
+        await adapter.send(chatId, { text: useCodex ? '没有找到 Codex CLI 会话' : '没有找到 Claude Code CLI 会话' });
+        break;
+      }
+      if (adapter.name === 'telegram') {
+        await adapter.send(chatId, { card: buildCLISessionText(sessions) });
+      } else {
+        await adapter.send(chatId, { card: buildCLISessionCard(sessions) });
+      }
       break;
     }
 
@@ -610,6 +833,72 @@ async function handleBridgeCommand(
     default:
       await adapter.send(chatId, { text: `未知指令: /${cmd.command}` });
   }
+}
+
+async function handleCLISessionResume(params: {
+  callback: CallbackQuery;
+  resume: { sessionId: string; cwd: string };
+  botName: string;
+  botConfig: BotConfig;
+  adapter: PlatformAdapter;
+  store: SessionStore;
+  agentManager: AgentManager;
+  handoffService: HandoffService;
+  cardController: StreamingCardController | undefined;
+  tgStreamController: TelegramStreamController | undefined;
+}): Promise<void> {
+  const { callback, resume, botName, botConfig, adapter, store, agentManager, handoffService } = params;
+  if (!callback.chatId) {
+    throw new Error('Missing chat id in callback');
+  }
+
+  const platform = callback.platform ?? 'feishu';
+  const sessionKey: SessionKey = `${platform}:${callback.chatId}:${botName}`;
+  agentManager.cancelAgent(sessionKey);
+  params.cardController?.interruptCard(sessionKey);
+  params.tgStreamController?.interrupt(sessionKey);
+
+  let workDir = resume.cwd;
+  if (!workDir) {
+    const scanner = botConfig.agent === 'codex'
+      ? new CodexSessionScanner(join(homedir(), '.codex'))
+      : new CLISessionScanner(join(homedir(), '.claude'));
+    const sessions = await scanner.scan();
+    const match = sessions.find((s) => s.sessionId === resume.sessionId);
+    workDir = match?.cwd || homedir();
+  }
+
+  const agentName = botConfig.agent;
+  const session = await store.getOrCreate(sessionKey, {
+    agentName,
+    workingDirectory: workDir,
+  });
+  await store.updateAgentSessionId(session.id, resume.sessionId);
+  await store.updateWorkingDirectory(session.id, workDir);
+  await store.updateState(session.id, 'active');
+  await store.touch(session.id);
+
+  const result = await handoffService.acceptHandoff({
+    botName,
+    sessionId: resume.sessionId,
+    workDir,
+    agentName,
+    chatId: callback.chatId,
+    platform: callback.platform,
+  });
+
+  if (!result.success) {
+    await adapter.send(callback.chatId, { text: `Resume failed: ${result.error}` });
+    return;
+  }
+
+  await adapter.send(callback.chatId, {
+    text: buildHandoffNotification({
+      sessionId: resume.sessionId,
+      workDir,
+      agentName,
+    }),
+  });
 }
 
 function formatDateTime(value: number): string {

@@ -97,6 +97,7 @@ export interface InboundMessage {
   attachments?: FileAttachment[];
   replyTo?: string;
   mentions?: string[];
+  isVoice?: boolean;
   raw?: unknown;
 }
 
@@ -107,10 +108,11 @@ export interface OutboundContent {
 }
 
 export interface CardPayload {
-  type: 'streaming' | 'final' | 'permission' | 'error';
+  type: 'streaming' | 'final' | 'permission' | 'error' | 'session_list';
   content: string;
   title?: string;
   buttons?: CardButton[];
+  rawElements?: object[];
 }
 
 export interface CardButton {
@@ -138,6 +140,7 @@ export interface PlatformAdapter {
   sendCard?(chatId: string, card: CardPayload): Promise<string>;
   updateCard?(messageId: string, content: string, seq: number): Promise<void>;
   downloadFile?(messageId: string, fileKey: string, type: string): Promise<Buffer>;
+  sendTypingIndicator?(chatId: string): Promise<void>;
 }
 
 export interface CallbackQuery {
@@ -204,6 +207,7 @@ export interface HandoffRequest {
   workDir: string;
   agentName: string;
   chatId?: string;
+  platform?: string;
 }
 
 export interface HandoffResult {

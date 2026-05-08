@@ -25,7 +25,8 @@ export class HandoffService {
 
   async acceptHandoff(req: HandoffRequest): Promise<HandoffResult> {
     const chatId = req.chatId ?? 'default';
-    const sessionKey: SessionKey = `feishu:${chatId}:${req.botName}`;
+    const platform = req.platform ?? 'feishu';
+    const sessionKey: SessionKey = `${platform}:${chatId}:${req.botName}`;
 
     if (this.locks.has(sessionKey)) {
       return { success: false, error: 'Handoff already in progress' };

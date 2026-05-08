@@ -46,6 +46,7 @@ interface TelegramMessage {
   caption?: string;
   photo?: TelegramPhotoSize[];
   document?: TelegramDocument;
+  voice?: TelegramVoice;
 }
 
 interface TelegramPhotoSize {
@@ -60,6 +61,14 @@ interface TelegramDocument {
   file_id?: string;
   file_unique_id?: string;
   file_name?: string;
+  mime_type?: string;
+  file_size?: number;
+}
+
+interface TelegramVoice {
+  file_id?: string;
+  file_unique_id?: string;
+  duration?: number;
   mime_type?: string;
   file_size?: number;
 }
@@ -119,19 +128,24 @@ export class TelegramAdapter implements PlatformAdapter {
     };
 
     if (content.card?.buttons?.length) {
+      const mapped = content.card.buttons.map((button) => ({
+        text: button.text,
+        callback_data: button.value,
+      }));
       payload.reply_markup = {
-        inline_keyboard: [
-          content.card.buttons.map((button) => ({
-            text: button.text,
-            callback_data: button.value,
-          })),
-        ],
+        inline_keyboard: content.card.type === 'session_list'
+          ? mapped.map((b) => [b])
+          : [mapped],
       };
     }
 
     const result = await this.botApi<{ message_id?: number | string }>('sendMessage', payload);
 
     return String(result.message_id ?? '');
+  }
+
+  async sendTypingIndicator(chatId: string): Promise<void> {
+    await this.botApi('sendChatAction', { chat_id: chatId, action: 'typing' });
   }
 
   async editMessage(chatId: string, msgId: string, content: string): Promise<void> {
@@ -159,6 +173,13 @@ export class TelegramAdapter implements PlatformAdapter {
     form.append('chat_id', chatId);
     form.append(field, blob, file.name);
     await this.botApi(method, form);
+  }
+
+  async sendVoice(chatId: string, audioBuffer: Buffer): Promise<void> {
+    const form = new FormData();
+    form.append('chat_id', chatId);
+    form.append('voice', new Blob([audioBuffer as unknown as BlobPart], { type: 'audio/mpeg' }), 'voice.mp3');
+    await this.botApi('sendVoice', form);
   }
 
   async downloadFile(_messageId: string, fileKey: string, _type: string): Promise<Buffer> {
@@ -304,6 +325,17 @@ export function parseTelegramUpdate(update: unknown): InboundMessage | null {
     });
   }
 
+  const isVoice = Boolean(message.voice?.file_id);
+  if (message.voice?.file_id) {
+    attachments.push({
+      type: 'audio',
+      fileKey: message.voice.file_id,
+      mimeType: message.voice.mime_type ?? 'audio/ogg',
+      size: message.voice.file_size,
+      messageId,
+    });
+  }
+
   const text = message.text ?? message.caption ?? '';
   if (!text && attachments.length === 0) return null;
 
@@ -315,6 +347,7 @@ export function parseTelegramUpdate(update: unknown): InboundMessage | null {
     text,
     chatType: message.chat.type,
     attachments: attachments.length > 0 ? attachments : undefined,
+    isVoice,
     raw: update,
   };
 }

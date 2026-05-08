@@ -12,6 +12,12 @@ export interface PermissionAgentManager {
   denyPermission(requestId: string): boolean;
 }
 
+export interface SessionResumeCallbackData {
+  action: 'resume_cli';
+  sessionId: string;
+  cwd: string;
+}
+
 export function parsePermissionCallbackData(rawData: string): PermissionCallbackData | null {
   const data = unwrapCallbackAction(rawData);
   if (!data.startsWith('perm:')) return null;
@@ -37,6 +43,18 @@ export function handlePermissionCallback(
   return agentManager.approvePermission(parsed.requestId);
 }
 
+export function parseSessionResumeCallback(rawData: string): SessionResumeCallbackData | null {
+  const compact = parseCompactResume(rawData);
+  if (compact) return compact;
+
+  const direct = parseResumeObject(rawData);
+  if (direct) return direct;
+
+  const unwrapped = unwrapCallbackAction(rawData);
+  if (unwrapped === rawData) return null;
+  return parseResumeObject(unwrapped);
+}
+
 function unwrapCallbackAction(rawData: string): string {
   try {
     const parsed = JSON.parse(rawData) as unknown;
@@ -52,6 +70,39 @@ function unwrapCallbackAction(rawData: string): string {
   }
 
   return rawData;
+}
+
+/**
+ * Parse compact Telegram resume format: "resume:<sessionId>"
+ * Used because Telegram callback_data has a 64-byte limit.
+ * The cwd is not included; the resume handler looks it up from the session store.
+ */
+function parseCompactResume(rawData: string): SessionResumeCallbackData | null {
+  const unwrapped = unwrapCallbackAction(rawData);
+  if (!unwrapped.startsWith('resume:')) return null;
+  const sessionId = unwrapped.slice('resume:'.length);
+  if (!sessionId) return null;
+  return { action: 'resume_cli', sessionId, cwd: '' };
+}
+
+function parseResumeObject(rawData: string): SessionResumeCallbackData | null {
+  try {
+    const parsed = JSON.parse(rawData) as unknown;
+    if (!parsed || typeof parsed !== 'object') return null;
+    const record = parsed as Record<string, unknown>;
+    if (
+      record.action !== 'resume_cli'
+      || typeof record.sessionId !== 'string'
+      || typeof record.cwd !== 'string'
+      || !record.sessionId
+      || !record.cwd
+    ) {
+      return null;
+    }
+    return { action: 'resume_cli', sessionId: record.sessionId, cwd: record.cwd };
+  } catch {
+    return null;
+  }
 }
 
 function isPermissionDecision(value: string | undefined): value is PermissionDecision {
