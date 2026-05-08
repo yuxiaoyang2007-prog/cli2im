@@ -34,10 +34,10 @@ export class StreamingCardController {
     this.throttle = throttle;
   }
 
-  async startCard(chatId: string, sessionKey: string, title: string): Promise<void> {
+  async startCard(chatId: string, sessionKey: string, title: string, initialText?: string): Promise<void> {
     const messageId = await this.adapter.sendCard(chatId, {
       type: 'streaming',
-      content: 'Starting...',
+      content: initialText ?? 'Processing...',
       title,
     });
 
@@ -62,6 +62,7 @@ export class StreamingCardController {
 
     switch (event.type) {
       case 'text':
+        card.thinking = '';
         card.content += event.content;
         this.scheduleUpdate(sessionKey);
         break;

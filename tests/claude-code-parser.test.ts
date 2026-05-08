@@ -1,155 +1,262 @@
-import { describe, it, expect } from 'vitest';
-import { ClaudeCodePlugin } from '../src/agents/claude-code.js';
-import { Readable } from 'node:stream';
-import type { AgentEvent } from '../src/types.js';
+import { describe, it, expect, vi } from 'vitest';
+import {
+  ClaudeCodePlugin,
+  ClaudeCodeVirtualProcess,
+  createSDKEventMappingState,
+  mapSDKEvent,
+} from '../src/agents/claude-code.js';
+import type { AgentEvent, SpawnOpts } from '../src/types.js';
+import type { SDKMessage } from '@anthropic-ai/claude-agent-sdk';
 
-function collectEvents(parser: NodeJS.ReadWriteStream, input: string): Promise<AgentEvent[]> {
+function baseOpts(): SpawnOpts {
+  return {
+    workingDirectory: '/Users/test/project',
+    permissionMode: 'blacklist',
+  };
+}
+
+function waitFor(predicate: () => boolean, timeoutMs = 500): Promise<void> {
   return new Promise((resolve, reject) => {
-    const events: AgentEvent[] = [];
-    const readable = Readable.from([input]);
-    readable
-      .pipe(parser)
-      .on('data', (event: AgentEvent) => events.push(event))
-      .on('end', () => resolve(events))
-      .on('error', reject);
+    const startedAt = Date.now();
+    const tick = () => {
+      if (predicate()) {
+        resolve();
+        return;
+      }
+      if (Date.now() - startedAt > timeoutMs) {
+        reject(new Error('Timed out waiting for condition'));
+        return;
+      }
+      setTimeout(tick, 5);
+    };
+    tick();
   });
 }
 
 describe('ClaudeCodePlugin stdout parser', () => {
   const plugin = new ClaudeCodePlugin('/usr/local/bin/claude');
 
-  it('parses assistant text message', async () => {
-    const input = JSON.stringify({
-      type: 'assistant',
-      message: {
-        role: 'assistant',
-        content: [{ type: 'text', text: 'Hello world' }],
-      },
-    }) + '\n';
+  it('passes AgentEvent objects through in object mode', async () => {
+    const parser = plugin.createStdoutParser();
+    const events: AgentEvent[] = [];
+    parser.on('data', (event: AgentEvent) => events.push(event));
 
-    const events = await collectEvents(plugin.createStdoutParser(), input);
-    expect(events).toHaveLength(1);
-    expect(events[0]).toEqual({ type: 'text', content: 'Hello world' });
-  });
+    parser.write({ type: 'text', content: 'Hello world' } satisfies AgentEvent);
 
-  it('parses tool_use event', async () => {
-    const input = JSON.stringify({
-      type: 'assistant',
-      message: {
-        role: 'assistant',
-        content: [{ type: 'tool_use', id: 'tu_1', name: 'Bash', input: { command: 'ls' } }],
-      },
-    }) + '\n';
-
-    const events = await collectEvents(plugin.createStdoutParser(), input);
-    expect(events).toHaveLength(1);
-    expect(events[0]).toEqual({
-      type: 'tool_use',
-      id: 'tu_1',
-      name: 'Bash',
-      input: { command: 'ls' },
-    });
-  });
-
-  it('parses tool_result event', async () => {
-    const input = JSON.stringify({
-      type: 'result',
-      result: {
-        role: 'assistant',
-        content: [{ type: 'text', text: 'Done' }],
-      },
-      session_id: 'ses_abc',
-    }) + '\n';
-
-    const events = await collectEvents(plugin.createStdoutParser(), input);
-    const resultEvent = events.find((e) => e.type === 'result');
-    expect(resultEvent).toBeDefined();
-    expect((resultEvent as any).sessionId).toBe('ses_abc');
-  });
-
-  it('parses permission_request', async () => {
-    const input = JSON.stringify({
-      type: 'tool_use_permission',
-      tool_use_id: 'tu_2',
-      tool_name: 'Bash',
-      input: { command: 'rm -rf /' },
-    }) + '\n';
-
-    const events = await collectEvents(plugin.createStdoutParser(), input);
-    expect(events).toHaveLength(1);
-    expect(events[0]).toEqual({
-      type: 'permission_request',
-      id: 'tu_2',
-      tool: 'Bash',
-      input: { command: 'rm -rf /' },
-    });
-  });
-
-  it('handles multiple events in sequence', async () => {
-    const lines = [
-      JSON.stringify({ type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: 'thinking...' }] } }),
-      JSON.stringify({ type: 'assistant', message: { role: 'assistant', content: [{ type: 'tool_use', id: 'tu_1', name: 'Read', input: { file_path: '/a.ts' } }] } }),
-    ].join('\n') + '\n';
-
-    const events = await collectEvents(plugin.createStdoutParser(), lines);
-    expect(events).toHaveLength(2);
-    expect(events[0].type).toBe('text');
-    expect(events[1].type).toBe('tool_use');
+    expect(events).toEqual([{ type: 'text', content: 'Hello world' }]);
   });
 });
 
-describe('ClaudeCodePlugin formatStdinMessage', () => {
+describe('mapSDKEvent', () => {
+  it('maps stream text deltas and suppresses duplicate assistant text', () => {
+    const state = createSDKEventMappingState();
+
+    const deltaEvents = mapSDKEvent({
+      type: 'stream_event',
+      session_id: 'ses_1',
+      parent_tool_use_id: null,
+      uuid: '00000000-0000-4000-8000-000000000001',
+      event: {
+        type: 'content_block_delta',
+        index: 0,
+        delta: { type: 'text_delta', text: 'Hello' },
+      },
+    } as unknown as SDKMessage, state);
+
+    const assistantEvents = mapSDKEvent({
+      type: 'assistant',
+      session_id: 'ses_1',
+      parent_tool_use_id: null,
+      uuid: '00000000-0000-4000-8000-000000000002',
+      message: {
+        id: 'msg_1',
+        role: 'assistant',
+        model: 'claude-sonnet-4-20250514',
+        stop_reason: 'end_turn',
+        stop_sequence: null,
+        type: 'message',
+        usage: { input_tokens: 1, output_tokens: 1 },
+        content: [{ type: 'text', text: 'Hello' }],
+      },
+    } as unknown as SDKMessage, state);
+
+    expect(deltaEvents).toEqual([{ type: 'text', content: 'Hello' }]);
+    expect(assistantEvents).toEqual([]);
+  });
+
+  it('maps assistant tool_use and tracks names for tool_result events', () => {
+    const state = createSDKEventMappingState();
+
+    const toolUseEvents = mapSDKEvent({
+      type: 'assistant',
+      session_id: 'ses_1',
+      parent_tool_use_id: null,
+      uuid: '00000000-0000-4000-8000-000000000003',
+      message: {
+        id: 'msg_2',
+        role: 'assistant',
+        model: 'claude-sonnet-4-20250514',
+        stop_reason: 'tool_use',
+        stop_sequence: null,
+        type: 'message',
+        usage: { input_tokens: 1, output_tokens: 1 },
+        content: [{ type: 'tool_use', id: 'tu_1', name: 'Bash', input: { command: 'ls' } }],
+      },
+    } as unknown as SDKMessage, state);
+
+    const toolResultEvents = mapSDKEvent({
+      type: 'user',
+      session_id: 'ses_1',
+      parent_tool_use_id: null,
+      uuid: '00000000-0000-4000-8000-000000000004',
+      message: {
+        role: 'user',
+        content: [{ type: 'tool_result', tool_use_id: 'tu_1', content: 'ok', is_error: false }],
+      },
+    } as unknown as SDKMessage, state);
+
+    expect(toolUseEvents).toEqual([
+      { type: 'tool_use', id: 'tu_1', name: 'Bash', input: { command: 'ls' } },
+    ]);
+    expect(toolResultEvents).toEqual([
+      { type: 'tool_result', id: 'tu_1', name: 'Bash', output: 'ok', isError: false },
+    ]);
+  });
+
+  it('maps result and init status messages', () => {
+    const state = createSDKEventMappingState();
+
+    const statusEvents = mapSDKEvent({
+      type: 'system',
+      subtype: 'init',
+      session_id: 'ses_init',
+      uuid: '00000000-0000-4000-8000-000000000005',
+    } as unknown as SDKMessage, state);
+
+    const resultEvents = mapSDKEvent({
+      type: 'result',
+      subtype: 'success',
+      session_id: 'ses_result',
+      uuid: '00000000-0000-4000-8000-000000000006',
+      usage: {
+        input_tokens: 10,
+        output_tokens: 5,
+        cache_read_input_tokens: 3,
+        cache_creation_input_tokens: 2,
+      },
+    } as unknown as SDKMessage, state);
+
+    expect(statusEvents).toEqual([{ type: 'status', sessionId: 'ses_init' }]);
+    expect(resultEvents).toEqual([
+      {
+        type: 'result',
+        sessionId: 'ses_result',
+        usage: {
+          inputTokens: 10,
+          outputTokens: 5,
+          cacheReadTokens: 3,
+          cacheWriteTokens: 2,
+        },
+      },
+    ]);
+    expect(state.latestSessionId).toBe('ses_result');
+  });
+});
+
+describe('ClaudeCodeVirtualProcess permissions', () => {
+  it('emits permission_request and resolves canUseTool from stdin response', async () => {
+    const plugin = new ClaudeCodePlugin('/usr/local/bin/claude');
+    const proc = plugin.spawn(baseOpts()) as ClaudeCodeVirtualProcess;
+    const stdoutEvents: AgentEvent[] = [];
+    proc.stdout.on('data', (event: AgentEvent) => stdoutEvents.push(event));
+
+    const resultPromise = proc.canUseTool(
+      'Bash',
+      { command: 'ls' },
+      { toolUseID: 'tu_perm', signal: new AbortController().signal },
+    );
+
+    await waitFor(() => stdoutEvents.length === 1);
+    expect(stdoutEvents[0]).toEqual({
+      type: 'permission_request',
+      id: 'tu_perm',
+      tool: 'Bash',
+      input: { command: 'ls' },
+    });
+
+    proc.stdin.write(plugin.formatPermissionResponse('tu_perm', 'allow'));
+
+    await expect(resultPromise).resolves.toEqual({ behavior: 'allow' });
+  });
+});
+
+describe('ClaudeCodeVirtualProcess query lifecycle', () => {
+  it('starts query on first user message, emits events, and stays alive after result', async () => {
+    const queryFn = vi.fn(({ options }) => (async function* () {
+      yield {
+        type: 'assistant',
+        session_id: 'ses_new',
+        parent_tool_use_id: null,
+        uuid: '00000000-0000-4000-8000-000000000007',
+        message: {
+          id: 'msg_3',
+          role: 'assistant',
+          model: 'claude-sonnet-4-20250514',
+          stop_reason: 'end_turn',
+          stop_sequence: null,
+          type: 'message',
+          usage: { input_tokens: 1, output_tokens: 1 },
+          content: [{ type: 'text', text: 'Done' }],
+        },
+      } as unknown as SDKMessage;
+      yield {
+        type: 'result',
+        subtype: 'success',
+        session_id: 'ses_new',
+        uuid: '00000000-0000-4000-8000-000000000008',
+        usage: { input_tokens: 1, output_tokens: 1 },
+      } as unknown as SDKMessage;
+      expect(options.resume).toBeUndefined();
+    })());
+    const plugin = new ClaudeCodePlugin('/usr/local/bin/claude', queryFn as any);
+    const proc = plugin.spawn(baseOpts());
+    const stdoutEvents: AgentEvent[] = [];
+    const exitHandler = vi.fn();
+    proc.stdout.on('data', (event: AgentEvent) => stdoutEvents.push(event));
+    proc.on('exit', exitHandler);
+
+    proc.stdin.write(plugin.formatStdinMessage({ role: 'user', content: 'hello' }));
+
+    await waitFor(() => stdoutEvents.some((event) => event.type === 'result'));
+
+    expect(queryFn).toHaveBeenCalledTimes(1);
+    expect(stdoutEvents).toContainEqual({ type: 'text', content: 'Done' });
+    expect(stdoutEvents).toContainEqual({
+      type: 'result',
+      sessionId: 'ses_new',
+      usage: { inputTokens: 1, outputTokens: 1, cacheReadTokens: undefined, cacheWriteTokens: undefined },
+    });
+    expect(proc.sessionId).toBe('ses_new');
+    expect(exitHandler).not.toHaveBeenCalled();
+  });
+});
+
+describe('ClaudeCodePlugin formatters', () => {
   const plugin = new ClaudeCodePlugin('/usr/local/bin/claude');
 
-  it('formats user text message', () => {
+  it('formats user text messages', () => {
     const msg = plugin.formatStdinMessage({ role: 'user', content: 'hello' });
     const parsed = JSON.parse(msg);
     expect(parsed.type).toBe('user');
     expect(parsed.message.role).toBe('user');
     expect(parsed.message.content).toBe('hello');
   });
-});
 
-describe('ClaudeCodePlugin formatPermissionResponse', () => {
-  const plugin = new ClaudeCodePlugin('/usr/local/bin/claude');
-
-  it('formats allow response', () => {
-    const msg = plugin.formatPermissionResponse('tu_1', 'allow');
+  it('formats permission responses', () => {
+    const msg = plugin.formatPermissionResponse('tu_1', 'deny');
     const parsed = JSON.parse(msg);
     expect(parsed.type).toBe('tool_use_permission_response');
     expect(parsed.tool_use_id).toBe('tu_1');
-    expect(parsed.decision).toBe('allow');
-  });
-
-  it('formats deny response', () => {
-    const msg = plugin.formatPermissionResponse('tu_1', 'deny');
-    const parsed = JSON.parse(msg);
     expect(parsed.decision).toBe('deny');
-  });
-});
-
-describe('ClaudeCodePlugin buildSpawnArgs', () => {
-  const plugin = new ClaudeCodePlugin('/usr/local/bin/claude');
-
-  it('includes stream-json flags', () => {
-    const args = plugin.buildSpawnArgs({
-      workingDirectory: '~/projects',
-      permissionMode: 'blacklist',
-    });
-    expect(args).toContain('--input-format');
-    expect(args).toContain('stream-json');
-    expect(args).toContain('--output-format');
-    expect(args).toContain('--permission-prompt-tool');
-    expect(args).toContain('stdio');
-  });
-
-  it('includes model when specified', () => {
-    const args = plugin.buildSpawnArgs({
-      workingDirectory: '~/projects',
-      permissionMode: 'blacklist',
-      model: 'claude-sonnet-4-20250514',
-    });
-    expect(args).toContain('--model');
-    expect(args).toContain('claude-sonnet-4-20250514');
   });
 });

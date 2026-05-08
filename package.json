@@ -10,6 +10,7 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.2.133",
     "@larksuiteoapi/node-sdk": "^1.60.0",
     "content-guard": "file:../content-guard",
     "sql.js": "^1.11.0",

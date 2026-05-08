@@ -184,6 +184,7 @@ async function main(): Promise<void> {
         }
       },
       onProcessExit: async (sk, code) => {
+        console.log(`[pipeline] ${sk}: process exited with code=${code}`);
         cardControllers.get(botName)?.interruptCard(sk);
         if (code !== 0 && adapter) {
           await adapter.send(chatId, { text: buildCrashNotification(code) });
@@ -268,9 +269,16 @@ async function main(): Promise<void> {
       const sender = { channel: msg.platform, userId: msg.userId, userName: msg.userName };
 
       const cardController = cardControllers.get(botName);
-      await cardController?.startCard(msg.chatId, sessionKey, botConfig.agent);
+      const isNewProcess = !agentManager.hasProcess(sessionKey);
+      console.log(`[pipeline] ${sessionKey}: isNewProcess=${isNewProcess}`);
+      await cardController?.startCard(
+        msg.chatId,
+        sessionKey,
+        botConfig.agent,
+        isNewProcess ? 'Starting...' : undefined,
+      );
 
-      if (!agentManager.hasProcess(sessionKey)) {
+      if (isNewProcess) {
         const handlers = createEventHandlers(sessionKey);
 
         const senderEnv = buildSenderEnv(sender);
