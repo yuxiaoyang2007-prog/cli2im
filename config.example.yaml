@@ -15,7 +15,7 @@ bots:
 
 agents:
   claude-code:
-    binary: /Users/xiaoyangyu/.claude/local/claude
+    binary: ~/.claude/local/claude
     defaultModel: claude-sonnet-4-20250514
     env:
       DISABLE_AUTOUPDATER: "1"

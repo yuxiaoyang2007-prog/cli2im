@@ -67,11 +67,11 @@ describe('parseSessionResumeCallback', () => {
     expect(parseSessionResumeCallback(JSON.stringify({
       action: 'resume_cli',
       sessionId: '9f53e234-c06b-44e6-b71e-3e1a4b618123',
-      cwd: '/Users/joulian/projects/cli2im:with-colon',
+      cwd: '/Users/testuser/projects/cli2im:with-colon',
     }))).toEqual({
       action: 'resume_cli',
       sessionId: '9f53e234-c06b-44e6-b71e-3e1a4b618123',
-      cwd: '/Users/joulian/projects/cli2im:with-colon',
+      cwd: '/Users/testuser/projects/cli2im:with-colon',
     });
   });
 

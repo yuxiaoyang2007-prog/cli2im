@@ -15,7 +15,7 @@ describe('parseTelegramUpdate', () => {
       message: {
         message_id: 11,
         chat: { id: -1001, type: 'group' },
-        from: { id: 42, username: 'joulian' },
+        from: { id: 42, username: 'testuser' },
         text: 'hello',
       },
     });
@@ -24,7 +24,7 @@ describe('parseTelegramUpdate', () => {
       platform: 'telegram',
       chatId: '-1001',
       userId: '42',
-      userName: 'joulian',
+      userName: 'testuser',
       text: 'hello',
       chatType: 'group',
     });
