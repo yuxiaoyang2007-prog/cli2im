@@ -138,6 +138,44 @@ describe('Relay messages bypass requireMention', () => {
   });
 });
 
+describe('Relay-enabled bots implicitly require mention', () => {
+  it('requires mention when 2+ relay bots in chat', () => {
+    const botConfig: BotConfig = {
+      ...baseConfig.bots.codexbot,
+      requireMention: false,
+      relay: { enabled: true, maxConsecutiveRounds: 5 },
+    };
+    const msg = humanMsg({ mentions: [] });
+
+    const reason = getGroupMessageSkipReason(msg, botConfig, 'ou_bot', 2);
+    expect(reason).toBe('Bot mention required');
+  });
+
+  it('does not require mention when only 1 relay bot in chat', () => {
+    const botConfig: BotConfig = {
+      ...baseConfig.bots.codexbot,
+      requireMention: false,
+      relay: { enabled: true, maxConsecutiveRounds: 5 },
+    };
+    const msg = humanMsg({ mentions: [] });
+
+    const reason = getGroupMessageSkipReason(msg, botConfig, 'ou_bot', 1);
+    expect(reason).toBeUndefined();
+  });
+
+  it('relay message bypasses implicit mention even with 2+ bots', () => {
+    const botConfig: BotConfig = {
+      ...baseConfig.bots.codexbot,
+      requireMention: false,
+      relay: { enabled: true, maxConsecutiveRounds: 5 },
+    };
+    const msg = relayMsg({ mentions: [] });
+
+    const reason = getGroupMessageSkipReason(msg, botConfig, 'ou_bot', 3);
+    expect(reason).toBeUndefined();
+  });
+});
+
 describe('Relay messages skip sanitizeInput', () => {
   it('relay message text is not modified by pipeline', () => {
     const pipeline = new InboundPipeline(baseConfig);

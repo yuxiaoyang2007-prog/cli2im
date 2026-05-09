@@ -70,6 +70,7 @@ export function getGroupMessageSkipReason(
   msg: InboundMessage,
   botConfig: BotConfig,
   botOpenId?: string,
+  relayBotCount?: number,
 ): string | undefined {
   if (msg.isRelay) return undefined;
   if (msg.chatType !== 'group') return undefined;
@@ -80,7 +81,9 @@ export function getGroupMessageSkipReason(
     return 'Unauthorized group';
   }
 
-  if (botConfig.requireMention && !isBridgeCommand(msg.text)) {
+  const relayImpliesMention = botConfig.relay?.enabled && (relayBotCount ?? 0) >= 2;
+  const requireMention = botConfig.requireMention || relayImpliesMention;
+  if (requireMention && !isBridgeCommand(msg.text)) {
     const mentioned = Boolean(botOpenId && (msg.mentions ?? []).includes(botOpenId));
     if (!mentioned) return 'Bot mention required';
   }

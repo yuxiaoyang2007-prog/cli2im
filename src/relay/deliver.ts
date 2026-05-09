@@ -25,6 +25,7 @@ export async function relayToOtherBots(
   const { relayManager, config, agentManager, adapters, messageProcessors, queue } = deps;
 
   const targets = relayManager.getRelayTargets(sourceBotName, chatId);
+  console.log(`[relay] ${sourceBotName} → targets=${JSON.stringify(targets)} textLen=${text.length}`);
   if (targets.length === 0) return;
 
   if (relayManager.incrementAndCheck(chatId)) {

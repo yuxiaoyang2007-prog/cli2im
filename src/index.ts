@@ -54,6 +54,14 @@ import { readFile } from 'node:fs/promises';
 const CONFIG_PATH = process.env.CLI2IM_CONFIG ?? join(homedir(), '.cli2im', 'config.yaml');
 const startedAt = Date.now();
 
+const TERMINAL_PATTERNS = /^(done|lgtm|confirmed|accepted|acknowledged|agreed|ok|收到|完成|没问题|好的|通过|stop here)/i;
+
+function isTerminalRelayText(text: string): boolean {
+  if (text.length > 500) return false;
+  const firstLine = text.split('\n')[0].trim();
+  return TERMINAL_PATTERNS.test(firstLine);
+}
+
 interface RuntimeCommandState {
   fastModeBySession: Map<SessionKey, boolean>;
 }
@@ -296,8 +304,10 @@ async function main(): Promise<void> {
         // Trigger relay on result, reset on error
         if (event.type === 'result') {
           const trimmedRelay = relayTextBuffer.trim();
+          const shouldRelay = trimmedRelay.length > 0 && !isTerminalRelayText(trimmedRelay);
+          console.log(`[relay-trigger] ${botName}: len=${trimmedRelay.length} relay=${shouldRelay} preview=${trimmedRelay.slice(0, 100)}`);
           relayTextBuffer = '';
-          if (trimmedRelay) {
+          if (shouldRelay) {
             await relayToOtherBots(botName, chatId, trimmedRelay, {
               relayManager,
               config,
@@ -435,6 +445,8 @@ async function main(): Promise<void> {
     adapter: PlatformAdapter,
   ): (msg: InboundMessage) => Promise<void> {
     return async (msg) => {
+      console.log(`[pipeline] ${botName}: incoming ${msg.chatType} from=${msg.userId} isRelay=${!!msg.isRelay} mentions=${JSON.stringify(msg.mentions ?? [])} text=${msg.text.slice(0, 60)}`);
+
       // Lazy relay registration on first group message
       if (msg.chatType === 'group' && botConfig.relay?.enabled) {
         relayManager.registerBot(botName, msg.chatId, botConfig.relay.maxConsecutiveRounds ?? 10);
@@ -445,13 +457,16 @@ async function main(): Promise<void> {
         relayManager.onHumanMessage(msg.chatId);
       }
 
+      const relayBotCount = relayManager.getBotsInChat(msg.chatId).length;
+      console.log(`[pipeline] ${botName}: relayBotCount=${relayBotCount} botOpenId=${getAdapterBotOpenId(adapter) ?? 'none'}`);
       const groupSkipReason = getGroupMessageSkipReason(
         msg,
         botConfig,
         getAdapterBotOpenId(adapter),
+        relayBotCount,
       );
       if (groupSkipReason) {
-        console.log(`[pipeline] Rejected: ${groupSkipReason}`);
+        console.log(`[pipeline] ${botName}: Rejected: ${groupSkipReason}`);
         return;
       }
 
@@ -525,7 +540,10 @@ async function main(): Promise<void> {
         }
       }
 
-      const messageText = senderHeader + msg.text;
+      const relayDirective = msg.isRelay
+        ? '<cti-relay>CRITICAL: This is an automated bot-to-bot relay. Rules: (1) Do NOT use brainstorming, planning, or design skills. (2) Do NOT ask questions or seek confirmation. (3) Keep your response under 200 words. (4) If the task is done, say "DONE" and stop. (5) If reviewing code, give only actionable findings — no praise, no summary.</cti-relay>\n\n'
+        : '';
+      const messageText = senderHeader + relayDirective + msg.text;
       const userMessage = await buildUserMessageForAgent(
         botConfig.agent,
         messageText,
@@ -545,6 +563,7 @@ async function main(): Promise<void> {
       );
 
       if (isNewProcess) {
+        console.log(`[pipeline] ${botName}: spawning ${botConfig.agent} in ${session.workingDirectory}`);
         const handlers = createEventHandlers(sessionKey);
 
         const senderEnv = buildSenderEnv(sender);
@@ -568,6 +587,7 @@ async function main(): Promise<void> {
 
         const plugin = agentManager.getPlugin(botConfig.agent);
         if (session.agentSessionId && plugin?.capabilities.sessionResume) {
+          console.log(`[pipeline] ${botName}: resuming session ${session.agentSessionId}`);
           agentManager.resumeAgent(
             sessionKey,
             botConfig.agent,
@@ -576,6 +596,7 @@ async function main(): Promise<void> {
             handlers,
           );
         } else {
+          console.log(`[pipeline] ${botName}: fresh spawn`);
           agentManager.spawnAgent(
             sessionKey,
             botConfig.agent,
@@ -585,9 +606,7 @@ async function main(): Promise<void> {
         }
       }
 
-      if (!isNewProcess) {
-        agentManager.sendMessage(sessionKey, botConfig.agent, userMessage);
-      }
+      agentManager.sendMessage(sessionKey, botConfig.agent, userMessage);
     };
   }
 
