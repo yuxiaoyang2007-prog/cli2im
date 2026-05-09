@@ -127,7 +127,7 @@ export class InboundPipeline {
 
     const isGroup = msg.chatType === 'group';
     const allowList = botConfig.allowFrom.map(String);
-    if (!isGroup && allowList.length > 0 && !allowList.includes(msg.userId)) {
+    if (!isGroup && allowList.length > 0 && !allowList.includes('*') && !allowList.includes(msg.userId)) {
       return { rejected: true, reason: 'Unauthorized user' };
     }
 

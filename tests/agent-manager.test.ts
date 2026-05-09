@@ -289,4 +289,30 @@ describe('AgentManager', () => {
       }),
     );
   });
+
+  it('captures session id from status events on the process', async () => {
+    const plugin = createMockPlugin();
+    manager.registerPlugin(plugin);
+
+    const proc = manager.spawnAgent(
+      'feishu:chat_1:mock-agent',
+      'mock-agent',
+      {
+        workingDirectory: '/Users/test/project',
+        permissionMode: 'blacklist',
+      },
+      {
+        onEvent: vi.fn(),
+        onToolBlocked: vi.fn(),
+        onPermissionTimeout: vi.fn(),
+        onProcessExit: vi.fn(),
+      },
+    );
+
+    proc.stdout.push({ type: 'status', sessionId: 'ses_status_1' } satisfies AgentEvent);
+
+    await new Promise((resolve) => setImmediate(resolve));
+
+    expect(proc.sessionId).toBe('ses_status_1');
+  });
 });

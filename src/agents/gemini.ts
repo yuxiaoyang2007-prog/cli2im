@@ -1,5 +1,9 @@
-import { execFileSync, spawn as spawnProcess } from 'node:child_process';
-import { Transform, Writable, type TransformCallback } from 'node:stream';
+import { execFileSync, spawn as spawnProcess, type ChildProcess } from 'node:child_process';
+import { EventEmitter } from 'node:events';
+import { writeFileSync, mkdirSync } from 'node:fs';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
+import { PassThrough, Transform, Writable, type TransformCallback } from 'node:stream';
 import type {
   AgentCapabilities,
   AgentEvent,
@@ -149,6 +153,230 @@ export class GeminiStreamParser extends Transform {
   }
 }
 
+type GeminiStdinPayload = { type: 'user'; message: UserMessage };
+
+const PROMPT_ARG_MAX_BYTES = 100 * 1024;
+
+export class GeminiVirtualProcess implements AgentProcess {
+  pid = process.pid;
+  sessionId: string;
+  stdin: Writable;
+  stdout: PassThrough;
+
+  private inputBuffer = '';
+  private activeChild: ChildProcess | undefined;
+  private queuedMessages: string[] = [];
+  private stderrBuffer = '';
+  private terminated = false;
+  private exitEmitted = false;
+  private eventEmitter = new EventEmitter();
+
+  constructor(
+    private readonly binary: string,
+    private readonly opts: SpawnOpts,
+    private geminiSessionId?: string,
+  ) {
+    this.sessionId = geminiSessionId ?? '';
+    this.stdout = new PassThrough({ objectMode: true });
+    this.stdin = new Writable({
+      write: (chunk, _encoding, callback) => {
+        try {
+          this.handleStdinChunk(chunk);
+          callback();
+        } catch (err) {
+          callback(err instanceof Error ? err : new Error(String(err)));
+        }
+      },
+    });
+  }
+
+  kill(signal: 'SIGTERM' | 'SIGKILL' = 'SIGTERM'): void {
+    if (this.terminated) return;
+
+    this.terminated = true;
+    this.queuedMessages = [];
+
+    if (this.activeChild) {
+      this.activeChild.kill(signal);
+      return;
+    }
+
+    this.emitExit(null);
+  }
+
+  on(event: 'exit', handler: (code: number | null) => void): void;
+  on(event: 'error', handler: (err: Error) => void): void;
+  on(event: 'exit' | 'error', handler: (...args: any[]) => void): void {
+    this.eventEmitter.on(event, handler);
+  }
+
+  private handleStdinChunk(chunk: Buffer | string | Uint8Array): void {
+    this.inputBuffer += Buffer.isBuffer(chunk) ? chunk.toString('utf8') : String(chunk);
+    const lines = this.inputBuffer.split('\n');
+    this.inputBuffer = lines.pop() ?? '';
+
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      let payload: GeminiStdinPayload;
+      try {
+        payload = JSON.parse(trimmed) as GeminiStdinPayload;
+      } catch {
+        continue;
+      }
+      if (payload.type === 'user') {
+        this.enqueue(messageToPrompt(payload.message));
+      }
+    }
+  }
+
+  private enqueue(prompt: string): void {
+    if (this.terminated) return;
+
+    if (this.activeChild) {
+      this.queuedMessages.push(prompt);
+      return;
+    }
+
+    this.runTurn(prompt);
+  }
+
+  private runTurn(prompt: string): void {
+    if (this.terminated) return;
+
+    const promptBytes = Buffer.byteLength(prompt, 'utf8');
+    const useStdinPrompt = promptBytes > PROMPT_ARG_MAX_BYTES;
+    const args = this.createTurnArgs(prompt, useStdinPrompt);
+    const child = spawnProcess(this.binary, args, {
+      cwd: this.opts.workingDirectory,
+      env: { ...process.env, ...this.opts.env },
+      stdio: [useStdinPrompt ? 'pipe' : 'ignore', 'pipe', 'pipe'],
+    });
+
+    this.activeChild = child;
+    this.stderrBuffer = '';
+
+    if (useStdinPrompt) {
+      if (!child.stdin) {
+        this.stdout.write({ type: 'error', message: 'Gemini CLI stdin is unavailable' } satisfies AgentEvent);
+        this.activeChild = undefined;
+        return;
+      }
+      child.stdin.write(prompt);
+      child.stdin.end();
+    }
+
+    this.attachChild(child);
+  }
+
+  private createTurnArgs(prompt: string, useStdinPrompt: boolean): string[] {
+    const args = buildGeminiBaseArgs(this.opts);
+
+    if (this.geminiSessionId) {
+      args.push('--resume', this.geminiSessionId);
+    }
+
+    if (!useStdinPrompt) {
+      args.push('-p', prompt);
+    }
+
+    return args;
+  }
+
+  private attachChild(child: ChildProcess): void {
+    if (!child.stdout || !child.stderr) {
+      this.stdout.write({ type: 'error', message: 'Gemini CLI stdio is unavailable' } satisfies AgentEvent);
+      this.activeChild = undefined;
+      return;
+    }
+
+    const parser = new GeminiStreamParser();
+    let childClosed = false;
+    let childExitCode: number | null = null;
+    let parserDrained = false;
+    let completed = false;
+
+    const maybeComplete = () => {
+      if (completed || !childClosed || !parserDrained) return;
+      completed = true;
+      this.onTurnComplete(childExitCode);
+    };
+
+    child.stdout.pipe(parser);
+    child.stdout.on('close', () => parser.end());
+    child.stderr.on('data', (chunk: Buffer | string) => {
+      this.stderrBuffer += chunk.toString();
+    });
+
+    parser.on('data', (event: AgentEvent) => {
+      if (event.type === 'status' && event.sessionId) {
+        this.geminiSessionId = event.sessionId;
+        this.sessionId = event.sessionId;
+      }
+      if (event.type === 'result' && event.sessionId) {
+        this.geminiSessionId = event.sessionId;
+        this.sessionId = event.sessionId;
+      }
+      this.stdout.write(event);
+    });
+
+    parser.on('error', (err) => {
+      this.stdout.write({ type: 'error', message: err instanceof Error ? err.message : String(err) } satisfies AgentEvent);
+    });
+
+    parser.on('end', () => {
+      parserDrained = true;
+      maybeComplete();
+    });
+
+    child.on('close', (code) => {
+      childClosed = true;
+      childExitCode = code;
+      maybeComplete();
+    });
+
+    child.on('error', (err) => {
+      const error = err instanceof Error ? err : new Error(String(err));
+      if (this.eventEmitter.listenerCount('error') > 0) {
+        this.eventEmitter.emit('error', error);
+      }
+      this.stdout.write({ type: 'error', message: error.message } satisfies AgentEvent);
+    });
+  }
+
+  private onTurnComplete(code: number | null): void {
+    if (this.terminated) {
+      this.activeChild = undefined;
+      this.emitExit(code);
+      return;
+    }
+
+    this.activeChild = undefined;
+
+    if (code !== 0 && code !== null) {
+      const message = this.stderrBuffer.trim() || `Gemini CLI exited with code ${code}`;
+      this.stdout.write({ type: 'error', message } satisfies AgentEvent);
+      this.queuedMessages = [];
+      this.stderrBuffer = '';
+      return;
+    }
+
+    this.stderrBuffer = '';
+    const next = this.queuedMessages.shift();
+    if (next) {
+      this.runTurn(next);
+    }
+  }
+
+  private emitExit(code: number | null): void {
+    if (this.exitEmitted) return;
+
+    this.exitEmitted = true;
+    this.stdout.end();
+    this.eventEmitter.emit('exit', code);
+  }
+}
+
 export class GeminiPlugin implements AgentPlugin {
   name = 'gemini';
   displayName = 'Gemini CLI';
@@ -157,7 +385,7 @@ export class GeminiPlugin implements AgentPlugin {
   capabilities: AgentCapabilities = {
     streamJson: true,
     permissionPrompt: false,
-    sessionResume: false,
+    sessionResume: true,
     gracefulCancel: false,
     slashCommands: [],
   };
@@ -179,72 +407,27 @@ export class GeminiPlugin implements AgentPlugin {
   }
 
   spawn(opts: SpawnOpts): AgentProcess {
-    return this.createCliProcess(opts);
+    return new GeminiVirtualProcess(this.binary, opts);
   }
 
   resume(sessionId: string, opts: SpawnOpts): AgentProcess {
-    return this.createCliProcess(opts, sessionId);
+    return new GeminiVirtualProcess(this.binary, opts, sessionId);
   }
 
-  buildSpawnArgs(opts: SpawnOpts, sessionId?: string): string[] {
-    const args: string[] = [];
-
-    if (sessionId) {
-      args.push('--resume', sessionId);
-    } else {
-      args.push('--prompt', opts.initialPrompt ?? '');
-    }
-
-    args.push(
-      '--output-format',
-      'stream-json',
-      '--approval-mode',
-      'yolo',
-      '--skip-trust',
-    );
-
-    if (opts.model) {
-      args.push('--model', opts.model);
-    }
-
-    return args;
+  buildSpawnArgs(opts: SpawnOpts): string[] {
+    return buildGeminiBaseArgs(opts);
   }
 
-  createStdoutParser(): Transform {
-    return new GeminiStreamParser();
+  createStdoutParser(): PassThrough {
+    return new PassThrough({ objectMode: true });
   }
 
-  formatStdinMessage(_msg: UserMessage): string {
-    return '';
+  formatStdinMessage(msg: UserMessage): string {
+    return JSON.stringify({ type: 'user', message: msg }) + '\n';
   }
 
   formatPermissionResponse(_requestId: string, _decision: 'allow' | 'deny'): string {
     return '';
-  }
-
-  private createCliProcess(opts: SpawnOpts, sessionId?: string): AgentProcess {
-    const child = spawnProcess('script', ['-q', '/dev/null', this.binary, ...this.buildSpawnArgs(opts, sessionId)], {
-      cwd: opts.workingDirectory,
-      env: { ...process.env, ...opts.env },
-      stdio: ['ignore', 'pipe', 'pipe'],
-    });
-
-    const noopStdin = new Writable({
-      write(_chunk, _encoding, callback) { callback(); },
-    });
-
-    return {
-      pid: child.pid ?? process.pid,
-      sessionId: sessionId ?? '',
-      stdin: noopStdin,
-      stdout: child.stdout,
-      kill: (signal = 'SIGTERM') => {
-        child.kill(signal);
-      },
-      on: (event, handler) => {
-        child.on(event, handler);
-      },
-    };
   }
 }
 
@@ -252,4 +435,47 @@ function asRecord(value: unknown): Record<string, unknown> {
   return value && typeof value === 'object' && !Array.isArray(value)
     ? value as Record<string, unknown>
     : {};
+}
+
+function buildGeminiBaseArgs(opts: SpawnOpts): string[] {
+  const args = [
+    '--output-format',
+    'stream-json',
+    '--approval-mode',
+    'yolo',
+    '--skip-trust',
+  ];
+
+  if (opts.model) {
+    args.push('--model', opts.model);
+  }
+
+  return args;
+}
+
+function messageToPrompt(message: UserMessage): string {
+  if (typeof message.content === 'string') return message.content;
+
+  const textParts: string[] = [];
+  const imagePaths: string[] = [];
+
+  for (const block of message.content) {
+    if (block.type === 'text') {
+      textParts.push(block.text);
+    } else if (block.type === 'image') {
+      const ext = block.source.media_type.split('/')[1] ?? 'png';
+      const dir = join(tmpdir(), 'cli2im-gemini-images');
+      mkdirSync(dir, { recursive: true });
+      const filePath = join(dir, `img-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${ext}`);
+      writeFileSync(filePath, Buffer.from(block.source.data, 'base64'));
+      imagePaths.push(filePath);
+    }
+  }
+
+  if (imagePaths.length > 0) {
+    const fileList = imagePaths.map((p) => `- ${p}`).join('\n');
+    textParts.push(`\n[用户发送了 ${imagePaths.length} 张图片，已保存到以下路径，请先用 upload_file 工具上传后分析：\n${fileList}\n]`);
+  }
+
+  return textParts.join('\n');
 }

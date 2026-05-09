@@ -279,6 +279,10 @@ export class AgentManager {
         proc.sessionId = event.sessionId;
       }
 
+      if (event.type === 'status' && event.sessionId) {
+        proc.sessionId = event.sessionId;
+      }
+
       if (event.type === 'tool_result') {
         event.output = scanToolResult(event.name, event.output);
       }

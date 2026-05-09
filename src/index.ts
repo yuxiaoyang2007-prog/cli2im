@@ -2,6 +2,7 @@ import { loadConfig } from './config/loader.js';
 import { SessionStore } from './session/store.js';
 import { CLISessionScanner } from './session/cli-scanner.js';
 import { CodexSessionScanner } from './session/codex-scanner.js';
+import { GeminiSessionScanner } from './session/gemini-scanner.js';
 import { ChatQueue } from './session/queue.js';
 import { AgentManager, type AgentManagerEvents } from './agents/manager.js';
 import { ToolGate } from './agents/tool-gate.js';
@@ -283,6 +284,13 @@ async function main(): Promise<void> {
         }
 
         if (event.type === 'result' && event.sessionId) {
+          const session = await store.getByKey(sessionKey);
+          if (session) {
+            await store.updateAgentSessionId(session.id, event.sessionId);
+          }
+        }
+
+        if (event.type === 'status' && event.sessionId) {
           const session = await store.getByKey(sessionKey);
           if (session) {
             await store.updateAgentSessionId(session.id, event.sessionId);
@@ -793,11 +801,14 @@ async function handleBridgeCommand(
         break;
       }
 
+      const useGemini = sub === 'gemini' || (!sub && botConfig.agent === 'gemini');
       const useCodex = sub === 'codex' || (!sub && botConfig.agent === 'codex');
-      const agentLabel = useCodex ? 'Codex' : 'Claude Code';
-      const sessions = useCodex
-        ? await new CodexSessionScanner(join(homedir(), '.codex')).scan()
-        : await new CLISessionScanner(join(homedir(), '.claude')).scan();
+      const agentLabel = useGemini ? 'Gemini' : useCodex ? 'Codex' : 'Claude Code';
+      const sessions = useGemini
+        ? await new GeminiSessionScanner(join(homedir(), '.gemini')).scan()
+        : useCodex
+          ? await new CodexSessionScanner(join(homedir(), '.codex')).scan()
+          : await new CLISessionScanner(join(homedir(), '.claude')).scan();
 
       if (sessions.length === 0) {
         await adapter.send(chatId, { text: `没有找到 ${agentLabel} CLI 会话` });
@@ -861,9 +872,11 @@ async function handleCLISessionResume(params: {
 
   let workDir = resume.cwd;
   if (!workDir) {
-    const scanner = botConfig.agent === 'codex'
-      ? new CodexSessionScanner(join(homedir(), '.codex'))
-      : new CLISessionScanner(join(homedir(), '.claude'));
+    const scanner = botConfig.agent === 'gemini'
+      ? new GeminiSessionScanner(join(homedir(), '.gemini'))
+      : botConfig.agent === 'codex'
+        ? new CodexSessionScanner(join(homedir(), '.codex'))
+        : new CLISessionScanner(join(homedir(), '.claude'));
     const sessions = await scanner.scan();
     const match = sessions.find((s) => s.sessionId === resume.sessionId);
     workDir = match?.cwd || homedir();
