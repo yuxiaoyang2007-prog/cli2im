@@ -85,6 +85,7 @@ export interface SenderInfo {
   channel: string;
   userId?: string;
   userName?: string;
+  botName?: string;
 }
 
 export interface InboundMessage {
@@ -98,6 +99,7 @@ export interface InboundMessage {
   replyTo?: string;
   mentions?: string[];
   isVoice?: boolean;
+  isRelay?: boolean;
   raw?: unknown;
 }
 
@@ -244,6 +246,10 @@ export interface BotConfig {
   groupAllowFrom?: string[];
   userOverrides?: Record<string, { workingDirectory?: string }>;
   sandboxMode?: string;
+  relay?: {
+    enabled: boolean;
+    maxConsecutiveRounds?: number;
+  };
 }
 
 export interface AgentConfig {

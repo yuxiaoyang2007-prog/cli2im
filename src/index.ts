@@ -44,6 +44,8 @@ import type {
   SpawnOpts,
   CallbackQuery,
 } from './types.js';
+import { RelayManager } from './relay/manager.js';
+import { relayToOtherBots } from './relay/deliver.js';
 import { homedir } from 'node:os';
 import { basename, join } from 'node:path';
 import { mkdirSync } from 'node:fs';
@@ -180,10 +182,12 @@ async function main(): Promise<void> {
     }
   }
 
+  const relayManager = new RelayManager();
   const adapters = new Map<string, PlatformAdapter>();
   const cardControllers = new Map<string, StreamingCardController>();
   const telegramStreams = new Map<string, TelegramStreamController>();
   const voiceSessions = new Map<SessionKey, string>();
+  const messageProcessors = new Map<string, (msg: InboundMessage) => Promise<void>>();
   const runtimeState: RuntimeCommandState = {
     fastModeBySession: new Map(),
   };
@@ -240,11 +244,17 @@ async function main(): Promise<void> {
     const tgStream = telegramStreams.get(botName);
     const adapter = adapters.get(botName);
     let voiceResponseBuffer = '';
+    let relayTextBuffer = '';
 
     return {
       onEvent: async (_sk, event) => {
         const isVoiceSession = voiceSessions.has(sessionKey);
         console.log(`[event] ${sessionKey}: type=${event.type} voice=${isVoiceSession} hasCard=${!!cardController} hasTgStream=${!!tgStream}`);
+
+        // Accumulate text for relay
+        if (event.type === 'text') {
+          relayTextBuffer += event.content;
+        }
 
         if (isVoiceSession && adapter) {
           if (event.type === 'text' && event.content.trim()) {
@@ -281,6 +291,25 @@ async function main(): Promise<void> {
               await tgStream.finalize(sessionKey);
             }
           }
+        }
+
+        // Trigger relay on result, reset on error
+        if (event.type === 'result') {
+          const trimmedRelay = relayTextBuffer.trim();
+          relayTextBuffer = '';
+          if (trimmedRelay) {
+            await relayToOtherBots(botName, chatId, trimmedRelay, {
+              relayManager,
+              config,
+              agentManager,
+              adapters,
+              messageProcessors,
+              queue,
+            });
+          }
+        }
+        if (event.type === 'error') {
+          relayTextBuffer = '';
         }
 
         if (event.type === 'result' && event.sessionId) {
@@ -362,6 +391,7 @@ async function main(): Promise<void> {
   for (const [botName, adapter] of adapters) {
     const botConfig = config.bots[botName];
     const processMessage = createMessageProcessor(botName, botConfig, adapter);
+    messageProcessors.set(botName, processMessage);
 
     adapter.onMessage((msg: InboundMessage) => {
       void queue.enqueue(msg.chatId, () => processMessage(msg)).catch((err) => {
@@ -405,6 +435,16 @@ async function main(): Promise<void> {
     adapter: PlatformAdapter,
   ): (msg: InboundMessage) => Promise<void> {
     return async (msg) => {
+      // Lazy relay registration on first group message
+      if (msg.chatType === 'group' && botConfig.relay?.enabled) {
+        relayManager.registerBot(botName, msg.chatId, botConfig.relay.maxConsecutiveRounds ?? 10);
+      }
+
+      // Reset relay counter on human messages
+      if (!msg.isRelay) {
+        relayManager.onHumanMessage(msg.chatId);
+      }
+
       const groupSkipReason = getGroupMessageSkipReason(
         msg,
         botConfig,
@@ -457,7 +497,14 @@ async function main(): Promise<void> {
         telegramStreams.get(botName)?.interrupt(sessionKey);
       }
 
-      const sender = { channel: msg.platform, userId: msg.userId, userName: msg.userName };
+      const sender: import('./types.js').SenderInfo = msg.isRelay
+        ? {
+            channel: 'relay',
+            userId: msg.userId,
+            botName: msg.userId.replace('relay:', ''),
+            userName: msg.userName,
+          }
+        : { channel: msg.platform, userId: msg.userId, userName: msg.userName };
       const senderHeader = buildSenderHeader(sender);
       await downloadInboundAttachments(msg, adapter, mediaDir);
 
@@ -538,7 +585,9 @@ async function main(): Promise<void> {
         }
       }
 
-      agentManager.sendMessage(sessionKey, botConfig.agent, userMessage);
+      if (!isNewProcess) {
+        agentManager.sendMessage(sessionKey, botConfig.agent, userMessage);
+      }
     };
   }
 

@@ -36,6 +36,9 @@ bots:
     # userOverrides:                # per-user overrides
     #   ou_xxxxxxxxxxxx:
     #     workingDirectory: ~/user-a-projects
+    # relay:                         # bot-to-bot relay (group chats only)
+    #   enabled: true                # opt-in: both sender and receiver must enable
+    #   maxConsecutiveRounds: 10     # safety cap for bot-to-bot turns without human input
 
   # --- Example: Codex on Telegram ---
   # codexbot:

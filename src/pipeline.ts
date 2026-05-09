@@ -16,6 +16,7 @@ function xmlAttr(s: string): string {
 export function buildSenderHeader(sender: SenderInfo): string {
   const parts: string[] = [`channel="${xmlAttr(sender.channel)}"`];
   if (sender.userId) parts.push(`user_id="${xmlAttr(sender.userId)}"`);
+  if (sender.botName) parts.push(`bot="${xmlAttr(sender.botName)}"`);
   if (sender.userName) parts.push(`name="${xmlAttr(sender.userName)}"`);
   return `<cti-sender ${parts.join(' ')}/>\n\n`;
 }
@@ -70,6 +71,7 @@ export function getGroupMessageSkipReason(
   botConfig: BotConfig,
   botOpenId?: string,
 ): string | undefined {
+  if (msg.isRelay) return undefined;
   if (msg.chatType !== 'group') return undefined;
 
   const groupAllowFrom = botConfig.groupAllowFrom ?? [];
@@ -118,7 +120,9 @@ export class InboundPipeline {
     msg: InboundMessage,
     botName: string,
   ): PipelineContext | { rejected: true; reason: string } {
-    msg.text = sanitizeInput(msg.text);
+    if (!msg.isRelay) {
+      msg.text = sanitizeInput(msg.text);
+    }
 
     const botConfig = this.config.bots[botName];
     if (!botConfig) {
@@ -127,7 +131,7 @@ export class InboundPipeline {
 
     const isGroup = msg.chatType === 'group';
     const allowList = botConfig.allowFrom.map(String);
-    if (!isGroup && allowList.length > 0 && !allowList.includes('*') && !allowList.includes(msg.userId)) {
+    if (!msg.isRelay && !isGroup && allowList.length > 0 && !allowList.includes('*') && !allowList.includes(msg.userId)) {
       return { rejected: true, reason: 'Unauthorized user' };
     }
 

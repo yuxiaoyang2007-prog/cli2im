@@ -54,6 +54,20 @@ function validateConfig(config: AppConfig): void {
     if (bot.userOverrides != null && typeof bot.userOverrides !== 'object') {
       throw new Error(`Config error: bot "${name}" userOverrides must be an object`);
     }
+    if (bot.relay != null) {
+      if (typeof bot.relay !== 'object' || Array.isArray(bot.relay)) {
+        throw new Error(`Config error: bot "${name}" relay must be an object`);
+      }
+      if (typeof bot.relay.enabled !== 'boolean') {
+        throw new Error(`Config error: bot "${name}" relay.enabled must be a boolean`);
+      }
+      if (
+        bot.relay.maxConsecutiveRounds != null
+        && (typeof bot.relay.maxConsecutiveRounds !== 'number' || bot.relay.maxConsecutiveRounds <= 0)
+      ) {
+        throw new Error(`Config error: bot "${name}" relay.maxConsecutiveRounds must be a positive number`);
+      }
+    }
     if (bot.userOverrides) {
       for (const [userId, override] of Object.entries(bot.userOverrides)) {
         if (typeof override !== 'object' || override == null || Array.isArray(override)) {
@@ -70,6 +84,20 @@ function validateConfig(config: AppConfig): void {
       }
     }
   }
+
+  // Warn if relay-enabled bots span different platforms
+  const relayPlatforms = new Set<string>();
+  for (const [, bot] of Object.entries(config.bots)) {
+    if (bot.relay?.enabled) {
+      relayPlatforms.add(bot.platform);
+    }
+  }
+  if (relayPlatforms.size > 1) {
+    console.warn(
+      `[config] Relay-enabled bots span different platforms (${[...relayPlatforms].join(', ')}) — relay only works between bots sharing the same group chat.`,
+    );
+  }
+
   if (!config.agents || typeof config.agents !== 'object') {
     throw new Error('Config error: "agents" section is required');
   }
