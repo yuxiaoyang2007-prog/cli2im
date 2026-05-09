@@ -8,6 +8,11 @@ cli2im runs multiple AI agent bots (Claude Code, Codex, Gemini) in a single daem
 
 Route bot output to other bots inside the daemon process. The IM platform is the display layer for humans; bots receive each other's messages through internal routing, not platform event delivery. This sidesteps Telegram's bot-to-bot limitation entirely.
 
+## Constraints
+
+- **Same-platform only.** Relay routes messages between bots that share the same `chatId` (same IM platform, same group). Cross-platform relay (e.g., Feishu bot → Telegram bot) is out of scope — `chatId` semantics differ between platforms.
+- **Group chats only.** Relay operates in group chats where multiple bots coexist. DM conversations are unaffected.
+
 ## User Flow
 
 1. User @mentions a bot in a group chat with instructions including collaboration (e.g., "Design an API, then have Codex review it")
@@ -31,14 +36,14 @@ bots:
       maxConsecutiveRounds: 10   # safety cap, default 10
   codexbot:
     agent: codex
-    platform: telegram
+    platform: feishu             # must be same platform as ccbot for relay
     relay:
       enabled: true
       maxConsecutiveRounds: 10
 ```
 
 - `relay.enabled` — opt-in per bot. Both sender and receiver must have it enabled.
-- `maxConsecutiveRounds` — max consecutive bot-to-bot turns without human intervention. Exceeding pauses relay and notifies the group.
+- `maxConsecutiveRounds` — max consecutive bot-to-bot turns without human intervention. Exceeding pauses relay and notifies the group. When multiple bots have different values, the minimum is used (safest).
 
 Type additions in `BotConfig`:
 
@@ -63,17 +68,22 @@ interface RelayGroup {
 class RelayManager {
   private groups: Map<string, RelayGroup>; // keyed by chatId
 
-  // Called when a bot connects to a chat (adapter.connect or first message)
+  // Lazy registration: called on first message from a relay-enabled bot in a group.
+  // If botName is already registered for this chatId, this is a no-op.
+  // Updates maxRounds to min(existing, newBot's maxRounds).
   registerBot(botName: string, chatId: string, maxRounds: number): void;
 
-  // Called when a bot produces output. Returns list of bot names to relay to.
-  // Returns empty if relay disabled, only one bot, or rounds exceeded.
+  // Returns list of bot names to relay to.
+  // Returns empty if: only one bot, source not registered, or rounds exceeded.
   getRelayTargets(sourceBotName: string, chatId: string): string[];
+
+  // Returns all relay-enabled bots in a chat (for pause notifications).
+  getBotsInChat(chatId: string): string[];
 
   // Called on every human message in the group. Resets counter.
   onHumanMessage(chatId: string): void;
 
-  // Called after each relay delivery. Returns true if limit reached.
+  // Increments counter. Returns true if limit NOW reached.
   incrementAndCheck(chatId: string): boolean;
 }
 ```
@@ -93,19 +103,15 @@ Agent emits 'result' event
 createEventHandlers.onEvent:
   1. Send to IM group (existing: adapter.send / card update)
   2. NEW: collect full response text during streaming
-  3. On 'result' event: call relayManager.getRelayTargets(botName, chatId)
+  3. On 'result' event: call relayToOtherBots(botName, chatId, text)
        |
        v
-For each target bot:
-  - Build synthetic InboundMessage:
-      platform: original platform
-      chatId: same chatId
-      userId: `relay:${sourceBotName}`
-      userName: sourceBotName display name
-      text: bot's full response text
-      chatType: 'group'
-      isRelay: true              // new field on InboundMessage
-  - Feed into target bot's processMessage() function
+relayToOtherBots:
+  1. Get targets via relayManager.getRelayTargets(sourceBotName, chatId)
+  2. If no targets → return (no relay needed)
+  3. Increment counter via relayManager.incrementAndCheck(chatId)
+  4. If limit reached → notify group, return
+  5. For each target bot → build synthetic InboundMessage → enqueue via processMessage
        |
        v
 Target bot's agent receives message with sender header:
@@ -114,6 +120,8 @@ Target bot's agent receives message with sender header:
        v
 Agent decides to respond (or not) → output → relay back (or stop)
 ```
+
+Note: `getRelayTargets` is called BEFORE `incrementAndCheck`. This avoids wasting the counter when there are no actual targets (e.g., source bot is the only relay-enabled bot in the chat).
 
 ### Collecting Bot Response Text
 
@@ -137,33 +145,53 @@ onEvent: (sk, event) => {
     }
     relayTextBuffer = '';
   }
+
+  if (event.type === 'error') {
+    // Don't relay errors — the error is shown in the group for humans.
+    // The other bot doesn't need to know about internal failures.
+    relayTextBuffer = '';
+  }
 };
 ```
 
+**Scope:** Only final text responses (`type === 'text'`) are accumulated and relayed. Thinking blocks, tool calls, tool results, and errors are NOT relayed — they are internal to each agent. This matches how CLI multi-agent review works: you see the other agent's final output, not its internal reasoning.
+
 ### Relay Delivery Function
 
-New function in `index.ts` (or `src/relay/deliver.ts`):
+New function in `src/relay/deliver.ts`:
 
 ```typescript
 async function relayToOtherBots(
   sourceBotName: string,
   chatId: string,
   text: string,
+  deps: {
+    relayManager: RelayManager;
+    config: AppConfig;
+    agentManager: AgentManager;
+    adapters: Map<string, PlatformAdapter>;
+    messageProcessors: Map<string, (msg: InboundMessage) => Promise<void>>;
+    queue: ChatQueue;
+  },
 ): Promise<void> {
+  const { relayManager, config, agentManager, adapters, messageProcessors, queue } = deps;
+
+  const targets = relayManager.getRelayTargets(sourceBotName, chatId);
+  if (targets.length === 0) return;
+
   if (relayManager.incrementAndCheck(chatId)) {
     // Round limit reached — notify all adapters in this chat
     for (const botName of relayManager.getBotsInChat(chatId)) {
       const adapter = adapters.get(botName);
       if (adapter) {
         await adapter.send(chatId, {
-          text: `[relay] Bot-to-bot conversation paused after ${limit} rounds. Send a message to continue.`,
+          text: '[relay] Bot-to-bot conversation paused (round limit reached). Send a message to continue.',
         });
       }
     }
     return;
   }
 
-  const targets = relayManager.getRelayTargets(sourceBotName, chatId);
   const sourcePlugin = agentManager.getPlugin(config.bots[sourceBotName].agent);
   const displayName = sourcePlugin?.displayName ?? sourceBotName;
 
@@ -178,8 +206,6 @@ async function relayToOtherBots(
       isRelay: true,
     };
 
-    const targetAdapter = adapters.get(targetBotName);
-    const targetConfig = config.bots[targetBotName];
     const processor = messageProcessors.get(targetBotName);
     if (processor) {
       await queue.enqueue(chatId, () => processor(syntheticMsg));
@@ -187,6 +213,49 @@ async function relayToOtherBots(
   }
 }
 ```
+
+### `messageProcessors` Map
+
+The current code creates `processMessage` as a local closure inside a `for...of` loop (index.ts line 364). To allow relay delivery to call any bot's processor, expose a module-level map:
+
+```typescript
+// In main(), before the adapter loop:
+const messageProcessors = new Map<string, (msg: InboundMessage) => Promise<void>>();
+
+// Inside the loop:
+for (const [botName, adapter] of adapters) {
+  const botConfig = config.bots[botName];
+  const processMessage = createMessageProcessor(botName, botConfig, adapter);
+  messageProcessors.set(botName, processMessage);  // NEW: store reference
+
+  adapter.onMessage((msg: InboundMessage) => {
+    void queue.enqueue(msg.chatId, () => processMessage(msg)).catch(...);
+  });
+  // ...
+}
+```
+
+### Bot Registration (Lazy)
+
+Bots are registered into RelayGroups lazily on first message. In `createMessageProcessor`, at the top of the returned function:
+
+```typescript
+return async (msg) => {
+  // Lazy relay registration on first group message
+  if (msg.chatType === 'group' && botConfig.relay?.enabled) {
+    relayManager.registerBot(botName, msg.chatId, botConfig.relay.maxConsecutiveRounds ?? 10);
+  }
+
+  // Reset relay counter on human messages
+  if (!msg.isRelay) {
+    relayManager.onHumanMessage(msg.chatId);
+  }
+
+  // ...existing pipeline logic...
+};
+```
+
+This means a bot won't be a relay target until it has received at least one message in the group. This is acceptable because relay only makes sense after bots are active in a group.
 
 ### Pipeline Changes
 
@@ -199,11 +268,36 @@ export interface InboundMessage {
 }
 ```
 
-Pipeline adjustments:
-- Relay messages bypass `allowFrom` check (they come from internal routing, not external users)
-- Relay messages bypass `requireMention` check
-- Relay messages bypass `sender_type === 'app'` filter (Feishu adapter)
-- Relay messages DO go through rate limiting (prevents runaway loops at the pipeline level too)
+Pipeline bypass rules for relay messages (in `pipeline.ts`):
+
+1. **`allowFrom` check** (line 130): Add explicit `isRelay` bypass. Currently the check is guarded by `!isGroup`, but relay messages should bypass regardless:
+   ```typescript
+   if (!msg.isRelay && !isGroup && allowList.length > 0 && ...)
+   ```
+
+2. **`getGroupMessageSkipReason`** (line 68-87): Add `isRelay` bypass at the top:
+   ```typescript
+   export function getGroupMessageSkipReason(msg, botConfig, botOpenId) {
+     if (msg.isRelay) return undefined;  // relay messages always pass
+     if (msg.chatType !== 'group') return undefined;
+     // ...existing checks...
+   }
+   ```
+
+3. **Content Guard**: Relay messages skip content guard scanning. Bot output has already been through the content guard when it was generated — double-scanning is wasteful.
+
+### Fix: Duplicate Message on New Spawn
+
+Pre-existing issue amplified by relay: when `isNewProcess` is true, `spawnOpts.initialPrompt` already contains the message text. Then `agentManager.sendMessage` at line 541 sends it again. Fix:
+
+```typescript
+// In createMessageProcessor, after the spawn block:
+if (!isNewProcess) {
+  agentManager.sendMessage(sessionKey, botConfig.agent, userMessage);
+}
+```
+
+This fix applies to all messages, not just relay — it's a bug fix for the existing code.
 
 ### Human Message Detection
 
@@ -219,30 +313,16 @@ if (!msg.isRelay) {
 
 1. **Agent judgment** (primary) — the LLM naturally stops responding when it has nothing to add. This is the same mechanism that makes CLI multi-agent code review converge.
 
-2. **Round counter** (safety net) — `maxConsecutiveRounds` per group. Incremented on each relay delivery, reset on human message. When exceeded, relay pauses and notifies group.
+2. **Round counter** (safety net) — `maxConsecutiveRounds` per group (minimum of all bots' configured values). Incremented on each relay delivery, reset on human message. When exceeded, relay pauses and notifies group.
 
-3. **Rate limiter** (existing) — the existing per-chat rate limiter applies to relay messages too, preventing burst floods.
+3. **Rate limiter** (existing) — the existing per-chat rate limiter (20/60s) applies to relay messages too, preventing burst floods. Note: relay and human messages share the same rate budget. For v1 this is acceptable; if it causes issues, a separate relay rate counter can be added later.
 
-## Feishu Adapter Change
+## Adapter Changes
 
-In `src/platforms/feishu/adapter.ts`, line 313:
+**None.** Both Feishu and Telegram adapters are unchanged.
 
-```typescript
-// Before:
-if (sender?.sender_type === 'app') return;
-
-// After:
-// Bot messages are now handled by the relay system internally.
-// We still filter them at the adapter level because relay doesn't
-// go through the adapter — it uses synthetic InboundMessages directly.
-if (sender?.sender_type === 'app') return;
-```
-
-No change needed. The Feishu adapter still filters bot messages from the platform event stream, because relay messages are injected directly into `processMessage()` as synthetic `InboundMessage` objects — they never come through the adapter.
-
-## Telegram: No Adapter Change
-
-Same reasoning. Telegram doesn't deliver bot-to-bot messages, and we don't need it to. Relay is internal.
+- Feishu adapter's `sender_type === 'app'` filter (line 313) stays — it only applies to platform-delivered events. Relay messages are synthetic `InboundMessage` objects injected directly into `processMessage()`, never touching the adapter's event handler.
+- Telegram doesn't deliver bot messages to other bots, and we don't need it to. Relay is entirely internal.
 
 ## Sender Header Format
 
@@ -279,8 +359,9 @@ export function buildSenderHeader(sender: SenderInfo): string {
 |------|--------|
 | `src/types.ts` | Add `relay` to `BotConfig`, `isRelay` to `InboundMessage`, `botName` to `SenderInfo` |
 | `src/relay/manager.ts` | **New file.** RelayManager class |
-| `src/index.ts` | Instantiate RelayManager, collect relay text buffer in event handlers, call `relayToOtherBots` on result, reset counter on human messages, expose `messageProcessors` map |
-| `src/pipeline.ts` | Add `botName` to `SenderInfo`, bypass allowFrom/requireMention for relay messages |
+| `src/relay/deliver.ts` | **New file.** `relayToOtherBots` function |
+| `src/index.ts` | Instantiate RelayManager, create `messageProcessors` map, collect relay text buffer in event handlers, call relay on result, fix duplicate sendMessage on new spawn |
+| `src/pipeline.ts` | Add `botName` to `SenderInfo`, add `isRelay` bypass in `process()` and `getGroupMessageSkipReason()` |
 | `src/config/loader.ts` | Validate `relay` config fields |
 | `config.example.yaml` | Add commented relay config example |
 | `tests/relay-manager.test.ts` | **New file.** Unit tests for RelayManager |
@@ -291,16 +372,22 @@ export function buildSenderHeader(sender: SenderInfo): string {
 ### Unit Tests (relay-manager.test.ts)
 - `getRelayTargets` returns correct targets (excludes source bot, non-relay bots)
 - `getRelayTargets` returns empty when only one relay bot in chat
+- `getRelayTargets` returns empty for unregistered bot
 - Counter increments and triggers pause at limit
+- Counter uses `min()` of all bots' maxConsecutiveRounds
 - `onHumanMessage` resets counter
 - Multiple chats tracked independently
+- `registerBot` is idempotent for same bot+chatId
 
 ### Integration Tests (relay-integration.test.ts)
-- Full flow: human message → bot output → relay → target bot receives
+- Full flow: human message → bot output → relay → target bot receives synthetic message
 - Relay message has correct sender header (`channel="relay"`, `bot=` attribute)
 - Relay messages bypass allowFrom check
+- Relay messages bypass requireMention check
 - Round limit triggers pause notification
 - Human message resets counter and re-enables relay
+- No relay when only one bot has relay enabled
+- Duplicate sendMessage fix: new spawn does not send initialPrompt twice
 
 ### Manual E2E
 1. Set up 2 bots in the same Feishu group with relay enabled
