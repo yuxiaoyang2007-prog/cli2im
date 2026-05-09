@@ -123,11 +123,17 @@ export class GeminiSessionScanner {
       try {
         const rec = JSON.parse(line) as GeminiMessageRecord;
         if (rec.type === 'user') {
+          let text = '';
           if (Array.isArray(rec.content)) {
             const block = rec.content.find((c: Record<string, unknown>) => typeof c.text === 'string');
-            if (block) return (block as { text: string }).text.slice(0, 120);
+            if (block) text = (block as { text: string }).text;
+          } else if (typeof rec.content === 'string') {
+            text = rec.content;
           }
-          if (typeof rec.content === 'string') return rec.content.slice(0, 120);
+          if (text) {
+            text = text.replace(/^<cti-sender[^>]*\/>\s*/s, '').trim();
+            if (text) return text.slice(0, 120);
+          }
         }
       } catch {
         continue;

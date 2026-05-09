@@ -245,7 +245,8 @@ function extractTitle(text: string): {
       } else if (!firstUserMessage && obj.type === 'user' && obj.message) {
         const msg = obj.message as Record<string, unknown>;
         if (typeof msg.content === 'string') {
-          firstUserMessage = msg.content;
+          const cleaned = msg.content.replace(/^<cti-sender[^>]*\/>\s*/s, '').trim();
+          if (cleaned) firstUserMessage = cleaned;
         }
       }
     } catch {
