@@ -45,6 +45,8 @@ bots:
 - `relay.enabled` — opt-in per bot. Both sender and receiver must have it enabled.
 - `maxConsecutiveRounds` — max consecutive bot-to-bot turns without human intervention. Exceeding pauses relay and notifies the group. When multiple bots have different values, the minimum is used (safest).
 
+**Config validation** (`config/loader.ts`): If multiple bots have `relay.enabled: true` but are on different platforms, log a warning at startup: "Relay-enabled bots span different platforms (feishu, telegram) — relay only works between bots sharing the same group chat." This is a warning, not an error, because the bots may still work independently.
+
 Type additions in `BotConfig`:
 
 ```typescript
@@ -180,14 +182,13 @@ async function relayToOtherBots(
   if (targets.length === 0) return;
 
   if (relayManager.incrementAndCheck(chatId)) {
-    // Round limit reached — notify all adapters in this chat
-    for (const botName of relayManager.getBotsInChat(chatId)) {
-      const adapter = adapters.get(botName);
-      if (adapter) {
-        await adapter.send(chatId, {
-          text: '[relay] Bot-to-bot conversation paused (round limit reached). Send a message to continue.',
-        });
-      }
+    // Round limit reached — send ONE notification (pick any adapter in this chat)
+    const anyBot = relayManager.getBotsInChat(chatId)[0];
+    const adapter = anyBot ? adapters.get(anyBot) : undefined;
+    if (adapter) {
+      await adapter.send(chatId, {
+        text: '[relay] Bot-to-bot conversation paused (round limit reached). Send a message to continue.',
+      });
     }
     return;
   }
@@ -286,6 +287,11 @@ Pipeline bypass rules for relay messages (in `pipeline.ts`):
 
 3. **Content Guard**: Relay messages skip content guard scanning. Bot output has already been through the content guard when it was generated — double-scanning is wasteful.
 
+4. **`sanitizeInput`** (line 121): Skip for relay messages. Bot output is already sanitized; double-sanitization could strip or truncate content:
+   ```typescript
+   if (!msg.isRelay) msg.text = sanitizeInput(msg.text);
+   ```
+
 ### Fix: Duplicate Message on New Spawn
 
 Pre-existing issue amplified by relay: when `isNewProcess` is true, `spawnOpts.initialPrompt` already contains the message text. Then `agentManager.sendMessage` at line 541 sends it again. Fix:
@@ -316,6 +322,8 @@ if (!msg.isRelay) {
 2. **Round counter** (safety net) — `maxConsecutiveRounds` per group (minimum of all bots' configured values). Incremented on each relay delivery, reset on human message. When exceeded, relay pauses and notifies group.
 
 3. **Rate limiter** (existing) — the existing per-chat rate limiter (20/60s) applies to relay messages too, preventing burst floods. Note: relay and human messages share the same rate budget. For v1 this is acceptable; if it causes issues, a separate relay rate counter can be added later.
+
+**Known behavior:** If a human sends a message while relay rounds are in-flight in the queue, the counter resets mid-relay. This is intentional — human re-engagement means the conversation context has changed, so resetting the budget is correct.
 
 ## Adapter Changes
 
@@ -361,8 +369,8 @@ export function buildSenderHeader(sender: SenderInfo): string {
 | `src/relay/manager.ts` | **New file.** RelayManager class |
 | `src/relay/deliver.ts` | **New file.** `relayToOtherBots` function |
 | `src/index.ts` | Instantiate RelayManager, create `messageProcessors` map, collect relay text buffer in event handlers, call relay on result, fix duplicate sendMessage on new spawn |
-| `src/pipeline.ts` | Add `botName` to `SenderInfo`, add `isRelay` bypass in `process()` and `getGroupMessageSkipReason()` |
-| `src/config/loader.ts` | Validate `relay` config fields |
+| `src/pipeline.ts` | Add `botName` to `SenderInfo`, add `isRelay` bypass in `process()`, `getGroupMessageSkipReason()`, and `sanitizeInput` |
+| `src/config/loader.ts` | Validate `relay` config fields + warn if relay-enabled bots span different platforms |
 | `config.example.yaml` | Add commented relay config example |
 | `tests/relay-manager.test.ts` | **New file.** Unit tests for RelayManager |
 | `tests/relay-integration.test.ts` | **New file.** Integration tests for relay message flow |
