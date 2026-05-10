@@ -1,4 +1,5 @@
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
+import { timingSafeEqual } from 'node:crypto';
 import type { HandoffRequest } from '../types.js';
 
 export interface ServerDeps {
@@ -50,7 +51,7 @@ export class HttpServer {
     }
 
     const authHeader = req.headers.authorization;
-    if (!authHeader || authHeader !== `Bearer ${this.token}`) {
+    if (!isAuthorizedBearerToken(authHeader, this.token)) {
       this.json(res, 401, { error: 'Unauthorized' });
       return;
     }
@@ -119,4 +120,14 @@ export class HttpServer {
       req.on('error', reject);
     });
   }
+}
+
+export function isAuthorizedBearerToken(authHeader: string | undefined, token: string): boolean {
+  if (!authHeader) return false;
+
+  const expected = Buffer.from(`Bearer ${token}`);
+  const actual = Buffer.from(authHeader);
+  if (actual.length !== expected.length) return false;
+
+  return timingSafeEqual(actual, expected);
 }
