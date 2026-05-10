@@ -5,6 +5,14 @@ import type { AgentPlugin, AgentProcess, AgentEvent } from '../src/types.js';
 import { Transform } from 'node:stream';
 import { EventEmitter, Readable, Writable } from 'node:stream';
 
+const contentGuardMock = vi.hoisted(() => ({
+  detectInjection: vi.fn(),
+}));
+
+vi.mock('content-guard', () => ({
+  detectInjection: contentGuardMock.detectInjection,
+}));
+
 function createMockPlugin(): AgentPlugin {
   return {
     name: 'mock-agent',
@@ -55,6 +63,12 @@ describe('AgentManager', () => {
   beforeEach(() => {
     const toolGate = new ToolGate(['sudo\\s+']);
     manager = new AgentManager(toolGate);
+    contentGuardMock.detectInjection.mockReset();
+    contentGuardMock.detectInjection.mockReturnValue({
+      detected: true,
+      score: 4,
+      severity: 'low',
+    });
   });
 
   it('registers plugins', () => {

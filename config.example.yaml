@@ -132,7 +132,7 @@ newMessageBehavior: queue          # queue = hold until agent is free
 
 # ----------------------------------------------------------
 # Content guard — optional content safety filtering
-# Requires `content-guard` package installed.
+# `content-guard` is an optional peer dependency; filtering is disabled when absent.
 # ----------------------------------------------------------
 # contentGuard:
 #   enabled: true

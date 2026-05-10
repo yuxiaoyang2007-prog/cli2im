@@ -44,7 +44,14 @@
     "vitest": "^3.0.0"
   },
   "optionalDependencies": {
-    "@openai/codex-sdk": "^0.128.0",
+    "@openai/codex-sdk": "^0.128.0"
+  },
+  "peerDependencies": {
     "content-guard": "^1.0.0"
+  },
+  "peerDependenciesMeta": {
+    "content-guard": {
+      "optional": true
+    }
   }
 }
