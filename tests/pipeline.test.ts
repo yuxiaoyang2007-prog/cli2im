@@ -122,9 +122,16 @@ describe('InboundPipeline authorization', () => {
     expect(result).toEqual({ rejected: true, reason: 'Unauthorized user' });
   });
 
-  it('skips DM allowFrom checks for group chats', () => {
+  it('rejects unauthorized group messages', () => {
     const pipeline = new InboundPipeline(config);
     const result = pipeline.process(message({ chatType: 'group' }), 'ccbot');
+
+    expect(result).toEqual({ rejected: true, reason: 'Unauthorized user' });
+  });
+
+  it('allows authorized group messages', () => {
+    const pipeline = new InboundPipeline(config);
+    const result = pipeline.process(message({ chatType: 'group', userId: 'ou_allowed' }), 'ccbot');
 
     expect('rejected' in result).toBe(false);
   });

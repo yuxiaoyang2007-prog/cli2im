@@ -132,9 +132,8 @@ export class InboundPipeline {
       return { rejected: true, reason: `Unknown bot: ${botName}` };
     }
 
-    const isGroup = msg.chatType === 'group';
     const allowList = botConfig.allowFrom.map(String);
-    if (!msg.isRelay && !isGroup && allowList.length > 0 && !allowList.includes('*') && !allowList.includes(msg.userId)) {
+    if (!msg.isRelay && allowList.length > 0 && !allowList.includes('*') && !allowList.includes(msg.userId)) {
       return { rejected: true, reason: 'Unauthorized user' };
     }
 
