@@ -34,7 +34,7 @@ describe('handlePermissionCallback', () => {
     return {
       platform: 'telegram',
       chatId: 'chat_1',
-      userId: 'user_1',
+      userId: 'ou_allowed',
       data,
       messageId: 'msg_1',
     };
@@ -46,7 +46,7 @@ describe('handlePermissionCallback', () => {
       denyPermission: vi.fn().mockReturnValue(true),
     };
 
-    expect(handlePermissionCallback(callback('perm:deny:req_4'), agentManager)).toBe(true);
+    expect(handlePermissionCallback(callback('perm:deny:req_4'), agentManager, botConfig())).toBe(true);
     expect(agentManager.denyPermission).toHaveBeenCalledWith('req_4');
     expect(agentManager.approvePermission).not.toHaveBeenCalled();
   });
@@ -57,7 +57,7 @@ describe('handlePermissionCallback', () => {
       denyPermission: vi.fn(),
     };
 
-    expect(handlePermissionCallback(callback('perm:allow_session:req_5'), agentManager)).toBe(true);
+    expect(handlePermissionCallback(callback('perm:allow_session:req_5'), agentManager, botConfig())).toBe(true);
     expect(agentManager.approvePermission).toHaveBeenCalledWith('req_5');
     expect(agentManager.denyPermission).not.toHaveBeenCalled();
   });
@@ -68,7 +68,11 @@ describe('handlePermissionCallback', () => {
       denyPermission: vi.fn(),
     };
 
-    expect(handlePermissionCallback(callback('perm:allow:req_6'), agentManager, botConfig())).toBe(false);
+    expect(handlePermissionCallback(
+      { ...callback('perm:allow:req_6'), userId: 'ou_intruder' },
+      agentManager,
+      botConfig(),
+    )).toBe(false);
     expect(agentManager.approvePermission).not.toHaveBeenCalled();
     expect(agentManager.denyPermission).not.toHaveBeenCalled();
   });
@@ -161,14 +165,82 @@ describe('parseSessionResumeCallback', () => {
   });
 });
 
-function botConfig(): BotConfig {
+describe('isCallbackAuthorized', () => {
+  it('accepts direct-message callbacks from allowed users', () => {
+    const callback: CallbackQuery = {
+      platform: 'feishu',
+      chatId: 'ou_allowed',
+      userId: 'ou_allowed',
+      chatType: 'p2p',
+      data: 'resume:session_1',
+      messageId: 'msg_1',
+    };
+
+    expect(isCallbackAuthorized(callback, botConfig())).toBe(true);
+  });
+
+  it('rejects direct-message callbacks from strangers', () => {
+    const callback: CallbackQuery = {
+      platform: 'feishu',
+      chatId: 'ou_intruder',
+      userId: 'ou_intruder',
+      chatType: 'p2p',
+      data: 'resume:session_1',
+      messageId: 'msg_1',
+    };
+
+    expect(isCallbackAuthorized(callback, botConfig())).toBe(false);
+  });
+
+  it('accepts group callbacks from allowed users', () => {
+    const callback: CallbackQuery = {
+      platform: 'feishu',
+      chatId: 'oc_any_group',
+      userId: 'ou_allowed',
+      chatType: 'group',
+      data: 'resume:session_1',
+      messageId: 'msg_1',
+    };
+
+    expect(isCallbackAuthorized(callback, botConfig())).toBe(true);
+  });
+
+  it('rejects group callbacks from strangers', () => {
+    const callback: CallbackQuery = {
+      platform: 'feishu',
+      chatId: 'oc_group_allowed',
+      userId: 'ou_intruder',
+      chatType: 'group',
+      data: 'resume:session_1',
+      messageId: 'msg_1',
+    };
+
+    expect(isCallbackAuthorized(callback, botConfig({ groupPolicy: 'allowlist' }))).toBe(false);
+  });
+
+  it('rejects group callbacks from non-allowlisted chats when groupPolicy is allowlist', () => {
+    const callback: CallbackQuery = {
+      platform: 'feishu',
+      chatId: 'oc_other_group',
+      userId: 'ou_allowed',
+      chatType: 'group',
+      data: 'resume:session_1',
+      messageId: 'msg_1',
+    };
+
+    expect(isCallbackAuthorized(callback, botConfig({ groupPolicy: 'allowlist' }))).toBe(false);
+  });
+});
+
+function botConfig(overrides: Partial<BotConfig> = {}): BotConfig {
   return {
     agent: 'claude-code',
     platform: 'feishu',
     feishu: { appId: 'cli_abc', appSecret: 'secret' },
     workingDirectory: '/Users/test/project',
     allowFrom: ['ou_allowed'],
-    groupAllowFrom: ['ou_group_allowed'],
+    groupAllowFrom: ['oc_group_allowed'],
     permissionMode: 'blacklist',
+    ...overrides,
   };
 }

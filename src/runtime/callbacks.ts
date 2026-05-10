@@ -20,9 +20,15 @@ export interface SessionResumeCallbackData {
 
 export function isCallbackAuthorized(callback: CallbackQuery, botConfig: BotConfig): boolean {
   const isGroup = isGroupCallback(callback);
-  const allowedUsers = isGroup ? (botConfig.groupAllowFrom ?? []) : botConfig.allowFrom;
-  const normalizedAllowList = allowedUsers.map(String);
-  return normalizedAllowList.includes('*') || normalizedAllowList.includes(callback.userId);
+  const normalizedAllowList = botConfig.allowFrom.map(String);
+  const userAllowed = normalizedAllowList.includes('*') || normalizedAllowList.includes(callback.userId);
+  if (!userAllowed) return false;
+
+  if (isGroup && botConfig.groupPolicy === 'allowlist') {
+    return (botConfig.groupAllowFrom ?? []).map(String).includes(callback.chatId);
+  }
+
+  return true;
 }
 
 export function parsePermissionCallbackData(rawData: string): PermissionCallbackData | null {
@@ -39,11 +45,11 @@ export function parsePermissionCallbackData(rawData: string): PermissionCallback
 export function handlePermissionCallback(
   callback: CallbackQuery,
   agentManager: PermissionAgentManager,
-  botConfig?: BotConfig,
+  botConfig: BotConfig,
 ): boolean {
   const parsed = parsePermissionCallbackData(callback.data);
   if (!parsed) return false;
-  if (botConfig && !isCallbackAuthorized(callback, botConfig)) return false;
+  if (!isCallbackAuthorized(callback, botConfig)) return false;
 
   if (parsed.decision === 'deny') {
     return agentManager.denyPermission(parsed.requestId);

@@ -422,7 +422,7 @@ async function main(): Promise<void> {
           return;
         }
 
-        const accepted = handlePermissionCallback(callback, agentManager);
+        const accepted = handlePermissionCallback(callback, agentManager, botConfig);
         if (accepted) return;
       }
 
