@@ -2,49 +2,85 @@
 
 English | [中文](README.zh-CN.md)
 
-Control CLI-based AI agents through instant messaging. Type in Feishu or Telegram, get Claude Code / Codex / Gemini CLI working on your projects — with streaming output, permission gating, session resume, and bidirectional handoff.
+**Run Claude Code / Codex / Gemini CLI from any IM app you already have.** When you walk away from your desk, the project doesn't stop — pick it up on your phone in Feishu or Telegram, with full streaming output, tool use, slash commands, and one-tap session resume.
 
-Built for developers who run AI coding agents on a home server or dev machine and want to keep driving them from a phone or any device with an IM client.
+This is not a chatbot. CLI2IM spawns the real CLI binaries you already use, preserves all their capabilities, and adds an IM control plane on top.
 
-## Why
+---
 
-CLI agents like Claude Code and Codex are powerful but tethered to a terminal. You leave your desk, the work stops. CLI2IM solves this by bridging the full CLI experience — slash commands, tool use, streaming output, session persistence — to IM platforms you already have on your phone.
+## Three Killer Features
 
-This is not a chatbot framework. It spawns real CLI binaries, preserves their full capabilities, and adds an IM control plane on top.
+### 1. Leave your desk, the project keeps moving
 
-## Features
+You spent the morning at your work laptop driving Claude Code through a refactor. Now you're heading to the airport. With CLI2IM, you don't lose the thread:
 
-- **Multi-agent**: Claude Code (SDK), Codex (SDK), Gemini CLI — pluggable architecture, one config to manage all
-- **Multi-platform**: Feishu/Lark (WebSocket + interactive cards) and Telegram (long polling + inline keyboards)
-- **Streaming output**: Real-time card updates on Feishu, message edits on Telegram, with thinking block visibility toggle
-- **Permission gating**: Dangerous command detection (configurable regex patterns), interactive Allow/Deny buttons, session-level auto-approve
-- **Session resume**: Scan local CLI sessions (`~/.claude/`, `~/.codex/`), display interactive picker in IM, one tap to resume any conversation
-- **Bidirectional handoff**: Move a session from CLI terminal to IM bot and back — `cli2im handoff` CLI tool included
-- **Voice support**: Speech-to-text transcription for voice messages, text-to-speech for responses (DashScope)
-- **Security**: User allowlists, working directory validation, content filtering ([content-guard](https://github.com/user/content-guard)), rate limiting, dangerous pattern blocking
-- **Session persistence**: SQLite-backed session store with idle cleanup and state tracking
-- **Multi-bot**: Run multiple bots in one process — each bot binds to one agent and one IM platform
+- Type `/sessions` in Feishu/Telegram from your phone
+- An interactive list pops up — every local Claude Code or Codex conversation, with title, last message preview, working directory, git branch, and time
+- Tap **Resume** on the one you were working on
+- The agent boots back up with `--resume <id>`, bound to the IM chat. Streaming output flows into the card. Tool calls, permission prompts, file edits — all work exactly as on the terminal
+
+Bidirectional handoff also works the other way: hand a session running in IM **back** to your terminal with `/handoff` (or the `cli2im handoff` CLI tool) when you sit back down at your computer.
+
+```
+~/.claude/projects/*.jsonl  ◄────► IM chat (Feishu card / TG inline keyboard)
+                             /handoff
+```
+
+### 2. Claude Code, Codex, and Gemini in one place — and they can talk to each other
+
+CLI2IM treats CLI agents as plugins. One YAML config lets you register multiple bots, each tied to a different agent on a different platform. They run as siblings in one daemon.
+
+What's special is **bot-to-bot relay** — when 2+ relay-enabled bots share a group chat, one bot's response automatically gets delivered to the others as a relay message:
+
+```
+You (in Feishu group):  @ccbot  Write a Fibonacci function and ask codexbot to review it.
+ccbot:                  [streams code]  Done. codexbot, please review.
+codexbot:                              ← receives ccbot's output as a relay message
+codexbot:               Reviewed. Suggest using iteration for n>30.
+ccbot:                                 ← receives codexbot's review
+ccbot:                  Updated to iterative version. Final code attached.
+```
+
+You orchestrate multi-agent workflows just by adding the right bots to a group. Each bot still runs its native CLI — Claude Code's strong reasoning, Codex's coding focus, Gemini's speed — without writing any orchestration code.
+
+Built-in safeguards: terminal-acknowledgment detection (single-word "done"/"lgtm"/"OK" doesn't trigger relay), per-chat round-cap to prevent infinite ping-pong, implicit `@mention` requirement for human messages when 2+ relay bots share a group.
+
+### 3. Your IM is already the control plane — no extra app to install
+
+Your team already lives in Feishu. Or you already have Telegram on every device. CLI2IM uses what's there:
+
+- **Feishu**: WebSocket real-time events (no public IP, no webhook, no port forwarding). Interactive cards stream output line by line. Permission prompts and session resume show up as native card buttons. Voice messages get transcribed via DashScope; text replies can be sent back as voice.
+- **Telegram**: Long polling (works behind any NAT). MarkdownV2 formatting. Inline keyboards for permissions and resume. Voice STT supported.
+
+Compared to "AI desktop apps" (Cursor / Claude Desktop / etc.) that demand a specific client on every device, CLI2IM rides on top of the IM you and your team already have. New device? Already signed in. Phone? Already configured. Sharing with a teammate? Just add them to the group.
+
+---
 
 ## Architecture
 
 ```
 Feishu / Telegram
-       |
-       | InboundMessage
-       v
-  +-----------+     +------------------+     +------------------+
-  |  Adapter   |---->|  Pipeline        |---->|  Agent Manager   |
-  +-----------+     |  auth gate       |     |  spawn / resume  |
-       ^            |  rate limit      |     |  tool gate       |
-       |            |  command parse   |     |  permission flow |
-       |            +------------------+     +--------+---------+
-       |                                              |
-       |            +------------------+              | stdin/stdout
-       +------------|  Session Store   |              v
-       |            |  (SQLite)        |     +------------------+
-       |            +------------------+     |  CLI Agent       |
-       |                                     |  (subprocess)    |
-       +------ streaming cards / edits <-----+------------------+
+       │
+       │ InboundMessage
+       ▼
+  ┌───────────┐     ┌──────────────────┐     ┌──────────────────┐
+  │  Adapter  ├────►│  Pipeline        ├────►│  Agent Manager   │
+  └───────────┘     │  - auth gate     │     │  - spawn/resume  │
+       ▲            │  - rate limit    │     │  - tool gate     │
+       │            │  - cmd parse     │     │  - permission    │
+       │            │  - relay check   │     └────────┬─────────┘
+       │            └──────────────────┘              │ stdin/stdout
+       │                                              ▼
+       │            ┌──────────────────┐     ┌──────────────────┐
+       │◄───────────┤  Session Store   │     │  CLI Agent       │
+       │            │  (SQLite)        │     │  (subprocess)    │
+       │            └──────────────────┘     └──────────────────┘
+       │
+       │            ┌──────────────────┐
+       │◄───────────┤  Relay Manager   │ (bot-to-bot delivery)
+       │            └──────────────────┘
+       │
+       └─── streaming cards / message edits
 ```
 
 ## Quick Start
@@ -71,7 +107,7 @@ See [Configuration](#configuration) for all options.
 
 ```bash
 npm run build
-node dist/daemon.mjs
+node dist/index.js
 
 # Or run in development mode:
 npm run dev
@@ -92,7 +128,7 @@ Create a LaunchAgent plist to keep CLI2IM running:
   <key>ProgramArguments</key>
   <array>
     <string>/opt/homebrew/bin/node</string>
-    <string>/path/to/cli2im/dist/daemon.mjs</string>
+    <string>/path/to/cli2im/dist/index.js</string>
   </array>
   <key>RunAtLoad</key>
   <true/>
@@ -106,6 +142,20 @@ Create a LaunchAgent plist to keep CLI2IM running:
 </dict>
 </plist>
 ```
+
+## Full Feature List
+
+- **Multi-agent**: Claude Code (SDK), Codex (SDK), Gemini CLI — pluggable architecture, one config to manage all
+- **Multi-platform**: Feishu/Lark (WebSocket + interactive cards) and Telegram (long polling + inline keyboards)
+- **Streaming output**: Real-time card updates on Feishu, message edits on Telegram, with thinking block visibility toggle
+- **Permission gating**: Dangerous command detection (configurable regex patterns), interactive Allow/Deny buttons, session-level auto-approve
+- **Session resume**: Scan local CLI sessions (`~/.claude/`, `~/.codex/`), display interactive picker in IM, one tap to resume any conversation
+- **Bidirectional handoff**: Move a session from CLI terminal to IM bot and back — `cli2im handoff` CLI tool included
+- **Bot-to-bot relay**: Multi-agent collaboration in group chats with terminal-acknowledgment detection and round caps
+- **Voice support**: Speech-to-text transcription for voice messages, text-to-speech for responses (DashScope)
+- **Security**: User allowlists, working directory validation, content filtering, rate limiting, dangerous pattern blocking
+- **Session persistence**: SQLite-backed session store with idle cleanup and state tracking
+- **Multi-bot**: Run multiple bots in one process — each bot binds to one agent and one IM platform
 
 ## Configuration
 
@@ -125,6 +175,9 @@ bots:
     allowFrom:                   # user IDs allowed to interact
       - ou_xxxx
     permissionMode: blacklist    # bypass | blacklist
+    relay:                       # opt-in to bot-to-bot relay
+      enabled: true
+      maxConsecutiveRounds: 10
 
   codexbot:
     agent: codex
@@ -228,32 +281,42 @@ cli2im status
 - Voice message transcription
 - Photo/document upload and download
 
-## Session Resume Flow
+## Bot-to-Bot Relay (deep dive)
 
-One of CLI2IM's key features — pick up any local CLI conversation from your phone:
+When two or more relay-enabled bots share a group, ccbot's text output automatically gets delivered to codexbot and gemini_bot as if it were a human message — except marked `isRelay: true` so the pipeline can:
+
+- Skip auth/rate-limit/sanitize checks (relay messages are trusted)
+- Inject a `<cti-relay>` directive into the receiving agent's prompt: "skip brainstorming, no clarifying questions, stay under 200 words, say DONE when finished"
+- Suppress relay when the source output looks like a terminal acknowledgment ("done", "lgtm", "ok", "收到", "完成")
+- Cap consecutive auto-rounds per chat (`maxConsecutiveRounds`, default 10) to prevent infinite ping-pong
+- Implicitly require `@mention` for human messages in groups with 2+ relay bots, so a single human prompt fans out to exactly the bot you addressed
+
+This turns a normal group chat into a multi-agent orchestration surface, with humans dropping in via `@mention` whenever they want to redirect the conversation.
+
+## Session Resume Flow
 
 ```
 User sends /sessions in IM
-       |
-       v
+       │
+       ▼
 CLI2IM scans ~/.claude/projects/ (or ~/.codex/)
   - Reads JSONL conversation files
   - Extracts titles, timestamps, git branches
   - Filters by entrypoint (CLI/task sessions only)
   - Merges active session status (idle/busy/stale)
-       |
-       v
+       │
+       ▼
 Sends interactive card/keyboard with session list
-       |
-       v
+       │
+       ▼
 User taps "Resume" button
-       |
-       v
+       │
+       ▼
 CLI2IM spawns agent with --resume <sessionId>
   - Resolves correct working directory from scanner
   - Binds to IM chat for streaming output
-       |
-       v
+       │
+       ▼
 Conversation continues in IM
 ```
 
@@ -273,14 +336,16 @@ A host-agnostic bridge library extracted from [CodePilot](https://github.com/op7
 | **Platforms** | Telegram, Discord, Feishu | Feishu, Telegram (Discord planned) |
 | **Session resume** | Not supported | Scan local CLI sessions, interactive picker, one-tap resume |
 | **Handoff** | Not supported | Bidirectional CLI ↔ IM handoff with CLI tool |
+| **Bot-to-bot collaboration** | Not supported | Built-in relay with terminal detection and round caps |
 | **Streaming** | Message edit based | Feishu: interactive cards with throttled updates; Telegram: message edits |
 | **Persistence** | Delegated to host (BridgeStore) | Built-in SQLite |
 
 ### Key additions in CLI2IM beyond claude-to-im's scope
 
-- **Multi-agent plugin system**: Not just Claude Code — Codex and Gemini CLI work through the same interface, with agent-specific capabilities (stream JSON, permissions, resume support) declared per plugin
+- **Multi-agent plugin system**: Codex and Gemini CLI work through the same interface as Claude Code, with agent-specific capabilities declared per plugin
 - **CLI session scanning**: Read `~/.claude/projects/` JSONL files and `~/.codex/session_index.jsonl`, extract titles from conversation data, display interactive session picker in IM
 - **Bidirectional handoff**: `cli2im handoff` CLI tool + HTTP API + IM `/handoff` command for seamless CLI ↔ IM session transfer
+- **Bot-to-bot relay**: Multi-agent collaboration with terminal-acknowledgment detection, round caps, and implicit mention requirements
 - **Feishu interactive cards**: Rich card UI with streaming updates, thinking block toggle, permission buttons, session list with Resume actions
 - **Telegram inline keyboards**: Session resume buttons, permission approval, all within Telegram's 64-byte callback_data constraint
 - **Voice support**: STT for voice messages, TTS for responses
@@ -303,30 +368,25 @@ cli2im/
 │   │   ├── gemini.ts            # Gemini CLI plugin
 │   │   └── tool-gate.ts         # Dangerous command detection
 │   ├── platforms/
-│   │   ├── feishu/
-│   │   │   ├── adapter.ts       # Feishu WebSocket adapter
-│   │   │   ├── cards.ts         # Streaming card controller
-│   │   │   └── markdown.ts      # Feishu markdown + card builder
-│   │   └── telegram/
-│   │       ├── adapter.ts       # Telegram polling adapter
-│   │       └── markdown.ts      # MarkdownV2 + session text
+│   │   ├── feishu/              # Feishu adapter, cards, markdown
+│   │   └── telegram/            # Telegram adapter, MarkdownV2
 │   ├── session/
 │   │   ├── store.ts             # SQLite session persistence
 │   │   ├── queue.ts             # Per-chat message queue
 │   │   ├── cli-scanner.ts       # Claude Code session scanner
 │   │   └── codex-scanner.ts     # Codex session scanner
+│   ├── relay/
+│   │   ├── manager.ts           # Bot registration, round counting
+│   │   └── deliver.ts           # Relay message delivery
 │   ├── services/
 │   │   ├── handoff.ts           # Session handoff service
 │   │   ├── server.ts            # HTTP API server
 │   │   └── speech.ts            # STT/TTS (DashScope)
-│   ├── security/
-│   │   ├── validators.ts        # Path + input validation
-│   │   └── content-guard.ts     # Content safety filtering
-│   └── runtime/
-│       └── callbacks.ts         # Button callback parsing
+│   ├── security/                # Validators, content guard
+│   └── runtime/                 # Button callback parsing
 ├── cli/
 │   └── cli2im.ts                # Handoff CLI tool
-├── tests/                       # 22 test files, 154 tests
+├── tests/                       # 24 test files, 189 tests
 ├── config.example.yaml
 ├── esbuild.config.mjs
 └── tsconfig.json
@@ -336,7 +396,7 @@ cli2im/
 
 ```bash
 npm run dev          # Run with tsx (hot reload)
-npm test             # Run all 154 tests
+npm test             # Run all 189 tests
 npm run typecheck    # TypeScript type check
 npm run build        # Bundle to dist/
 ```
