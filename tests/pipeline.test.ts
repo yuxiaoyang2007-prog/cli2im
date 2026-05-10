@@ -155,7 +155,7 @@ describe('InboundPipeline authorization', () => {
     }), botConfig, 'ou_bot')).toBeUndefined();
   });
 
-  it('requires bot mention in groups but exempts bridge commands', () => {
+  it('requires bot mention in groups including bridge commands', () => {
     const botConfig = {
       ...config.bots.ccbot,
       requireMention: true,
@@ -173,8 +173,13 @@ describe('InboundPipeline authorization', () => {
     }), botConfig, 'ou_bot')).toBeUndefined();
     expect(getGroupMessageSkipReason(message({
       chatType: 'group',
-      text: '/status',
+      text: '/kill',
       mentions: [],
+    }), botConfig, 'ou_bot')).toBe('Bot mention required');
+    expect(getGroupMessageSkipReason(message({
+      chatType: 'group',
+      text: '/kill',
+      mentions: ['ou_bot'],
     }), botConfig, 'ou_bot')).toBeUndefined();
   });
 });

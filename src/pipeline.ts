@@ -83,7 +83,7 @@ export function getGroupMessageSkipReason(
 
   const relayImpliesMention = botConfig.relay?.enabled && (relayBotCount ?? 0) >= 2;
   const requireMention = botConfig.requireMention || relayImpliesMention;
-  if (requireMention && !isBridgeCommand(msg.text)) {
+  if (requireMention) {
     const mentioned = Boolean(botOpenId && (msg.mentions ?? []).includes(botOpenId));
     if (!mentioned) return 'Bot mention required';
   }
