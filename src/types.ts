@@ -149,6 +149,7 @@ export interface CallbackQuery {
   platform: string;
   chatId: string;
   userId: string;
+  chatType?: string;
   data: string;
   messageId: string;
 }

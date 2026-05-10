@@ -399,6 +399,7 @@ export class FeishuAdapter implements PlatformAdapter {
       platform: 'feishu',
       chatId: (ctx.open_chat_id as string) ?? '',
       userId: (operator?.open_id as string) ?? (raw.open_id as string) ?? '',
+      chatType: (ctx.chat_type as string) ?? (raw.chat_type as string) ?? undefined,
       data: JSON.stringify(action?.value ?? {}),
       messageId: (ctx.open_message_id as string) ?? (raw.open_message_id as string) ?? '',
     });

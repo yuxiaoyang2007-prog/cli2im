@@ -1,10 +1,11 @@
 import { describe, expect, it, vi } from 'vitest';
 import {
   handlePermissionCallback,
+  isCallbackAuthorized,
   parseSessionResumeCallback,
   parsePermissionCallbackData,
 } from '../src/runtime/callbacks.js';
-import type { CallbackQuery } from '../src/types.js';
+import type { BotConfig, CallbackQuery } from '../src/types.js';
 
 describe('parsePermissionCallbackData', () => {
   it('parses Feishu JSON action envelopes', () => {
@@ -60,6 +61,33 @@ describe('handlePermissionCallback', () => {
     expect(agentManager.approvePermission).toHaveBeenCalledWith('req_5');
     expect(agentManager.denyPermission).not.toHaveBeenCalled();
   });
+
+  it('rejects permission callbacks from unauthorized direct-message users', () => {
+    const agentManager = {
+      approvePermission: vi.fn(),
+      denyPermission: vi.fn(),
+    };
+
+    expect(handlePermissionCallback(callback('perm:allow:req_6'), agentManager, botConfig())).toBe(false);
+    expect(agentManager.approvePermission).not.toHaveBeenCalled();
+    expect(agentManager.denyPermission).not.toHaveBeenCalled();
+  });
+
+  it('rejects permission callbacks from unauthorized group users', () => {
+    const agentManager = {
+      approvePermission: vi.fn(),
+      denyPermission: vi.fn(),
+    };
+    const groupCallback = {
+      ...callback('perm:deny:req_7'),
+      chatType: 'group',
+      userId: 'ou_intruder',
+    };
+
+    expect(handlePermissionCallback(groupCallback, agentManager, botConfig())).toBe(false);
+    expect(agentManager.approvePermission).not.toHaveBeenCalled();
+    expect(agentManager.denyPermission).not.toHaveBeenCalled();
+  });
 });
 
 describe('parseSessionResumeCallback', () => {
@@ -103,4 +131,44 @@ describe('parseSessionResumeCallback', () => {
   it('rejects bare "resume:" with no sessionId', () => {
     expect(parseSessionResumeCallback('resume:')).toBeNull();
   });
+
+  it('rejects session resume callbacks from unauthorized direct-message users', () => {
+    const callback: CallbackQuery = {
+      platform: 'feishu',
+      chatId: 'chat_1',
+      userId: 'ou_intruder',
+      chatType: 'p2p',
+      data: 'resume:session_1',
+      messageId: 'msg_1',
+    };
+
+    expect(parseSessionResumeCallback(callback.data)).not.toBeNull();
+    expect(isCallbackAuthorized(callback, botConfig())).toBe(false);
+  });
+
+  it('rejects session resume callbacks from unauthorized group users', () => {
+    const callback: CallbackQuery = {
+      platform: 'feishu',
+      chatId: 'oc_group',
+      userId: 'ou_intruder',
+      chatType: 'group',
+      data: 'resume:session_1',
+      messageId: 'msg_1',
+    };
+
+    expect(parseSessionResumeCallback(callback.data)).not.toBeNull();
+    expect(isCallbackAuthorized(callback, botConfig())).toBe(false);
+  });
 });
+
+function botConfig(): BotConfig {
+  return {
+    agent: 'claude-code',
+    platform: 'feishu',
+    feishu: { appId: 'cli_abc', appSecret: 'secret' },
+    workingDirectory: '/Users/test/project',
+    allowFrom: ['ou_allowed'],
+    groupAllowFrom: ['ou_group_allowed'],
+    permissionMode: 'blacklist',
+  };
+}

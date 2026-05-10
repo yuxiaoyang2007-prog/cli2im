@@ -366,6 +366,7 @@ export function parseTelegramCallback(update: unknown): CallbackQuery | null {
     platform: 'telegram',
     chatId: String(chatId),
     userId: String(userId),
+    chatType: callback.message?.chat?.type,
     data: callback.data,
     messageId: String(messageId),
   };

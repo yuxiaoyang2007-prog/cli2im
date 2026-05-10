@@ -34,7 +34,12 @@ import {
   downloadInboundAttachments,
 } from './media.js';
 import { initContentGuard } from './security/content-guard.js';
-import { handlePermissionCallback, parseSessionResumeCallback } from './runtime/callbacks.js';
+import {
+  handlePermissionCallback,
+  isCallbackAuthorized,
+  parsePermissionCallbackData,
+  parseSessionResumeCallback,
+} from './runtime/callbacks.js';
 import { transcribeAudio, synthesizeSpeech } from './services/speech.js';
 import type {
   SessionKey,
@@ -410,11 +415,24 @@ async function main(): Promise<void> {
     });
 
     adapter.onCallback?.((callback) => {
-      const accepted = handlePermissionCallback(callback, agentManager);
-      if (accepted) return;
+      const permission = parsePermissionCallbackData(callback.data);
+      if (permission) {
+        if (!isCallbackAuthorized(callback, botConfig)) {
+          void adapter.send(callback.chatId, { text: 'Unauthorized callback user' });
+          return;
+        }
+
+        const accepted = handlePermissionCallback(callback, agentManager);
+        if (accepted) return;
+      }
 
       const resume = parseSessionResumeCallback(callback.data);
       if (resume) {
+        if (!isCallbackAuthorized(callback, botConfig)) {
+          void adapter.send(callback.chatId, { text: 'Unauthorized callback user' });
+          return;
+        }
+
         void handleCLISessionResume({
           callback,
           resume,
