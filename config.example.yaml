@@ -92,12 +92,14 @@ session:
 # Commands matching these patterns require explicit approval via IM buttons.
 # ----------------------------------------------------------
 dangerousPatterns:
-  - 'rm\s+(-[a-zA-Z]*f[a-zA-Z]*\s+|.*--force).*\/'
+  - 'rm\s+(-[a-zA-Z]*[rRf][a-zA-Z]*|--force\b|--recursive\b)'
   - 'mkfs\.'
   - 'dd\s+.*of=\/dev\/'
   - 'git\s+push\s+.*--force'
   - 'git\s+reset\s+--hard'
   - 'git\s+clean\s+-[a-zA-Z]*f'
+  - 'chmod\s+-[a-zA-Z]*R[a-zA-Z]*\s+777\b'
+  - 'curl\s+.*\|\s*(sh|bash)\b'
   - 'kill\s+-9'
   - 'killall'
   - 'pkill'
