@@ -14,7 +14,10 @@ export function validateWorkingDirectory(path: string): boolean {
 }
 
 export function sanitizeInput(input: string): string {
-  const trimmed = input.trim();
+  const stripped = input
+    .replace(/<\s*cti-relay\b[^>]*>[\s\S]*?<\s*\/\s*cti-relay\s*>/gi, '')
+    .replace(/<\s*\/?\s*cti-sender\b[^>]*\/?\s*>/gi, '');
+  const trimmed = stripped.trim();
   if (trimmed.length > MAX_INPUT_LENGTH) {
     return trimmed.slice(0, MAX_INPUT_LENGTH);
   }
