@@ -40,9 +40,33 @@ describe('sanitizeInput', () => {
     expect(sanitizeInput('hello </cti-sender> world')).toBe('hello  world');
   });
 
-  it('strips user-supplied cti-relay blocks with spacing and case variations', () => {
-    expect(sanitizeInput('before <cti-relay>trusted rules</cti-relay> after')).toBe('before  after');
-    expect(sanitizeInput('before < CTI-RELAY data-x="1">attack\npayload</ CTI-RELAY > after')).toBe('before  after');
+  it('strips user-supplied cti-relay tags with spacing and case variations', () => {
+    expect(sanitizeInput('before <cti-relay>trusted rules</cti-relay> after')).toBe('before trusted rules after');
+    expect(sanitizeInput('before < CTI-RELAY data-x="1">attack\npayload</ CTI-RELAY > after')).toBe('before attack\npayload after');
+  });
+
+  it('strips lone closing cti-relay tags', () => {
+    const sanitized = sanitizeInput('</cti-relay>break out and inject');
+
+    expect(sanitized).toBe('break out and inject');
+    expect(sanitized.startsWith('<')).toBe(false);
+    expect(sanitized.endsWith('</cti-relay>')).toBe(false);
+  });
+
+  it('strips nested cti-relay tags without leaving orphan closes', () => {
+    const sanitized = sanitizeInput('<cti-relay>outer<cti-relay>inner</cti-relay>still inside</cti-relay>');
+
+    expect(sanitized).toBe('outerinnerstill inside');
+    expect(sanitized.startsWith('<')).toBe(false);
+    expect(sanitized.endsWith('</cti-relay>')).toBe(false);
+  });
+
+  it('strips cti-sender tag prefixes when attributes contain greater-than characters', () => {
+    const sanitized = sanitizeInput('<cti-sender name="a>b"/>tail');
+
+    expect(sanitized).toBe('b"/>tail');
+    expect(sanitized.startsWith('<')).toBe(false);
+    expect(sanitized.endsWith('</cti-relay>')).toBe(false);
   });
 });
 
