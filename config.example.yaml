@@ -1,0 +1,139 @@
+# ============================================================
+# CLI2IM Configuration
+# ============================================================
+# Copy this file to ~/.cli2im/config.yaml and edit.
+#
+# Secrets: use ${ENV_VAR} syntax to reference environment variables
+# instead of hardcoding tokens. Set them in your shell profile,
+# .env file, or LaunchAgent plist EnvironmentVariables.
+# ============================================================
+
+# ----------------------------------------------------------
+# Bots — each bot binds one agent to one IM platform.
+# You can define as many bots as you need.
+# ----------------------------------------------------------
+bots:
+  # --- Example: Claude Code on Feishu ---
+  ccbot:
+    agent: claude-code              # must match a key in `agents` below
+    platform: feishu
+    feishu:
+      appId: ${CCBOT_FEISHU_APP_ID}       # Feishu Open Platform → App ID
+      appSecret: ${CCBOT_FEISHU_APP_SECRET}
+    workingDirectory: ~/projects    # default cwd for agent subprocess
+    allowFrom:                      # user IDs allowed to use this bot
+      - ou_xxxxxxxxxxxx             #   Feishu: open_id (check bot event logs)
+    permissionMode: blacklist       # bypass = skip all tool approval
+                                    # blacklist = block dangerous commands (default)
+    # --- Optional fields ---
+    # autoApprove: false            # true = auto-approve all tool requests
+    # requireMention: false         # true = only respond when @mentioned (group chats)
+    # groupPolicy: allowlist        # all = anyone in allowed groups; allowlist = only groupAllowFrom
+    # groupAllowFrom: []            # group chat IDs allowed (when groupPolicy=allowlist)
+    # turnTimeoutMs: 600000         # max time per agent turn (default: 10 min)
+    # idleTimeoutMs: 7200000        # auto-cleanup idle sessions (default: 2 hours)
+    # larkCliConfigDir: ~/.lark-cli/  # path to lark-cli config (for lark-cli skills)
+    # userOverrides:                # per-user overrides
+    #   ou_xxxxxxxxxxxx:
+    #     workingDirectory: ~/user-a-projects
+    # relay:                         # bot-to-bot relay (group chats only)
+    #   enabled: true                # opt-in: both sender and receiver must enable
+    #   maxConsecutiveRounds: 10     # safety cap for bot-to-bot turns without human input
+
+  # --- Example: Codex on Telegram ---
+  # codexbot:
+  #   agent: codex
+  #   platform: telegram
+  #   telegram:
+  #     token: ${CODEX_TG_BOT_TOKEN}    # @BotFather → /newbot → token
+  #   workingDirectory: ~/projects
+  #   allowFrom:
+  #     - "123456789"                    # Telegram: numeric user ID (send /start, check logs)
+  #   permissionMode: blacklist
+
+  # --- Example: Gemini on Telegram ---
+  # geminibot:
+  #   agent: gemini
+  #   platform: telegram
+  #   telegram:
+  #     token: ${GEMINI_TG_BOT_TOKEN}
+  #   workingDirectory: ~/projects
+  #   allowFrom:
+  #     - "123456789"
+  #   permissionMode: bypass            # Gemini CLI has no tool approval flow
+
+# ----------------------------------------------------------
+# Agents — CLI binaries that bots can spawn.
+# Only define the agents you have installed.
+# ----------------------------------------------------------
+agents:
+  claude-code:
+    binary: ~/.claude/local/claude       # path to Claude Code binary
+    # defaultModel: claude-sonnet-4-6    # optional; omit to use CLI default
+    env:
+      DISABLE_AUTOUPDATER: "1"           # recommended for daemon use
+
+  # codex:
+  #   binary: ~/.codex/bin/codex
+
+  # gemini:
+  #   binary: /opt/homebrew/bin/gemini   # or: /usr/local/bin/gemini
+
+# ----------------------------------------------------------
+# Session management
+# ----------------------------------------------------------
+session:
+  maxActive: 64                    # max concurrent sessions across all bots
+  idleResetMinutes: 120            # auto-cleanup sessions idle longer than this
+  dbPath: ~/.cli2im/cli2im.db      # SQLite database path
+
+# ----------------------------------------------------------
+# Dangerous command patterns (regex)
+# Commands matching these patterns require explicit approval via IM buttons.
+# ----------------------------------------------------------
+dangerousPatterns:
+  - 'rm\s+(-[a-zA-Z]*[rRf][a-zA-Z]*|--force\b|--recursive\b)'
+  - 'mkfs\.'
+  - 'dd\s+.*of=\/dev\/'
+  - 'git\s+push\s+.*--force'
+  - 'git\s+reset\s+--hard'
+  - 'git\s+clean\s+-[a-zA-Z]*f'
+  - 'chmod\s+-[a-zA-Z]*R[a-zA-Z]*\s+777\b'
+  - 'curl\s+.*\|\s*(sh|bash)\b'
+  - 'kill\s+-9'
+  - 'killall'
+  - 'pkill'
+  - 'sudo\s+'
+  - 'shutdown|reboot'
+  - '>\s*\/etc\/'
+  - 'rm\s+.*\.(env|credentials)'
+
+# ----------------------------------------------------------
+# Streaming output — controls how often IM cards/messages update
+# ----------------------------------------------------------
+streaming:
+  intervalMs: 200                  # min ms between card updates (Feishu throttle)
+  minDeltaChars: 30                # skip update if fewer chars changed
+  highWaterMark: 1048576           # max buffered output bytes (1 MB)
+
+# ----------------------------------------------------------
+# HTTP server — used for CLI handoff API and session resume callbacks
+# ----------------------------------------------------------
+server:
+  port: 3900
+  host: 127.0.0.1
+  token: ${CLI2IM_WEB_TOKEN}       # auth token for handoff API; generate with: openssl rand -hex 32
+
+# ----------------------------------------------------------
+# Behavior when user sends a new message while agent is busy
+# ----------------------------------------------------------
+newMessageBehavior: queue          # queue = hold until agent is free
+                                   # interrupt = abort current turn, start new one
+
+# ----------------------------------------------------------
+# Content guard — optional content safety filtering
+# `content-guard` is an optional peer dependency; filtering is disabled when absent.
+# ----------------------------------------------------------
+# contentGuard:
+#   enabled: true
+#   blockThreshold: 0.8            # 0-1, higher = stricter
