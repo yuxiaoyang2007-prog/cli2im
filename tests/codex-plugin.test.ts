@@ -1,4 +1,4 @@
-import { describe, it, expect, vi } from 'vitest';
+import { beforeEach, describe, it, expect, vi } from 'vitest';
 import {
   CodexPlugin,
   formatNonImageAttachment,
@@ -6,19 +6,31 @@ import {
   mapCodexThreadEvent,
 } from '../src/agents/codex.js';
 
+const codexSdkMock = vi.hoisted(() => ({
+  startThread: vi.fn(),
+  resumeThread: vi.fn(),
+}));
+
 vi.mock('@openai/codex-sdk', () => ({
   Codex: class MockCodex {
-    startThread() {
+    startThread(options?: Record<string, unknown>) {
+      codexSdkMock.startThread(options);
       return { runStreamed: vi.fn() };
     }
 
-    resumeThread() {
+    resumeThread(id: string, options?: Record<string, unknown>) {
+      codexSdkMock.resumeThread(id, options);
       return { runStreamed: vi.fn() };
     }
   },
 }));
 
 describe('CodexPlugin', () => {
+  beforeEach(() => {
+    codexSdkMock.startThread.mockClear();
+    codexSdkMock.resumeThread.mockClear();
+  });
+
   it('declares SDK-backed capabilities', () => {
     const plugin = new CodexPlugin('/usr/local/bin/codex');
     expect(plugin.capabilities).toEqual({
@@ -34,6 +46,44 @@ describe('CodexPlugin', () => {
     const plugin = new CodexPlugin('/usr/local/bin/codex');
     const result = await plugin.preflight();
     expect(result).toHaveProperty('ok');
+  });
+
+  it.each([
+    {
+      name: 'autoApprove true',
+      opts: { permissionMode: 'blacklist' as const, autoApprove: true },
+      expected: 'never',
+    },
+    {
+      name: 'autoApprove false with non-bypass permission',
+      opts: { permissionMode: 'blacklist' as const, autoApprove: false },
+      expected: 'on-request',
+    },
+    {
+      name: 'bypass permission',
+      opts: { permissionMode: 'bypass' as const, autoApprove: false },
+      expected: 'never',
+    },
+  ])('maps approvalPolicy for $name on start and resume', async ({ opts, expected }) => {
+    const plugin = new CodexPlugin('/usr/local/bin/codex');
+    const baseOpts = {
+      workingDirectory: '/Users/test/project',
+      ...opts,
+    };
+
+    const spawned = plugin.spawn(baseOpts);
+    await vi.waitFor(() => expect(codexSdkMock.startThread).toHaveBeenCalled());
+    expect(codexSdkMock.startThread).toHaveBeenLastCalledWith(expect.objectContaining({
+      approvalPolicy: expected,
+    }));
+    spawned.kill();
+
+    const resumed = plugin.resume('thread_1', baseOpts);
+    await vi.waitFor(() => expect(codexSdkMock.resumeThread).toHaveBeenCalled());
+    expect(codexSdkMock.resumeThread).toHaveBeenLastCalledWith('thread_1', expect.objectContaining({
+      approvalPolicy: expected,
+    }));
+    resumed.kill();
   });
 });
 

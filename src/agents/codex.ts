@@ -528,7 +528,7 @@ function createThreadOptions(opts: SpawnOpts): Record<string, unknown> {
     model: opts.model,
     sandboxMode: opts.sandboxMode,
     modelReasoningEffort: opts.reasoningEffort,
-    approvalPolicy: opts.permissionMode === 'bypass' ? 'never' : 'on-request',
+    approvalPolicy: (opts.permissionMode === 'bypass' || opts.autoApprove) ? 'never' : 'on-request',
     skipGitRepoCheck: true,
   };
 }
