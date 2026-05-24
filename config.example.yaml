@@ -30,8 +30,8 @@ bots:
     # requireMention: false         # true = only respond when @mentioned (group chats)
     # groupPolicy: allowlist        # all = anyone in allowed groups; allowlist = only groupAllowFrom
     # groupAllowFrom: []            # group chat IDs allowed (when groupPolicy=allowlist)
-    # turnTimeoutMs: 600000         # max time per agent turn (default: 10 min)
-    # idleTimeoutMs: 7200000        # auto-cleanup idle sessions (default: 2 hours)
+    # turnTimeoutMs: 600000         # hard cap N ms after process START (not per-turn, never reset — can kill healthy long sessions); unset = no cap
+    # idleTimeoutMs: 300000         # kill + auto-recover a session after N ms of zero output (stall recovery); unset = disabled
     # larkCliConfigDir: ~/.lark-cli/  # path to lark-cli config (for lark-cli skills)
     # userOverrides:                # per-user overrides
     #   ou_xxxxxxxxxxxx:
