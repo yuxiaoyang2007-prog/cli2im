@@ -756,6 +756,67 @@ describe('AgentManager', () => {
     }
   });
 
+  it('kills a spawned watched process when idle timeout expires before any output', async () => {
+    vi.useFakeTimers();
+    try {
+      const plugin = createMockPlugin();
+      manager.registerPlugin(plugin);
+      const proc = await manager.spawnAgent(
+        'feishu:chat_1:mock-agent',
+        'mock-agent',
+        {
+          workingDirectory: '/Users/test/project',
+          permissionMode: 'blacklist',
+          idleTimeoutMs: 100,
+        },
+        {
+          onEvent: vi.fn(),
+          onToolBlocked: vi.fn(),
+          onPermissionTimeout: vi.fn(),
+          onProcessExit: vi.fn(),
+        },
+      );
+
+      vi.advanceTimersByTime(99);
+      expect(proc.kill).not.toHaveBeenCalled();
+      vi.advanceTimersByTime(1);
+      expect(proc.kill).toHaveBeenCalledWith('SIGTERM');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('kills a resumed watched process when idle timeout expires before any output', async () => {
+    vi.useFakeTimers();
+    try {
+      const plugin = createMockPlugin();
+      manager.registerPlugin(plugin);
+      const proc = await manager.resumeAgent(
+        'feishu:chat_1:mock-agent',
+        'mock-agent',
+        'agent-session-1',
+        {
+          workingDirectory: '/Users/test/project',
+          permissionMode: 'blacklist',
+          idleTimeoutMs: 100,
+        },
+        {
+          onEvent: vi.fn(),
+          onToolBlocked: vi.fn(),
+          onPermissionTimeout: vi.fn(),
+          onProcessExit: vi.fn(),
+        },
+      );
+
+      vi.advanceTimersByTime(99);
+      expect(proc.kill).not.toHaveBeenCalled();
+      vi.advanceTimersByTime(1);
+      expect(proc.kill).toHaveBeenCalledWith('SIGTERM');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('does not let a stale watchdog kill a replacement process with the same session key', async () => {
     vi.useFakeTimers();
     try {

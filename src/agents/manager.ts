@@ -286,7 +286,6 @@ export class AgentManager {
     idleTimeoutMs?: number,
   ): WatchdogHandle {
     let disposed = false;
-    let idleTimer: ReturnType<typeof setTimeout> | undefined;
 
     const expire = () => {
       if (disposed) return;
@@ -295,6 +294,8 @@ export class AgentManager {
     };
 
     const turnTimer = turnTimeoutMs ? setTimeout(expire, turnTimeoutMs) : undefined;
+    let idleTimer: ReturnType<typeof setTimeout> | undefined =
+      idleTimeoutMs ? setTimeout(expire, idleTimeoutMs) : undefined;
     const markActivity = () => {
       if (!idleTimeoutMs || disposed) return;
       if (!this.isCurrentContext(sessionKey, ctx)) return;
