@@ -11,11 +11,12 @@ const DEFAULT_MEDIA_DIR = join(homedir(), '.cli2im', 'media');
 export async function downloadInboundAttachments(
   msg: InboundMessage,
   adapter: Pick<PlatformAdapter, 'downloadFile'>,
-  mediaDir = DEFAULT_MEDIA_DIR,
+  targetDir = DEFAULT_MEDIA_DIR,
 ): Promise<void> {
   if (!msg.attachments?.length || !adapter.downloadFile) return;
 
-  await mkdir(mediaDir, { recursive: true });
+  await mkdir(targetDir, { recursive: true });
+  await ensureTargetDirGitignore(targetDir);
   for (const attachment of msg.attachments) {
     if (attachment.localPath || !attachment.fileKey || !attachment.messageId) continue;
     if (typeof attachment.size === 'number') {
@@ -28,10 +29,16 @@ export async function downloadInboundAttachments(
       attachment.type,
     );
     assertWithinAttachmentDownloadLimit(data.byteLength);
-    const path = join(mediaDir, buildAttachmentFileName(attachment));
+    const path = join(targetDir, buildAttachmentFileName(attachment));
     await writeFile(path, data);
     attachment.localPath = path;
   }
+}
+
+export function expandHome(p: string): string {
+  if (p === '~') return homedir();
+  if (p.startsWith('~/')) return join(homedir(), p.slice(2));
+  return p;
 }
 
 export async function buildUserMessageForAgent(
@@ -96,6 +103,19 @@ function buildAttachmentFileName(attachment: FileAttachment): string {
   const ext = extname(name) || extensionForAttachment(attachment);
   const stem = extname(name) ? name.slice(0, -extname(name).length) : name;
   return `${Date.now()}-${randomUUID()}-${stem}${ext}`;
+}
+
+async function ensureTargetDirGitignore(targetDir: string): Promise<void> {
+  try {
+    await writeFile(join(targetDir, '.gitignore'), '*\n', { flag: 'wx' });
+  } catch (err) {
+    if (isNodeError(err) && err.code === 'EEXIST') return;
+    throw err;
+  }
+}
+
+function isNodeError(err: unknown): err is NodeJS.ErrnoException {
+  return err instanceof Error && 'code' in err;
 }
 
 function sanitizeFileName(name: string): string {

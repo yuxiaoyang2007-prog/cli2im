@@ -32,6 +32,7 @@ import { sanitizeVoiceTranscript, validateWorkingDirectory } from './security/va
 import {
   buildUserMessageForAgent,
   downloadInboundAttachments,
+  expandHome,
 } from './media.js';
 import { initContentGuard } from './security/content-guard.js';
 import {
@@ -162,20 +163,7 @@ async function main(): Promise<void> {
   const pipeline = new InboundPipeline(config);
 
   const handoffService = new HandoffService({
-    spawnResume: async (sessionKey, agentName, sessionId, workDir) => {
-      const handlers = createEventHandlers(sessionKey);
-      const proc = await agentManager.resumeAgent(
-        sessionKey,
-        agentName,
-        sessionId,
-        {
-          workingDirectory: workDir,
-          permissionMode: 'blacklist',
-        },
-        handlers,
-      );
-      return { pid: proc.pid, sessionId };
-    },
+    spawnResume: createHandoffSpawnResume(agentManager, store, createEventHandlers),
     getSession: async (sessionKey) => store.getByKey(sessionKey),
     updateState: async (id, state) => store.updateState(id, state),
   });
@@ -383,7 +371,7 @@ async function main(): Promise<void> {
           }
         : { channel: msg.platform, userId: msg.userId, userName: msg.userName };
       const senderHeader = buildSenderHeader(sender);
-      await downloadInboundAttachments(msg, adapter, mediaDir);
+      await downloadInboundAttachments(msg, adapter, join(expandHome(session.workingDirectory), 'inbox'));
 
       let pendingVoiceChatId: string | undefined;
       if (msg.isVoice) {
@@ -790,6 +778,41 @@ export async function handleBridgeCommand(
     default:
       await adapter.send(chatId, { text: `未知指令: /${cmd.command}` });
   }
+}
+
+export function createHandoffSpawnResume(
+  agentManager: Pick<AgentManager, 'resumeAgent'>,
+  store: Pick<
+    SessionStore,
+    'getOrCreate' | 'updateWorkingDirectory' | 'updateAgentSessionId' | 'updateState' | 'touch'
+  >,
+  createEventHandlers: (sessionKey: SessionKey) => AgentManagerEvents,
+): (
+  sessionKey: SessionKey,
+  agentName: string,
+  sessionId: string,
+  workDir: string,
+) => Promise<{ pid: number; sessionId: string }> {
+  return async (sessionKey, agentName, sessionId, workDir) => {
+    const handlers = createEventHandlers(sessionKey);
+    const proc = await agentManager.resumeAgent(
+      sessionKey,
+      agentName,
+      sessionId,
+      {
+        workingDirectory: workDir,
+        permissionMode: 'blacklist',
+      },
+      handlers,
+    );
+    const normalizedWorkDir = expandHome(workDir);
+    const session = await store.getOrCreate(sessionKey, { agentName, workingDirectory: normalizedWorkDir });
+    await store.updateWorkingDirectory(session.id, normalizedWorkDir);
+    await store.updateAgentSessionId(session.id, sessionId);
+    await store.updateState(session.id, 'active');
+    await store.touch(session.id);
+    return { pid: proc.pid, sessionId };
+  };
 }
 
 function formatDateTime(value: number): string {

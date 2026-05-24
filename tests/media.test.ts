@@ -1,17 +1,18 @@
 import { mkdtempSync, readFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { homedir, tmpdir } from 'node:os';
+import { isAbsolute, join, sep } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
 import {
   buildUserMessageForAgent,
   downloadInboundAttachments,
+  expandHome,
 } from '../src/media.js';
 import { MAX_ATTACHMENT_DOWNLOAD_BYTES } from '../src/security/download-limits.js';
 import type { InboundMessage, PlatformAdapter } from '../src/types.js';
 
-describe('media bridge helpers', () => {
-  it('downloads inbound attachments to the media directory and sets localPath', async () => {
-    const dir = mkdtempSync(join(tmpdir(), 'cli2im-media-'));
+describe('attachment bridge helpers', () => {
+  it('downloads inbound attachments to the target directory and sets localPath', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'cli2im-target-'));
     const msg: InboundMessage = {
       platform: 'feishu',
       chatId: 'oc_1',
@@ -34,11 +35,32 @@ describe('media bridge helpers', () => {
 
     expect(adapter.downloadFile).toHaveBeenCalledWith('om_1', 'img_1', 'image');
     expect(msg.attachments?.[0].localPath).toMatch(/\.png$/);
+    expect(msg.attachments?.[0].localPath?.startsWith(`${dir}${sep}`)).toBe(true);
     expect(readFileSync(msg.attachments![0].localPath!, 'utf8')).toBe('png-data');
+    expect(readFileSync(join(dir, '.gitignore'), 'utf8')).toBe('*\n');
+  });
+
+  it('initializes the target directory repeatedly and concurrently without EEXIST', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'cli2im-target-'));
+    const first = inboundMessage('om_1', 'file_1');
+    const second = inboundMessage('om_2', 'file_2');
+    const adapter: Pick<PlatformAdapter, 'downloadFile'> = {
+      downloadFile: vi.fn(async (_messageId, fileKey) => Buffer.from(`data-${fileKey}`)),
+    };
+
+    await Promise.all([
+      downloadInboundAttachments(first, adapter, dir),
+      downloadInboundAttachments(second, adapter, dir),
+    ]);
+    await downloadInboundAttachments(inboundMessage('om_3', 'file_3'), adapter, dir);
+
+    expect(readFileSync(join(dir, '.gitignore'), 'utf8')).toBe('*\n');
+    expect(first.attachments?.[0].localPath?.startsWith(`${dir}${sep}`)).toBe(true);
+    expect(second.attachments?.[0].localPath?.startsWith(`${dir}${sep}`)).toBe(true);
   });
 
   it('rejects oversized attachments before downloading or writing them', async () => {
-    const dir = mkdtempSync(join(tmpdir(), 'cli2im-media-'));
+    const dir = mkdtempSync(join(tmpdir(), 'cli2im-target-'));
     const msg: InboundMessage = {
       platform: 'telegram',
       chatId: '1001',
@@ -63,6 +85,15 @@ describe('media bridge helpers', () => {
     expect(msg.attachments?.[0].localPath).toBeUndefined();
   });
 
+  it('expands only the current user home shorthand', () => {
+    expect(expandHome('~')).toBe(homedir());
+    expect(expandHome('~/x')).toBe(join(homedir(), 'x'));
+    expect(expandHome('~user/x')).toBe('~user/x');
+
+    const absolute = isAbsolute('/tmp') ? '/tmp' : 'C:\\tmp';
+    expect(expandHome(absolute)).toBe(absolute);
+  });
+
   it('passes downloaded attachments through to Codex user messages', async () => {
     const attachment = {
       type: 'image' as const,
@@ -78,7 +109,7 @@ describe('media bridge helpers', () => {
   });
 
   it('converts Claude Code images to base64 blocks and injects file paths into text', async () => {
-    const dir = mkdtempSync(join(tmpdir(), 'cli2im-media-'));
+    const dir = mkdtempSync(join(tmpdir(), 'cli2im-target-'));
     const imagePath = join(dir, 'picture.png');
     const filePath = join(dir, 'report.pdf');
     await import('node:fs/promises').then(({ writeFile }) =>
@@ -128,3 +159,20 @@ describe('media bridge helpers', () => {
     expect(text).not.toContain('ou_admin');
   });
 });
+
+function inboundMessage(messageId: string, fileKey: string): InboundMessage {
+  return {
+    platform: 'feishu',
+    chatId: 'oc_1',
+    userId: 'ou_1',
+    text: 'see attached',
+    attachments: [
+      {
+        type: 'file',
+        fileKey,
+        messageId,
+        mimeType: 'text/plain',
+      },
+    ],
+  };
+}
