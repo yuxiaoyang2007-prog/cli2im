@@ -1,7 +1,9 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { AgentManager } from '../src/agents/manager.js';
 import { ToolGate } from '../src/agents/tool-gate.js';
+import { ClaudeCodePlugin } from '../src/agents/claude-code.js';
 import type { AgentPlugin, AgentProcess, AgentEvent, SessionKey } from '../src/types.js';
+import type { SDKMessage } from '@anthropic-ai/claude-agent-sdk';
 import { Transform } from 'node:stream';
 import { EventEmitter, Readable, Writable } from 'node:stream';
 import { mkdir, mkdtemp, rm, symlink } from 'node:fs/promises';
@@ -63,6 +65,24 @@ function createMockProcess(): MockAgentProcess {
     on: (event: string, handler: any) => { ee.on(event, handler); },
     emitExit: (code: number | null) => ee.emit('exit', code),
   };
+}
+
+function waitFor(predicate: () => boolean, timeoutMs = 500): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const startedAt = Date.now();
+    const tick = () => {
+      if (predicate()) {
+        resolve();
+        return;
+      }
+      if (Date.now() - startedAt > timeoutMs) {
+        reject(new Error('Timed out waiting for condition'));
+        return;
+      }
+      setTimeout(tick, 5);
+    };
+    tick();
+  });
 }
 
 describe('AgentManager', () => {
@@ -1182,4 +1202,297 @@ describe('AgentManager', () => {
 
     expect(proc.sessionId).toBe('ses_status_1');
   });
+
+  it('does not start claude-code query before the first manager message and preserves initial status', async () => {
+    const queryFn = vi.fn(() => (async function* () {
+      yield systemInit('ses_lazy');
+      yield successResult('ses_lazy');
+    })());
+    const plugin = new ClaudeCodePlugin('/usr/local/bin/claude', queryFn as any);
+    manager.registerPlugin(plugin);
+    const onEvent = vi.fn();
+    const sessionKey = 'feishu:chat_1:ccbot' as const;
+
+    const proc = await manager.spawnAgent(
+      sessionKey,
+      'claude-code',
+      {
+        workingDirectory: process.cwd(),
+        permissionMode: 'blacklist',
+      },
+      {
+        onEvent,
+        onToolBlocked: vi.fn(),
+        onPermissionTimeout: vi.fn(),
+        onProcessExit: vi.fn(),
+      },
+    );
+
+    expect(queryFn).not.toHaveBeenCalled();
+    expect(onEvent).not.toHaveBeenCalled();
+
+    manager.sendMessage(sessionKey, 'claude-code', {
+      role: 'user',
+      content: 'hello',
+    });
+
+    await waitFor(() => onEvent.mock.calls.some((call) => call[1]?.type === 'result'));
+
+    expect(queryFn).toHaveBeenCalledTimes(1);
+    expect(onEvent.mock.calls.map((call) => call[1])).toEqual([
+      { type: 'status', sessionId: 'ses_lazy' },
+      {
+        type: 'result',
+        sessionId: 'ses_lazy',
+        usage: {
+          inputTokens: 1,
+          outputTokens: 1,
+          cacheReadTokens: undefined,
+          cacheWriteTokens: undefined,
+        },
+      },
+    ]);
+    expect(proc.sessionId).toBe('ses_lazy');
+  });
+
+  it('stores fresh claude-code session id after cold resume fallback', async () => {
+    const resumes: Array<string | undefined> = [];
+    const queryFn = vi.fn(({ prompt, options }) => (async function* () {
+      resumes.push(options.resume);
+      if (options.resume === 'poisoned_session') {
+        yield systemInit('poisoned_session');
+        throw new Error('API Error: 400 thinking blocks cannot be modified');
+      }
+
+      for await (const _message of prompt as AsyncIterable<unknown>) {
+        yield systemInit('fresh_session');
+        yield successResult('fresh_session');
+        break;
+      }
+    })());
+    const plugin = new ClaudeCodePlugin('/usr/local/bin/claude', queryFn as any);
+    manager.registerPlugin(plugin);
+    const onEvent = vi.fn();
+    const onProcessExit = vi.fn();
+    const sessionKey = 'feishu:chat_1:ccbot' as const;
+
+    const proc = await manager.resumeAgent(
+      sessionKey,
+      'claude-code',
+      'poisoned_session',
+      {
+        workingDirectory: process.cwd(),
+        permissionMode: 'blacklist',
+      },
+      {
+        onEvent,
+        onToolBlocked: vi.fn(),
+        onPermissionTimeout: vi.fn(),
+        onProcessExit,
+      },
+    );
+
+    manager.sendMessage(sessionKey, 'claude-code', {
+      role: 'user',
+      content: 'recover',
+    });
+
+    await waitFor(() => onEvent.mock.calls.some((call) => call[1]?.type === 'result'));
+
+    expect(resumes).toEqual(['poisoned_session', undefined]);
+    expect(onEvent.mock.calls.map((call) => call[1])).toEqual([
+      { type: 'status', sessionId: 'fresh_session' },
+      {
+        type: 'result',
+        sessionId: 'fresh_session',
+        usage: {
+          inputTokens: 1,
+          outputTokens: 1,
+          cacheReadTokens: undefined,
+          cacheWriteTokens: undefined,
+        },
+      },
+    ]);
+    expect(proc.sessionId).toBe('fresh_session');
+    expect(onProcessExit).not.toHaveBeenCalled();
+  });
+
+  it('stores fresh claude-code session id after synthetic thinking-400 resume fallback', async () => {
+    const resumes: Array<string | undefined> = [];
+    const queryFn = vi.fn(({ prompt, options }) => (async function* () {
+      resumes.push(options.resume);
+      if (options.resume === 'poisoned_session') {
+        yield assistantText(
+          'API Error: 400 messages.3.content.10: `thinking` or `redacted_thinking` blocks in the latest assistant message cannot be modified.',
+          '<synthetic>',
+        );
+        yield systemInit('poisoned_session');
+        yield successResult('poisoned_session');
+        await new Promise<void>((_resolve, reject) => {
+          options.abortController.signal.addEventListener('abort', () => reject(new Error('aborted')), { once: true });
+        });
+        return;
+      }
+
+      for await (const _message of prompt as AsyncIterable<unknown>) {
+        yield systemInit('fresh_session');
+        yield successResult('fresh_session');
+        break;
+      }
+    })());
+    const plugin = new ClaudeCodePlugin('/usr/local/bin/claude', queryFn as any);
+    manager.registerPlugin(plugin);
+    const onEvent = vi.fn();
+    const onProcessExit = vi.fn();
+    const sessionKey = 'feishu:chat_1:ccbot' as const;
+
+    const proc = await manager.resumeAgent(
+      sessionKey,
+      'claude-code',
+      'poisoned_session',
+      {
+        workingDirectory: process.cwd(),
+        permissionMode: 'blacklist',
+      },
+      {
+        onEvent,
+        onToolBlocked: vi.fn(),
+        onPermissionTimeout: vi.fn(),
+        onProcessExit,
+      },
+    );
+
+    try {
+      manager.sendMessage(sessionKey, 'claude-code', {
+        role: 'user',
+        content: 'recover',
+      });
+
+      await waitFor(() => onEvent.mock.calls.some((call) => call[1]?.type === 'result'));
+
+      expect(resumes).toEqual(['poisoned_session', undefined]);
+      expect(onEvent.mock.calls.map((call) => call[1])).toEqual([
+        { type: 'status', sessionId: 'fresh_session' },
+        {
+          type: 'result',
+          sessionId: 'fresh_session',
+          usage: {
+            inputTokens: 1,
+            outputTokens: 1,
+            cacheReadTokens: undefined,
+            cacheWriteTokens: undefined,
+          },
+        },
+      ]);
+      expect(onEvent.mock.calls.map((call) => call[1])).not.toContainEqual(expect.objectContaining({
+        type: 'text',
+        content: expect.stringContaining('cannot be modified'),
+      }));
+      expect(proc.sessionId).toBe('fresh_session');
+      expect(onProcessExit).not.toHaveBeenCalled();
+    } finally {
+      manager.cancelAgent(sessionKey);
+    }
+  });
+
+  it('routes claude-code permission responses and clears pending permission on stop', async () => {
+    const permissionResults: unknown[] = [];
+    const queryFn = vi.fn(({ prompt, options }) => (async function* () {
+      let count = 0;
+      for await (const _message of prompt as AsyncIterable<unknown>) {
+        count += 1;
+        const result = await options.canUseTool(
+          'Bash',
+          { command: `sudo ls ${count}` },
+          { toolUseID: `perm_${count}`, signal: options.abortController.signal },
+        );
+        permissionResults.push(result);
+        if (options.abortController.signal.aborted) return;
+        yield successResult(`ses_perm_${count}`);
+      }
+    })());
+    const plugin = new ClaudeCodePlugin('/usr/local/bin/claude', queryFn as any);
+    manager.registerPlugin(plugin);
+    const onToolBlocked = vi.fn();
+    const onProcessExit = vi.fn();
+    const sessionKey = 'feishu:chat_1:ccbot' as const;
+
+    await manager.spawnAgent(
+      sessionKey,
+      'claude-code',
+      {
+        workingDirectory: process.cwd(),
+        permissionMode: 'blacklist',
+      },
+      {
+        onEvent: vi.fn(),
+        onToolBlocked,
+        onPermissionTimeout: vi.fn(),
+        onProcessExit,
+      },
+    );
+
+    manager.sendMessage(sessionKey, 'claude-code', {
+      role: 'user',
+      content: 'needs approval',
+    });
+
+    await waitFor(() => onToolBlocked.mock.calls.length === 1);
+    expect(manager.approvePermission(sessionKey, 'perm_1')).toBe(true);
+    await waitFor(() => permissionResults.length === 1);
+    expect(permissionResults[0]).toEqual({ behavior: 'allow' });
+
+    manager.sendMessage(sessionKey, 'claude-code', {
+      role: 'user',
+      content: 'will stop',
+    });
+    await waitFor(() => onToolBlocked.mock.calls.length === 2);
+    expect(manager.getPendingPermissionForSession(sessionKey)?.requestId).toBe('perm_2');
+
+    manager.cancelAgent(sessionKey);
+
+    await waitFor(() => onProcessExit.mock.calls.length === 1);
+    expect(manager.getPendingPermissionForSession(sessionKey)).toBeUndefined();
+    expect(manager.approvePermission(sessionKey, 'perm_2')).toBe(false);
+    expect(permissionResults[1]).toMatchObject({ behavior: 'deny' });
+    expect(onProcessExit).toHaveBeenCalledWith(sessionKey, null, expect.any(Object));
+  });
 });
+
+function assistantText(text: string, model = 'claude-sonnet-4-20250514'): SDKMessage {
+  return {
+    type: 'assistant',
+    session_id: 'ses_text',
+    parent_tool_use_id: null,
+    uuid: `00000000-0000-4000-8003-${text.length.toString().padStart(12, '0')}`,
+    message: {
+      id: `msg_${text.length}`,
+      role: 'assistant',
+      model,
+      stop_reason: 'end_turn',
+      stop_sequence: null,
+      type: 'message',
+      usage: { input_tokens: 1, output_tokens: 1 },
+      content: [{ type: 'text', text }],
+    },
+  } as unknown as SDKMessage;
+}
+
+function systemInit(sessionId: string): SDKMessage {
+  return {
+    type: 'system',
+    subtype: 'init',
+    session_id: sessionId,
+    uuid: `00000000-0000-4000-8004-${sessionId.padStart(12, '0').slice(-12)}`,
+  } as unknown as SDKMessage;
+}
+
+function successResult(sessionId: string): SDKMessage {
+  return {
+    type: 'result',
+    subtype: 'success',
+    session_id: sessionId,
+    uuid: `00000000-0000-4000-8002-${sessionId.padStart(12, '0').slice(-12)}`,
+    usage: { input_tokens: 1, output_tokens: 1 },
+  } as unknown as SDKMessage;
+}

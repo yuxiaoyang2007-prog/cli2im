@@ -2,6 +2,7 @@ import { PassThrough, Writable } from 'node:stream';
 import { EventEmitter } from 'node:events';
 import { query } from '@anthropic-ai/claude-agent-sdk';
 import { resolveSafeFilePayloads } from './codex-file-markers.js';
+import { InputQueue } from './input-queue.js';
 import type {
   CanUseTool,
   Options as ClaudeQueryOptions,
@@ -46,6 +47,14 @@ export interface SDKEventMappingState {
 
 interface PendingPermissionResolver {
   resolve: (result: PermissionResult) => void;
+  cleanup: () => void;
+}
+
+class ResumeFailed extends Error {
+  constructor() {
+    super('Resume failed before side effects');
+    this.name = 'ResumeFailed';
+  }
 }
 
 export function createSDKEventMappingState(): SDKEventMappingState {
@@ -164,6 +173,21 @@ function stringifyToolResultContent(content: unknown): string {
   return JSON.stringify(content ?? '');
 }
 
+function isTransportExitError(err: unknown): boolean {
+  const message = err instanceof Error ? err.message : String(err);
+  return message.includes('process exited with code');
+}
+
+function isThinkingBlockMutationErrorText(content: string): boolean {
+  const normalized = content.toLowerCase();
+  const mentionsSyntheticError = normalized.includes('api error') && normalized.includes('400');
+  const mentionsThinking = normalized.includes('thinking') || normalized.includes('redacted_thinking');
+  const mentionsMutation =
+    normalized.includes('cannot be modified') ||
+    normalized.includes('must remain as they were');
+  return mentionsSyntheticError && mentionsThinking && mentionsMutation;
+}
+
 function mapPermissionMode(permissionMode: SpawnOpts['permissionMode']): PermissionMode {
   return permissionMode === 'bypass' ? 'bypassPermissions' : 'default';
 }
@@ -174,10 +198,8 @@ function isCancelMessage(payload: StdinPayload): boolean {
   return payload.message.content === '/stop';
 }
 
-function createPrompt(msg: UserMessage): string | AsyncIterable<SDKUserMessage> {
-  if (typeof msg.content === 'string') return msg.content;
-
-  const sdkMessage: SDKUserMessage = {
+function createSDKUserMessage(msg: UserMessage): SDKUserMessage {
+  return {
     type: 'user',
     message: {
       role: 'user',
@@ -185,10 +207,15 @@ function createPrompt(msg: UserMessage): string | AsyncIterable<SDKUserMessage> 
     },
     parent_tool_use_id: null,
   };
+}
 
-  return (async function* () {
-    yield sdkMessage;
-  })();
+function resetTurnMappingState(state: SDKEventMappingState): void {
+  state.hasStreamedDeltas = false;
+  state.toolNamesById.clear();
+}
+
+function isTurnSideEffectEvent(event: AgentEvent): boolean {
+  return event.type !== 'status' && event.type !== 'result';
 }
 
 export class ClaudeCodeVirtualProcess implements AgentProcess {
@@ -199,10 +226,15 @@ export class ClaudeCodeVirtualProcess implements AgentProcess {
 
   private inputBuffer = '';
   private activeQuery = false;
+  private queryStarted = false;
   private terminated = false;
   private exitEmitted = false;
   private abortController = new AbortController();
-  private queuedMessages: UserMessage[] = [];
+  private inputQueue = new InputQueue<SDKUserMessage>();
+  private coldStartReplayInputs: SDKUserMessage[] = [];
+  private bufferingColdStartReplay = true;
+  private bufferingResumeInput = false;
+  private resumeAttemptHasSideEffects = false;
   private pendingPermissions = new Map<string, PendingPermissionResolver>();
   private eventEmitter = new EventEmitter();
   private mappingState = createSDKEventMappingState();
@@ -238,6 +270,8 @@ export class ClaudeCodeVirtualProcess implements AgentProcess {
   }
 
   canUseTool: CanUseTool = async (toolName, input, context) => {
+    this.resumeAttemptHasSideEffects = this.bufferingResumeInput || this.resumeAttemptHasSideEffects;
+
     if (this.opts.autoApprove) {
       return { behavior: 'allow', updatedInput: input };
     }
@@ -252,8 +286,7 @@ export class ClaudeCodeVirtualProcess implements AgentProcess {
 
     return new Promise<PermissionResult>((resolve) => {
       const abort = () => {
-        this.pendingPermissions.delete(toolUseID);
-        resolve({
+        this.settlePermission(toolUseID, {
           behavior: 'deny',
           message: 'Permission request was cancelled',
           toolUseID,
@@ -261,11 +294,18 @@ export class ClaudeCodeVirtualProcess implements AgentProcess {
       };
 
       if (context.signal.aborted) {
-        abort();
+        resolve({
+          behavior: 'deny',
+          message: 'Permission request was cancelled',
+          toolUseID,
+        });
         return;
       }
 
-      this.pendingPermissions.set(toolUseID, { resolve });
+      this.pendingPermissions.set(toolUseID, {
+        resolve,
+        cleanup: () => context.signal.removeEventListener('abort', abort),
+      });
       context.signal.addEventListener('abort', abort, { once: true });
     });
   };
@@ -301,30 +341,81 @@ export class ClaudeCodeVirtualProcess implements AgentProcess {
   private enqueueUserMessage(message: UserMessage): void {
     if (this.terminated) return;
 
-    if (this.activeQuery) {
-      this.queuedMessages.push(message);
-      return;
+    const sdkMessage = createSDKUserMessage(message);
+    if (this.bufferingColdStartReplay) {
+      this.coldStartReplayInputs.push(sdkMessage);
     }
 
-    void this.runQuery(message);
+    if (!this.queryStarted) {
+      this.queryStarted = true;
+      void this.runQuery();
+    }
+
+    this.inputQueue.push(sdkMessage);
   }
 
-  private async runQuery(message: UserMessage): Promise<void> {
+  private async runQuery(): Promise<void> {
     if (this.terminated) return;
 
     this.activeQuery = true;
-    this.mappingState.hasStreamedDeltas = false;
-    let hasReceivedResult = false;
+
+    try {
+      let resumeForAttempt = this.sdkSessionId;
+      while (!this.terminated) {
+        try {
+          await this.consumeQuery(resumeForAttempt);
+          return;
+        } catch (err) {
+          if (this.terminated || this.abortController.signal.aborted) {
+            this.emitExit(null);
+            return;
+          }
+
+          if (
+            resumeForAttempt &&
+            !this.resumeAttemptHasSideEffects &&
+            !isTransportExitError(err)
+          ) {
+            this.sdkSessionId = undefined;
+            this.sessionId = '';
+            this.mappingState = createSDKEventMappingState();
+            this.resetInputQueueFromColdStartReplay();
+            this.bufferingResumeInput = false;
+            this.resumeAttemptHasSideEffects = false;
+            resumeForAttempt = undefined;
+            continue;
+          }
+
+          this.handleFatalError(err);
+          return;
+        }
+      }
+    } finally {
+      this.activeQuery = false;
+    }
+  }
+
+  private async consumeQuery(resumeSessionId: string | undefined): Promise<void> {
+    const usedResume = !!resumeSessionId;
+    const bufferedStatusEvents: AgentEvent[] = [];
     const pendingFilePathsByToolId = new Map<string, string>();
     const completedFilePaths: string[] = [];
+    const attemptAbort = this.createAttemptAbortController();
+    let hasSideEffectsSinceLastResult = false;
+    let resumeFailed = false;
+
+    this.bufferingResumeInput = usedResume;
+    this.resumeAttemptHasSideEffects = false;
 
     try {
       const queryInstance = this.queryFn({
-        prompt: createPrompt(message),
-        options: this.createQueryOptions(),
+        prompt: this.inputQueue,
+        options: this.createQueryOptions(resumeSessionId, attemptAbort.controller),
       }) as Query;
 
       for await (const sdkMessage of queryInstance) {
+        const isSyntheticAssistant =
+          sdkMessage.type === 'assistant' && sdkMessage.message?.model === '<synthetic>';
         const events = mapSDKEvent(sdkMessage, this.mappingState);
 
         // Track successful file-writing tools; failed tool results must not
@@ -346,6 +437,27 @@ export class ClaudeCodeVirtualProcess implements AgentProcess {
         }
 
         for (const event of events) {
+          if (
+            usedResume &&
+            this.bufferingResumeInput &&
+            isSyntheticAssistant &&
+            event.type === 'text' &&
+            isThinkingBlockMutationErrorText(event.content)
+          ) {
+            resumeFailed = true;
+            attemptAbort.controller.abort();
+            throw new ResumeFailed();
+          }
+
+          if (usedResume && this.bufferingResumeInput && event.type === 'status') {
+            bufferedStatusEvents.push(event);
+            continue;
+          }
+
+          if (isTurnSideEffectEvent(event)) {
+            hasSideEffectsSinceLastResult = true;
+          }
+
           // Attach createdFiles to result event
           if (event.type === 'result' && completedFilePaths.length > 0) {
             const resolved = await resolveCreatedFiles(
@@ -357,58 +469,100 @@ export class ClaudeCodeVirtualProcess implements AgentProcess {
             }
           }
 
+          if (usedResume && this.bufferingResumeInput && event.type !== 'result') {
+            this.resumeAttemptHasSideEffects = true;
+          }
+
+          if (event.type === 'result' && event.sessionId) {
+            for (const statusEvent of bufferedStatusEvents) {
+              this.stdout.write(statusEvent);
+            }
+            bufferedStatusEvents.length = 0;
+            this.bufferingResumeInput = false;
+          }
+
           this.stdout.write(event);
           if (event.type === 'result' && event.sessionId) {
-            hasReceivedResult = true;
             this.sdkSessionId = event.sessionId;
             this.sessionId = event.sessionId;
+            if (this.bufferingColdStartReplay) {
+              this.coldStartReplayInputs = [];
+              this.bufferingColdStartReplay = false;
+            }
+            hasSideEffectsSinceLastResult = false;
+            resetTurnMappingState(this.mappingState);
+            pendingFilePathsByToolId.clear();
+            completedFilePaths.length = 0;
           }
         }
       }
-
-      if (this.mappingState.latestSessionId) {
-        this.sdkSessionId = this.mappingState.latestSessionId;
-        this.sessionId = this.mappingState.latestSessionId;
-      }
     } catch (err) {
-      if (this.terminated || this.abortController.signal.aborted) {
-        this.emitExit(null);
+      if (resumeFailed) {
+        throw new ResumeFailed();
+      }
+      if (isTransportExitError(err) && !hasSideEffectsSinceLastResult) {
+        // A transport exit means the subprocess crashed. We intentionally do
+        // not keep or replay in-flight stdin here; AgentManager will rebuild
+        // on the next user message using the latest session id, and the user
+        // can resend the message that was in flight when the crash happened.
+        this.terminated = true;
+        this.denyPendingPermissions('Process exited');
+        this.emitExit(1);
         return;
       }
-
-      const message = err instanceof Error ? err.message : String(err);
-      const isTransportExit = message.includes('process exited with code');
-
-      if (hasReceivedResult && isTransportExit) {
-        console.log('[claude-code-sdk] Suppressing transport error after result');
-        return;
-      }
-
-      this.terminated = true;
-      const error = err instanceof Error ? err : new Error(String(err));
-      this.stdout.write({ type: 'error', message: error.message } satisfies AgentEvent);
-      if (this.eventEmitter.listenerCount('error') > 0) {
-        this.eventEmitter.emit('error', error);
-      }
-      this.emitExit(1);
-      return;
+      throw err;
     } finally {
-      this.activeQuery = false;
+      attemptAbort.dispose();
     }
 
-    const nextMessage = this.queuedMessages.shift();
-    if (nextMessage) {
-      void this.runQuery(nextMessage);
+    this.bufferingResumeInput = false;
+
+    if (this.mappingState.latestSessionId) {
+      this.sdkSessionId = this.mappingState.latestSessionId;
+      this.sessionId = this.mappingState.latestSessionId;
+    }
+
+    if (this.terminated || this.abortController.signal.aborted) {
+      this.emitExit(null);
     }
   }
 
-  private createQueryOptions(): ClaudeQueryOptions {
+  private handleFatalError(err: unknown): void {
+    this.terminated = true;
+    this.bufferingResumeInput = false;
+    const error = err instanceof Error ? err : new Error(String(err));
+    this.stdout.write({ type: 'error', message: error.message } satisfies AgentEvent);
+    this.denyPendingPermissions('Process failed');
+    if (this.eventEmitter.listenerCount('error') > 0) {
+      this.eventEmitter.emit('error', error);
+    }
+    this.emitExit(1);
+  }
+
+  private createAttemptAbortController(): { controller: AbortController; dispose: () => void } {
+    const attemptAbortController = new AbortController();
+    const abortAttempt = () => attemptAbortController.abort();
+    if (this.abortController.signal.aborted) {
+      attemptAbortController.abort();
+    } else {
+      this.abortController.signal.addEventListener('abort', abortAttempt, { once: true });
+    }
+    return {
+      controller: attemptAbortController,
+      dispose: () => this.abortController.signal.removeEventListener('abort', abortAttempt),
+    };
+  }
+
+  private createQueryOptions(
+    resumeSessionId: string | undefined,
+    abortController: AbortController,
+  ): ClaudeQueryOptions {
     const permissionMode = mapPermissionMode(this.opts.permissionMode);
     return {
       cwd: this.opts.workingDirectory,
       model: this.opts.model,
-      resume: this.sdkSessionId,
-      abortController: this.abortController,
+      resume: resumeSessionId,
+      abortController,
       permissionMode,
       allowDangerouslySkipPermissions: permissionMode === 'bypassPermissions' ? true : undefined,
       includePartialMessages: true,
@@ -425,19 +579,43 @@ export class ClaudeCodeVirtualProcess implements AgentProcess {
   }
 
   private resolvePermission(toolUseID: string, decision: 'allow' | 'deny'): void {
+    if (decision === 'allow') {
+      this.settlePermission(toolUseID, { behavior: 'allow' });
+      return;
+    }
+
+    this.settlePermission(toolUseID, {
+      behavior: 'deny',
+      message: 'Denied by user',
+    });
+  }
+
+  private denyPendingPermissions(message: string): void {
+    for (const [toolUseID, pending] of this.pendingPermissions) {
+      pending.cleanup();
+      pending.resolve({
+        behavior: 'deny',
+        message,
+        toolUseID,
+      });
+    }
+    this.pendingPermissions.clear();
+  }
+
+  private settlePermission(toolUseID: string, result: PermissionResult): void {
     const pending = this.pendingPermissions.get(toolUseID);
     if (!pending) return;
 
     this.pendingPermissions.delete(toolUseID);
-    if (decision === 'allow') {
-      pending.resolve({ behavior: 'allow' });
-      return;
-    }
+    pending.cleanup();
+    pending.resolve(result);
+  }
 
-    pending.resolve({
-      behavior: 'deny',
-      message: 'Denied by user',
-    });
+  private resetInputQueueFromColdStartReplay(): void {
+    this.inputQueue = new InputQueue<SDKUserMessage>();
+    for (const message of this.coldStartReplayInputs) {
+      this.inputQueue.push(message);
+    }
   }
 
   private terminate(code: number | null): void {
@@ -445,14 +623,10 @@ export class ClaudeCodeVirtualProcess implements AgentProcess {
 
     this.terminated = true;
     this.abortController.abort();
-    for (const [toolUseID, pending] of this.pendingPermissions) {
-      pending.resolve({
-        behavior: 'deny',
-        message: 'Process terminated',
-        toolUseID,
-      });
-    }
-    this.pendingPermissions.clear();
+    this.inputQueue.close();
+    this.coldStartReplayInputs = [];
+    this.bufferingColdStartReplay = false;
+    this.denyPendingPermissions('Process terminated');
 
     if (!this.activeQuery) {
       this.emitExit(code);

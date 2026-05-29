@@ -17,7 +17,7 @@ export interface SpawnOpts {
   permissionMode: 'bypass' | 'blacklist';
   env?: Record<string, string>;
   systemPrompt?: string;
-  reasoningEffort?: 'low' | 'medium' | 'high';
+  reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max';
   sandboxMode?: string;
   autoApprove?: boolean;
   turnTimeoutMs?: number;
@@ -261,6 +261,7 @@ export interface BotConfig {
 export interface AgentConfig {
   binary: string;
   defaultModel?: string;
+  defaultEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max';
   env?: Record<string, string>;
 }
 

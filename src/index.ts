@@ -432,7 +432,9 @@ async function main(): Promise<void> {
           turnTimeoutMs: botConfig.turnTimeoutMs,
           idleTimeoutMs: botConfig.idleTimeoutMs,
           sandboxMode: botConfig.sandboxMode,
-          reasoningEffort: runtimeState.fastModeBySession.get(sessionKey) ? 'low' : undefined,
+          reasoningEffort: runtimeState.fastModeBySession.get(sessionKey)
+            ? 'low'
+            : config.agents[botConfig.agent]?.defaultEffort,
           initialPrompt: messageText,
         };
 
