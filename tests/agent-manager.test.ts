@@ -692,7 +692,7 @@ describe('AgentManager', () => {
     second.emitExit(0);
 
     expect(manager.getProcess(sessionKey)).toBeUndefined();
-    expect(onProcessExit).toHaveBeenCalledWith(sessionKey, 0, expect.any(Object));
+    expect(onProcessExit).toHaveBeenCalledWith(sessionKey, 0, expect.any(Object), undefined);
   });
 
   it('does not let a stale resumed process exit clear a replacement process', async () => {
@@ -741,7 +741,7 @@ describe('AgentManager', () => {
     second.emitExit(0);
 
     expect(manager.getProcess(sessionKey)).toBeUndefined();
-    expect(onProcessExit).toHaveBeenCalledWith(sessionKey, 0, expect.any(Object));
+    expect(onProcessExit).toHaveBeenCalledWith(sessionKey, 0, expect.any(Object), undefined);
   });
 
   it('kills a watched process when idle timeout expires and resets timeout on activity', async () => {
@@ -1455,7 +1455,7 @@ describe('AgentManager', () => {
     expect(manager.getPendingPermissionForSession(sessionKey)).toBeUndefined();
     expect(manager.approvePermission(sessionKey, 'perm_2')).toBe(false);
     expect(permissionResults[1]).toMatchObject({ behavior: 'deny' });
-    expect(onProcessExit).toHaveBeenCalledWith(sessionKey, null, expect.any(Object));
+    expect(onProcessExit).toHaveBeenCalledWith(sessionKey, null, expect.any(Object), 'ses_perm_1');
   });
 });
 

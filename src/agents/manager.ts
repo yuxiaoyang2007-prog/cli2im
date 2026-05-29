@@ -52,6 +52,7 @@ export interface AgentManagerEvents {
     sessionKey: SessionKey,
     code: number | null,
     context: AgentEventContext,
+    sessionId: string | undefined,
   ) => void | Promise<void>;
 }
 
@@ -279,6 +280,11 @@ export class AgentManager {
     return ctx ? this.createCurrentEventContext(sessionKey, ctx) : undefined;
   }
 
+  getLatestSessionId(sessionKey: SessionKey): string | undefined {
+    const ctx = this.getProcessContext(sessionKey) ?? this.exitingContexts.get(sessionKey);
+    return ctx?.proc.sessionId || ctx?.sessionAgentId;
+  }
+
   private setupWatchdog(
     sessionKey: SessionKey,
     ctx: ProcessContext,
@@ -411,11 +417,12 @@ export class AgentManager {
     code: number | null,
   ): Promise<void> {
     const exitContext = this.createCurrentEventContext(sessionKey, ctx);
+    const sessionId = ctx.proc.sessionId || ctx.sessionAgentId;
     const current = this.contexts.get(sessionKey);
     if (current?.kind === 'claim' && current.previous === ctx) {
       current.previous = undefined;
       this.disposeContext(ctx);
-      await handlers.onProcessExit(sessionKey, code, exitContext);
+      await handlers.onProcessExit(sessionKey, code, exitContext, sessionId);
       return;
     }
 
@@ -424,7 +431,7 @@ export class AgentManager {
     this.contexts.delete(sessionKey);
     this.exitingContexts.set(sessionKey, ctx);
     try {
-      await handlers.onProcessExit(sessionKey, code, exitContext);
+      await handlers.onProcessExit(sessionKey, code, exitContext, sessionId);
     } finally {
       if (this.exitingContexts.get(sessionKey) === ctx) {
         this.exitingContexts.delete(sessionKey);

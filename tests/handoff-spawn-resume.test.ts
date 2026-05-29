@@ -1,9 +1,9 @@
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
-import { createHandoffSpawnResume } from '../src/index.js';
+import { createHandoffSpawnResume, startAgentProcessForSession } from '../src/index.js';
 import type { AgentManagerEvents } from '../src/agents/manager.js';
-import type { AgentProcess, Session, SessionKey } from '../src/types.js';
+import type { AgentPlugin, AgentProcess, Session, SessionKey } from '../src/types.js';
 
 describe('handoff spawnResume store sync', () => {
   it('updates an existing row after resume succeeds', async () => {
@@ -54,6 +54,62 @@ describe('handoff spawnResume store sync', () => {
   });
 });
 
+describe('startAgentProcessForSession session resume id selection', () => {
+  it('durably prewrites the manager latest session id before resuming', async () => {
+    const sessionKey = 'telegram:chat_1:codexbot' as SessionKey;
+    const session = sessionRow('row_existing', sessionKey);
+    session.agentSessionId = 'agent_session_s1';
+    const updateGate = deferred<void>();
+    const order: string[] = [];
+    const agentManager = {
+      getPlugin: vi.fn(() => ({
+        capabilities: { sessionResume: true },
+      }) as AgentPlugin),
+      getLatestSessionId: vi.fn(() => 'agent_session_s2'),
+      resumeAgent: vi.fn(async () => {
+        order.push('resume');
+        return { pid: 123 } as AgentProcess;
+      }),
+      spawnAgent: vi.fn(),
+    };
+    const store = {
+      updateAgentSessionId: vi.fn(async () => {
+        order.push('update-start');
+        await updateGate.promise;
+        order.push('update-end');
+      }),
+    };
+    const handlers = createHandlers();
+
+    const started = startAgentProcessForSession({
+      agentManager,
+      store,
+      session,
+      sessionKey,
+      agentName: 'codex',
+      spawnOpts: { workingDirectory: '~/project-a', permissionMode: 'blacklist' },
+      handlers,
+    });
+
+    await vi.waitFor(() => expect(store.updateAgentSessionId).toHaveBeenCalledTimes(1));
+    expect(agentManager.resumeAgent).not.toHaveBeenCalled();
+
+    updateGate.resolve();
+    await started;
+
+    expect(store.updateAgentSessionId).toHaveBeenCalledWith('row_existing', 'agent_session_s2');
+    expect(agentManager.resumeAgent).toHaveBeenCalledWith(
+      sessionKey,
+      'codex',
+      'agent_session_s2',
+      { workingDirectory: '~/project-a', permissionMode: 'blacklist' },
+      handlers,
+    );
+    expect(agentManager.spawnAgent).not.toHaveBeenCalled();
+    expect(order).toEqual(['update-start', 'update-end', 'resume']);
+  });
+});
+
 function createDeps(session: Session) {
   const agentManager = {
     resumeAgent: vi.fn(async () => ({ pid: 123 }) as AgentProcess),
@@ -66,10 +122,7 @@ function createDeps(session: Session) {
     touch: vi.fn(async () => undefined),
   };
   const createEventHandlers = vi.fn((): AgentManagerEvents => ({
-    onEvent: vi.fn(),
-    onToolBlocked: vi.fn(),
-    onPermissionTimeout: vi.fn(),
-    onProcessExit: vi.fn(),
+    ...createHandlers(),
   }));
 
   return {
@@ -78,6 +131,25 @@ function createDeps(session: Session) {
     createEventHandlers,
     spawnResume: createHandoffSpawnResume(agentManager, store, createEventHandlers),
   };
+}
+
+function createHandlers(): AgentManagerEvents {
+  return {
+    onEvent: vi.fn(),
+    onToolBlocked: vi.fn(),
+    onPermissionTimeout: vi.fn(),
+    onProcessExit: vi.fn(),
+  };
+}
+
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
 }
 
 function sessionRow(id: string, key: SessionKey): Session {

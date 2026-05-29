@@ -220,6 +220,7 @@ async function main(): Promise<void> {
       },
       onProcessExit: createRuntimeProcessExitHandler({
         sessionKey,
+        store,
         stopTyping,
         voiceSessions,
         cardController,
@@ -439,24 +440,21 @@ async function main(): Promise<void> {
         };
 
         const plugin = agentManager.getPlugin(botConfig.agent);
-        if (session.agentSessionId && plugin?.capabilities.sessionResume) {
-          console.log(`[pipeline] ${scrubLog(botName)}: resuming session ${scrubLog(session.agentSessionId)}`);
-          await agentManager.resumeAgent(
-            sessionKey,
-            botConfig.agent,
-            session.agentSessionId,
-            spawnOpts,
-            handlers,
-          );
+        const latestId = agentManager.getLatestSessionId(sessionKey) ?? session.agentSessionId;
+        if (latestId && plugin?.capabilities.sessionResume) {
+          console.log(`[pipeline] ${scrubLog(botName)}: resuming session ${scrubLog(latestId)}`);
         } else {
           console.log(`[pipeline] ${scrubLog(botName)}: fresh spawn`);
-          await agentManager.spawnAgent(
-            sessionKey,
-            botConfig.agent,
-            spawnOpts,
-            handlers,
-          );
         }
+        await startAgentProcessForSession({
+          agentManager,
+          store,
+          session,
+          sessionKey,
+          agentName: botConfig.agent,
+          spawnOpts,
+          handlers,
+        });
       }
 
       if (pendingVoiceChatId) {
@@ -815,6 +813,38 @@ export function createHandoffSpawnResume(
     await store.touch(session.id);
     return { pid: proc.pid, sessionId };
   };
+}
+
+export async function startAgentProcessForSession(params: {
+  agentManager: Pick<AgentManager, 'getPlugin' | 'getLatestSessionId' | 'resumeAgent' | 'spawnAgent'>;
+  store: Pick<SessionStore, 'updateAgentSessionId'>;
+  session: import('./types.js').Session;
+  sessionKey: SessionKey;
+  agentName: string;
+  spawnOpts: SpawnOpts;
+  handlers: AgentManagerEvents;
+}): Promise<void> {
+  const {
+    agentManager,
+    store,
+    session,
+    sessionKey,
+    agentName,
+    spawnOpts,
+    handlers,
+  } = params;
+  const plugin = agentManager.getPlugin(agentName);
+  const latestId = agentManager.getLatestSessionId(sessionKey) ?? session.agentSessionId;
+
+  if (latestId && plugin?.capabilities.sessionResume) {
+    if (latestId !== session.agentSessionId) {
+      await store.updateAgentSessionId(session.id, latestId);
+    }
+    await agentManager.resumeAgent(sessionKey, agentName, latestId, spawnOpts, handlers);
+    return;
+  }
+
+  await agentManager.spawnAgent(sessionKey, agentName, spawnOpts, handlers);
 }
 
 function formatDateTime(value: number): string {

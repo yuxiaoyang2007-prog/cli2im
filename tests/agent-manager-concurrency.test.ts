@@ -147,7 +147,7 @@ describe('AgentManager concurrent start claims', () => {
 
     await expect(replacement).rejects.toThrow('Invalid working directory');
     expect(manager.getProcess(sessionKey)).toBeUndefined();
-    expect(onProcessExit).toHaveBeenCalledWith(sessionKey, 0, expect.any(Object));
+    expect(onProcessExit).toHaveBeenCalledWith(sessionKey, 0, expect.any(Object), undefined);
   });
 
   it('passes the aborted previous context when a process exits during a replacement claim', async () => {
@@ -175,6 +175,7 @@ describe('AgentManager concurrent start claims', () => {
 
     expect(onProcessExit).toHaveBeenCalledTimes(1);
     const exitContext = onProcessExit.mock.calls[0][2];
+    expect(onProcessExit.mock.calls[0][3]).toBeUndefined();
     expect(exitContext.signal.aborted).toBe(true);
     expect(exitContext.isCurrent()).toBe(false);
 
@@ -186,9 +187,11 @@ describe('AgentManager concurrent start claims', () => {
     validatorMock.validateWorkingDirectory.mockResolvedValueOnce(true);
     let signalWasAborted: boolean | undefined;
     let contextWasCurrent: boolean | undefined;
-    const onProcessExit = vi.fn((_sessionKey, _code, exitContext) => {
+    let exitSessionId: string | undefined;
+    const onProcessExit = vi.fn((_sessionKey, _code, exitContext, sessionId) => {
       signalWasAborted = exitContext.signal.aborted;
       contextWasCurrent = exitContext.isCurrent();
+      exitSessionId = sessionId;
     });
     const handlers = { ...handlersStub(), onProcessExit };
     const sessionKey = 'feishu:chat_1:mock-agent' as const;
@@ -204,6 +207,56 @@ describe('AgentManager concurrent start claims', () => {
     expect(onProcessExit).toHaveBeenCalledTimes(1);
     expect(signalWasAborted).toBe(false);
     expect(contextWasCurrent).toBe(true);
+    expect(exitSessionId).toBeUndefined();
+  });
+
+  it('passes proc.sessionId to onProcessExit even when parser result handling is skipped', async () => {
+    validatorMock.validateWorkingDirectory.mockResolvedValueOnce(true);
+    const onProcessExit = vi.fn();
+    const handlers = { ...handlersStub(), onProcessExit };
+    const sessionKey = 'feishu:chat_1:mock-agent' as const;
+    const proc = await manager.spawnAgent(
+      sessionKey,
+      'mock-agent',
+      { workingDirectory: '/Users/test/current', permissionMode: 'blacklist' },
+      handlers,
+    ) as MockAgentProcess;
+
+    proc.sessionId = 'agent-session-s2';
+    proc.emitExit(0);
+
+    expect(onProcessExit).toHaveBeenCalledWith(
+      sessionKey,
+      0,
+      expect.any(Object),
+      'agent-session-s2',
+    );
+  });
+
+  it('returns the latest session id from current and exiting contexts', async () => {
+    validatorMock.validateWorkingDirectory.mockResolvedValue(true);
+    const exitGate = deferred<void>();
+    const onProcessExit = vi.fn(() => exitGate.promise);
+    const handlers = { ...handlersStub(), onProcessExit };
+    const sessionKey = 'feishu:chat_1:mock-agent' as const;
+    const proc = await manager.spawnAgent(
+      sessionKey,
+      'mock-agent',
+      { workingDirectory: '/Users/test/current', permissionMode: 'blacklist' },
+      handlers,
+    ) as MockAgentProcess;
+
+    proc.sessionId = 'agent-session-current';
+    expect(manager.getLatestSessionId(sessionKey)).toBe('agent-session-current');
+
+    proc.sessionId = 'agent-session-exiting';
+    proc.emitExit(0);
+    await vi.waitFor(() => expect(onProcessExit).toHaveBeenCalledTimes(1));
+
+    expect(manager.getLatestSessionId(sessionKey)).toBe('agent-session-exiting');
+
+    exitGate.resolve();
+    await vi.waitFor(() => expect(manager.getLatestSessionId(sessionKey)).toBeUndefined());
   });
 
   it('aborts the old event context signal when a process is replaced', async () => {

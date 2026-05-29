@@ -264,6 +264,7 @@ describe('createRuntimeProcessExitHandler stale exit guard', () => {
     } as unknown as StreamingCardController;
     const handler = createRuntimeProcessExitHandler({
       sessionKey,
+      store: sessionIdStore(),
       stopTyping: vi.fn(),
       voiceSessions: new Map(),
       cardController,
@@ -272,7 +273,7 @@ describe('createRuntimeProcessExitHandler stale exit guard', () => {
       getCurrentContext: () => context(() => true, replacementController.signal),
     });
 
-    await handler(sessionKey, 1, context(() => false, oldController.signal));
+    await handler(sessionKey, 1, context(() => false, oldController.signal), 'agent-session-old');
 
     expect(cardController.interruptCard).not.toHaveBeenCalled();
   });
@@ -283,6 +284,7 @@ describe('createRuntimeProcessExitHandler stale exit guard', () => {
     controller.abort();
     const handler = createRuntimeProcessExitHandler({
       sessionKey,
+      store: sessionIdStore(),
       adapter,
       stopTyping: vi.fn(),
       voiceSessions: new Map(),
@@ -291,9 +293,75 @@ describe('createRuntimeProcessExitHandler stale exit guard', () => {
       getCurrentContext: () => undefined,
     });
 
-    await handler(sessionKey, 1, context(() => false, controller.signal));
+    await handler(sessionKey, 1, context(() => false, controller.signal), 'agent-session-old');
 
     expect(adapter.send).not.toHaveBeenCalled();
+  });
+
+  it('persists the exiting process session id before exit finalization work', async () => {
+    const store = sessionIdStore();
+    const order: string[] = [];
+    store.updateAgentSessionId.mockImplementation(async () => {
+      order.push('persist');
+    });
+    const cardController = {
+      interruptCard: vi.fn(() => {
+        order.push('finalize');
+      }),
+    } as unknown as StreamingCardController;
+    const controller = new AbortController();
+    const handler = createRuntimeProcessExitHandler({
+      sessionKey,
+      store,
+      stopTyping: vi.fn(),
+      voiceSessions: new Map(),
+      cardController,
+      voiceResponseBuffer: { value: '' },
+      sendVoiceReply: vi.fn(),
+      getCurrentContext: () => context(() => true, controller.signal),
+    });
+
+    await handler(sessionKey, 0, context(() => true, controller.signal), 'agent-session-s2');
+
+    expect(store.updateAgentSessionId).toHaveBeenCalledWith('db-session', 'agent-session-s2');
+    expect(order).toEqual(['persist', 'finalize']);
+  });
+
+  it('does not persist when the exiting context has been superseded', async () => {
+    const store = sessionIdStore();
+    const oldController = new AbortController();
+    const replacementController = new AbortController();
+    const handler = createRuntimeProcessExitHandler({
+      sessionKey,
+      store,
+      stopTyping: vi.fn(),
+      voiceSessions: new Map(),
+      voiceResponseBuffer: { value: '' },
+      sendVoiceReply: vi.fn(),
+      getCurrentContext: () => context(() => true, replacementController.signal),
+    });
+
+    await handler(sessionKey, 0, context(() => false, oldController.signal), 'agent-session-s2');
+
+    expect(store.updateAgentSessionId).not.toHaveBeenCalled();
+  });
+
+  it('does not persist when no session id is available on exit', async () => {
+    const store = sessionIdStore();
+    const controller = new AbortController();
+    const handler = createRuntimeProcessExitHandler({
+      sessionKey,
+      store,
+      stopTyping: vi.fn(),
+      voiceSessions: new Map(),
+      voiceResponseBuffer: { value: '' },
+      sendVoiceReply: vi.fn(),
+      getCurrentContext: () => context(() => true, controller.signal),
+    });
+
+    await handler(sessionKey, 0, context(() => true, controller.signal), undefined);
+
+    expect(store.updateAgentSessionId).not.toHaveBeenCalled();
   });
 });
 
@@ -336,6 +404,21 @@ function createHandler(opts: {
   });
 
   return { handler, store };
+}
+
+function sessionIdStore() {
+  return {
+    getByKey: vi.fn(async () => ({
+      id: 'db-session',
+      key: sessionKey,
+      agentName: 'mock-agent',
+      workingDirectory: '/tmp',
+      state: 'active' as const,
+      createdAt: 0,
+      lastActiveAt: 0,
+    })),
+    updateAgentSessionId: vi.fn(async () => undefined),
+  };
 }
 
 function adapterStub(): PlatformAdapter {

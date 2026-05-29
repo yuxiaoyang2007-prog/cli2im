@@ -5,10 +5,15 @@ import { buildCrashNotification } from '../platforms/feishu/markdown.js';
 import type { SendVoiceReplyOptions } from './voice-reply.js';
 import { isAbortError } from '../abort.js';
 import { scrubLog } from '../security/logging.js';
+import type { SessionStore } from '../session/store.js';
 import type { PlatformAdapter, SessionKey } from '../types.js';
+import { persistAgentSessionIdIfCurrent } from './agent-session-id.js';
+
+type SessionIdStore = Pick<SessionStore, 'getByKey' | 'updateAgentSessionId'>;
 
 export interface RuntimeProcessExitHandlerDeps {
   sessionKey: SessionKey;
+  store: SessionIdStore;
   stopTyping: (chatId: string) => void;
   voiceSessions: Map<SessionKey, string>;
   cardController?: StreamingCardController;
@@ -24,6 +29,7 @@ export function createRuntimeProcessExitHandler(
 ): AgentManagerEvents['onProcessExit'] {
   const {
     sessionKey,
+    store,
     stopTyping,
     voiceSessions,
     cardController,
@@ -35,9 +41,9 @@ export function createRuntimeProcessExitHandler(
   } = deps;
   const chatId = sessionKey.split(':')[1];
 
-  return async (sk, code, exitContext) => {
+  return async (sk, code, exitContext, sessionId) => {
     const signal = exitContext.signal;
-    const isCurrent = () => getCurrentContext(sk)?.signal === signal && !signal.aborted;
+    const isCurrent = () => exitContext.isCurrent() && getCurrentContext(sk)?.signal === signal && !signal.aborted;
 
     console.log(`[pipeline] ${scrubLog(sk)}: process exited with code=${code}`);
     stopTyping(chatId);
@@ -45,6 +51,11 @@ export function createRuntimeProcessExitHandler(
     if (!isCurrent()) return;
 
     try {
+      if (sessionId) {
+        await persistAgentSessionIdIfCurrent(store, sk, sessionId, () => exitContext.isCurrent(), { signal });
+      }
+      if (!isCurrent()) return;
+
       cardController?.interruptCard(sk, { signal });
 
       const isVoiceSession = voiceSessions.has(sk);
