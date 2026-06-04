@@ -111,7 +111,12 @@ class CodexInputWriter extends Writable {
       const queued: QueuedInput = {
         message: payload.message,
         resolve: () => callback(),
-        reject: (err) => callback(err),
+        // A failed turn must NOT error this Writable. manager.ts writes to
+        // stdin without an 'error' listener, so callback(err) would emit an
+        // unhandled 'error' event and crash the whole bridge process. The
+        // turn error is already surfaced via the stdout error event + exit
+        // (runThreadLoop throws after reject). So complete the write cleanly.
+        reject: () => callback(),
       };
 
       const waiter = this.waiters.shift();
@@ -249,7 +254,7 @@ export function mapCodexThreadEvent(
 
 export function shouldRetryFreshThread(err: unknown): boolean {
   const message = err instanceof Error ? err.message : String(err);
-  return /resuming session with different model|no such session/i.test(message);
+  return /resuming session with different model|no such session|is archived|unarchive|session not found/i.test(message);
 }
 
 export class CodexPlugin implements AgentPlugin {

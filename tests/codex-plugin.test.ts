@@ -4,7 +4,9 @@ import {
   formatNonImageAttachment,
   mapCodexItemToEvents,
   mapCodexThreadEvent,
+  shouldRetryFreshThread,
 } from '../src/agents/codex.js';
+import type { AgentEvent } from '../src/types.js';
 
 const codexSdkMock = vi.hoisted(() => ({
   startThread: vi.fn(),
@@ -14,13 +16,11 @@ const codexSdkMock = vi.hoisted(() => ({
 vi.mock('@openai/codex-sdk', () => ({
   Codex: class MockCodex {
     startThread(options?: Record<string, unknown>) {
-      codexSdkMock.startThread(options);
-      return { runStreamed: vi.fn() };
+      return codexSdkMock.startThread(options) ?? { runStreamed: vi.fn() };
     }
 
     resumeThread(id: string, options?: Record<string, unknown>) {
-      codexSdkMock.resumeThread(id, options);
-      return { runStreamed: vi.fn() };
+      return codexSdkMock.resumeThread(id, options) ?? { runStreamed: vi.fn() };
     }
   },
 }));
@@ -84,6 +84,89 @@ describe('CodexPlugin', () => {
       approvalPolicy: expected,
     }));
     resumed.kill();
+  });
+
+  it('recovers from an archived session by starting a fresh thread', async () => {
+    const plugin = new CodexPlugin('/usr/local/bin/codex');
+    codexSdkMock.resumeThread.mockReturnValue({
+      runStreamed: () =>
+        Promise.reject(
+          new Error(
+            'thread/resume: thread/resume failed: session abc is archived. Run `codex unarchive abc` to unarchive it first. (code -32600)',
+          ),
+        ),
+    });
+    codexSdkMock.startThread.mockReturnValue({
+      runStreamed: () =>
+        Promise.resolve({
+          events: (async function* () {
+            yield { type: 'thread.started', thread_id: 'fresh_session' };
+            yield { type: 'item.completed', item: { type: 'agent_message', text: 'hello again' } };
+            yield { type: 'turn.completed', usage: {} };
+          })(),
+        }),
+    });
+
+    const proc = plugin.resume('archived_session', {
+      workingDirectory: '/tmp',
+      permissionMode: 'blacklist',
+      autoApprove: true,
+    });
+    const events: AgentEvent[] = [];
+    proc.stdout.on('data', (event: AgentEvent) => events.push(event));
+
+    proc.stdin.write(plugin.formatStdinMessage({ role: 'user', content: 'are you there?' }));
+
+    await vi.waitFor(() => expect(codexSdkMock.startThread).toHaveBeenCalled());
+    await vi.waitFor(() => expect(events.some((e) => e.type === 'result')).toBe(true));
+
+    expect(events.some((e) => e.type === 'text' && e.content === 'hello again')).toBe(true);
+    expect(events.some((e) => e.type === 'result' && e.sessionId === 'fresh_session')).toBe(true);
+    proc.kill();
+  });
+
+  it('does not error the stdin stream when a turn fails unrecoverably', async () => {
+    const plugin = new CodexPlugin('/usr/local/bin/codex');
+    codexSdkMock.startThread.mockReturnValue({
+      runStreamed: () => Promise.reject(new Error('fatal: authentication failed')),
+    });
+
+    const proc = plugin.spawn({
+      workingDirectory: '/tmp',
+      permissionMode: 'blacklist',
+      autoApprove: true,
+    });
+    const events: AgentEvent[] = [];
+    proc.stdout.on('data', (event: AgentEvent) => events.push(event));
+
+    // The write callback must NOT receive an error — that is what would emit an
+    // unhandled 'error' event on the Writable and crash the whole bridge.
+    const writeErr = await new Promise<unknown>((resolve) => {
+      proc.stdin.write(plugin.formatStdinMessage({ role: 'user', content: 'hi' }), (err) => resolve(err));
+    });
+    expect(writeErr).toBeFalsy();
+
+    await vi.waitFor(() => expect(events.some((e) => e.type === 'error')).toBe(true));
+    proc.kill();
+  });
+});
+
+describe('shouldRetryFreshThread', () => {
+  it.each([
+    'thread/resume failed: session abc is archived. Run `codex unarchive abc`',
+    'Error: no such session xyz',
+    'resuming session with different model',
+    'session not found',
+  ])('returns true for recoverable resume error: %s', (message) => {
+    expect(shouldRetryFreshThread(new Error(message))).toBe(true);
+  });
+
+  it.each([
+    'fatal: authentication failed',
+    'network timeout',
+    'rate limit exceeded',
+  ])('returns false for unrecoverable error: %s', (message) => {
+    expect(shouldRetryFreshThread(new Error(message))).toBe(false);
   });
 });
 
