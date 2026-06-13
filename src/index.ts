@@ -9,6 +9,7 @@ import { ToolGate } from './agents/tool-gate.js';
 import { ClaudeCodePlugin } from './agents/claude-code.js';
 import { CodexPlugin } from './agents/codex.js';
 import { GeminiPlugin } from './agents/gemini.js';
+import { AgyPlugin } from './agents/agy.js';
 import { FeishuAdapter } from './platforms/feishu/adapter.js';
 import { TelegramAdapter } from './platforms/telegram/adapter.js';
 import { TelegramStreamController } from './platforms/telegram/stream.js';
@@ -133,6 +134,8 @@ async function main(): Promise<void> {
       agentManager.registerPlugin(new CodexPlugin(agentConfig.binary));
     } else if (name === 'gemini') {
       agentManager.registerPlugin(new GeminiPlugin(agentConfig.binary));
+    } else if (name === 'agy') {
+      agentManager.registerPlugin(new AgyPlugin(agentConfig.binary));
     }
   }
 
