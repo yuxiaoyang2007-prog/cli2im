@@ -12,6 +12,8 @@ export interface ServerDeps {
 export interface HandoffValidationConfig {
   botNames: string[];
   agentNames: string[];
+  botAgents: Record<string, string>;
+  validateWorkDir?: (body: Pick<HandoffRequest, 'botName' | 'agentName' | 'workDir'>) => Promise<boolean>;
 }
 
 const SESSION_ID_PATTERN = /^[A-Za-z0-9_-]{8,128}$/;
@@ -170,10 +172,6 @@ export async function validateHandoffRequestBody(
     return 'Invalid sessionId';
   }
 
-  if (!(await validateWorkingDirectory(body.workDir))) {
-    return 'Invalid workDir';
-  }
-
   if (body.chatId !== undefined) {
     if (typeof body.chatId !== 'string' || CONTROL_OR_COLON_PATTERN.test(body.chatId)) {
       return 'Invalid chatId';
@@ -196,6 +194,21 @@ export async function validateHandoffRequestBody(
 
   if (config && !config.agentNames.includes(body.agentName)) {
     return 'Unknown agentName';
+  }
+
+  if (config && config.botAgents[body.botName] !== body.agentName) {
+    return 'Agent does not match bot configuration';
+  }
+
+  const workDirValid = config?.validateWorkDir
+    ? await config.validateWorkDir({
+        botName: body.botName,
+        agentName: body.agentName,
+        workDir: body.workDir,
+      })
+    : await validateWorkingDirectory(body.workDir);
+  if (!workDirValid) {
+    return 'Invalid workDir';
   }
 
   return undefined;

@@ -17,6 +17,11 @@ import { InputInjector, type InputWriteTarget } from './pty/InputInjector.js';
 import { InteractiveClaudeSession } from './pty/InteractiveClaudeSession.js';
 import { JsonlTailer } from './pty/JsonlTailer.js';
 import { PtyClaudeRunner, type PtySpawnInput, type PtyState } from './pty/PtyClaudeRunner.js';
+import {
+  buildSandboxProfile,
+  defaultDenyReadPaths,
+  writeSandboxProfile,
+} from './pty/SandboxProfile.js';
 import { PtyScreenRenderer } from './pty/screen.js';
 import {
   SettingsInjector,
@@ -298,12 +303,15 @@ export class ClaudePtyVirtualProcess implements AgentProcess {
 
   private async createRuntime(resumeSessionId?: string): Promise<Runtime> {
     const handle = `claude-pty-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const ptyHandleDir = join(getCli2imDataDir(), 'pty', handle);
+    const tmpDir = join(ptyHandleDir, 'tmp');
     const settings = await this.deps.buildSettings({
       handle,
       sessionId: resumeSessionId,
       effortLevel: this.opts.reasoningEffort,
       permissionMode: this.opts.permissionMode,
     });
+    const sandboxProfilePath = await this.buildSandboxProfile(handle, ptyHandleDir);
     const runner = this.deps.createRunner({
       claudeBin: this.binary,
       cwd: this.opts.workingDirectory,
@@ -329,6 +337,8 @@ export class ClaudePtyVirtualProcess implements AgentProcess {
         model: this.opts.model,
         permissionMode: this.opts.permissionMode,
         addDirs: buildAddDirs(this.opts.workingDirectory, this.opts.addDirs),
+        sandboxProfilePath,
+        tmpDir: sandboxProfilePath ? tmpDir : undefined,
       });
       spawned = true;
 
@@ -394,6 +404,24 @@ export class ClaudePtyVirtualProcess implements AgentProcess {
       if (spawned) runner.kill('SIGTERM');
       throw err;
     }
+  }
+
+  private async buildSandboxProfile(handle: string, ptyHandleDir: string): Promise<string | undefined> {
+    if (this.opts.sandbox !== 'workdir') return undefined;
+    if (!existsSync('/usr/bin/sandbox-exec')) {
+      throw new Error('Claude PTY sandbox requested but /usr/bin/sandbox-exec is unavailable');
+    }
+    const tmpDir = join(ptyHandleDir, 'tmp');
+    await mkdir(tmpDir, { recursive: true });
+    const homeDir = homedir();
+    const profile = buildSandboxProfile({
+      boxRoots: this.opts.sandboxBoxRoots ?? [this.opts.workingDirectory],
+      homeDir,
+      ptyHandleDir,
+      denyReadPaths: defaultDenyReadPaths(homeDir),
+      otherProtectedRoots: this.opts.sandboxOtherProtectedRoots ?? [],
+    });
+    return writeSandboxProfile({ handle, ptyHandleDir, profile });
   }
 
   private currentController?: TurnController;
@@ -676,7 +704,7 @@ function withDefaultDeps(deps: ClaudePtyRuntimeDeps): Required<ClaudePtyRuntimeD
   return {
     buildSettings: deps.buildSettings ?? (async (input) => {
       const injector = new SettingsInjector({
-        runtimeDir: join(getCli2imDataDir(), 'pty'),
+        runtimeDir: join(getCli2imDataDir(), 'pty', input.handle),
         permissionsDeny: input.permissionMode === 'blacklist' ? BLACKLIST_DENY_TOOLS : [],
       });
       return injector.build({

@@ -61,11 +61,22 @@ describe('handoff spawnResume store sync', () => {
       permissionMode: 'bypass',
       idleTimeoutMs: 30_000,
     }));
-    const { spawnResume, agentManager } = createDeps(existingSession, getBotConfig);
+    const resolveSpawnOpts = vi.fn(async () => ({
+      workingDirectory: '~/project-pty',
+      permissionMode: 'bypass' as const,
+      turnTimeoutMs: undefined,
+      idleTimeoutMs: 600_000,
+    }));
+    const { spawnResume, agentManager } = createDeps(existingSession, getBotConfig, resolveSpawnOpts);
 
     await spawnResume(sessionKey, 'claude-code-pty', 'agent_session_pty', '~/project-pty');
 
     expect(getBotConfig).toHaveBeenCalledWith('ptybot');
+    expect(resolveSpawnOpts).toHaveBeenCalledWith(expect.objectContaining({
+      workingDirectory: '~/project-pty',
+      turnTimeoutMs: undefined,
+      idleTimeoutMs: 600_000,
+    }));
     expect(agentManager.resumeAgent).toHaveBeenCalledWith(
       sessionKey,
       'claude-code-pty',
@@ -75,6 +86,49 @@ describe('handoff spawnResume store sync', () => {
         permissionMode: 'bypass',
         turnTimeoutMs: undefined,
         idleTimeoutMs: 600_000,
+      },
+      expect.any(Object),
+    );
+  });
+
+  it('can resolve PTY handoff spawn opts through the shared strict resolver', async () => {
+    const sessionKey = 'feishu:chat_1:ptybot' as SessionKey;
+    const existingSession = sessionRow('row_pty', sessionKey);
+    const config = botConfig({
+      agent: 'claude-code-pty',
+      permissionMode: 'bypass',
+      sandbox: 'workdir',
+    });
+    const getBotConfig = vi.fn(() => config);
+    const resolveSpawnOpts = vi.fn(async () => ({
+      workingDirectory: '/real/project-pty',
+      permissionMode: 'bypass' as const,
+      turnTimeoutMs: undefined,
+      idleTimeoutMs: 600_000,
+      sandbox: 'workdir' as const,
+      sandboxBoxRoots: ['/real/project-pty'],
+    }));
+    const { spawnResume, agentManager } = createDeps(existingSession, getBotConfig, resolveSpawnOpts);
+
+    await spawnResume(sessionKey, 'claude-code-pty', 'agent_session_pty', '~/project-pty');
+
+    expect(resolveSpawnOpts).toHaveBeenCalledWith(expect.objectContaining({
+      botConfig: config,
+      workingDirectory: '~/project-pty',
+      turnTimeoutMs: undefined,
+      idleTimeoutMs: 600_000,
+    }));
+    expect(agentManager.resumeAgent).toHaveBeenCalledWith(
+      sessionKey,
+      'claude-code-pty',
+      'agent_session_pty',
+      {
+        workingDirectory: '/real/project-pty',
+        permissionMode: 'bypass',
+        turnTimeoutMs: undefined,
+        idleTimeoutMs: 600_000,
+        sandbox: 'workdir',
+        sandboxBoxRoots: ['/real/project-pty'],
       },
       expect.any(Object),
     );
@@ -101,7 +155,7 @@ describe('handoff spawnResume store sync', () => {
     );
   });
 
-  it('keeps legacy opts when HTTP requests claude-code-pty for a non-PTY bot', async () => {
+  it('fails closed when claude-code-pty handoff does not belong to a PTY bot', async () => {
     const sessionKey = 'feishu:chat_1:codexbot' as SessionKey;
     const existingSession = sessionRow('row_http', sessionKey);
     const getBotConfig = vi.fn(() => botConfig({
@@ -111,15 +165,28 @@ describe('handoff spawnResume store sync', () => {
     }));
     const { spawnResume, agentManager } = createDeps(existingSession, getBotConfig);
 
-    await spawnResume(sessionKey, 'claude-code-pty', 'agent_session_http', '~/project-http');
+    await expect(
+      spawnResume(sessionKey, 'claude-code-pty', 'agent_session_http', '~/project-http'),
+    ).rejects.toThrow('claude-code-pty handoff requires a PTY bot configuration');
 
-    expect(agentManager.resumeAgent).toHaveBeenCalledWith(
-      sessionKey,
-      'claude-code-pty',
-      'agent_session_http',
-      { workingDirectory: '~/project-http', permissionMode: 'blacklist' },
-      expect.any(Object),
-    );
+    expect(agentManager.resumeAgent).not.toHaveBeenCalled();
+  });
+
+  it('fails closed when claude-code-pty handoff has no strict spawn resolver', async () => {
+    const sessionKey = 'feishu:chat_1:ptybot' as SessionKey;
+    const existingSession = sessionRow('row_http', sessionKey);
+    const getBotConfig = vi.fn(() => botConfig({
+      agent: 'claude-code-pty',
+      permissionMode: 'bypass',
+      idleTimeoutMs: 30_000,
+    }));
+    const { spawnResume, agentManager } = createDeps(existingSession, getBotConfig);
+
+    await expect(
+      spawnResume(sessionKey, 'claude-code-pty', 'agent_session_http', '~/project-http'),
+    ).rejects.toThrow('claude-code-pty handoff requires a strict spawn resolver');
+
+    expect(agentManager.resumeAgent).not.toHaveBeenCalled();
   });
 });
 
@@ -179,7 +246,11 @@ describe('startAgentProcessForSession session resume id selection', () => {
   });
 });
 
-function createDeps(session: Session, getBotConfig?: (botName: string) => BotConfig | undefined) {
+function createDeps(
+  session: Session,
+  getBotConfig?: (botName: string) => BotConfig | undefined,
+  resolveSpawnOpts?: Parameters<typeof createHandoffSpawnResume>[4],
+) {
   const agentManager = {
     resumeAgent: vi.fn(async () => ({ pid: 123 }) as AgentProcess),
   };
@@ -198,7 +269,7 @@ function createDeps(session: Session, getBotConfig?: (botName: string) => BotCon
     agentManager,
     store,
     createEventHandlers,
-    spawnResume: createHandoffSpawnResume(agentManager, store, createEventHandlers, getBotConfig),
+    spawnResume: createHandoffSpawnResume(agentManager, store, createEventHandlers, getBotConfig, resolveSpawnOpts),
   };
 }
 

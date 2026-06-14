@@ -166,6 +166,28 @@ describe('claude pty transcript layer', () => {
     ]);
   });
 
+  it('wraps claude with sandbox-exec and injects handle tmp env when a profile is provided', () => {
+    expect(PtyClaudeRunner.buildSpawnCommand({
+      claudeBin: '/usr/local/bin/claude',
+      sandboxProfilePath: '/tmp/handle.sb',
+    })).toEqual({
+      file: '/usr/bin/sandbox-exec',
+      argsPrefix: ['-f', '/tmp/handle.sb', '/usr/local/bin/claude'],
+    });
+
+    expect(PtyClaudeRunner.buildEnv(
+      { PATH: '/bin' },
+      { FOO: 'bar' },
+      '/Users/test/.cli2im/pty/h/tmp',
+    )).toMatchObject({
+      PATH: '/bin',
+      FOO: 'bar',
+      TMPDIR: '/Users/test/.cli2im/pty/h/tmp',
+      TMP: '/Users/test/.cli2im/pty/h/tmp',
+      TEMP: '/Users/test/.cli2im/pty/h/tmp',
+    });
+  });
+
   it('passes kill signals through to the underlying pty', () => {
     const runner = new PtyClaudeRunner({ cwd: process.cwd() });
     const pty = {

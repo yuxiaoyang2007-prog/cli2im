@@ -17,6 +17,8 @@ export interface PtySpawnInput {
   model?: string;
   permissionMode?: "bypass" | "blacklist";
   addDirs?: string[];
+  sandboxProfilePath?: string;
+  tmpDir?: string;
 }
 
 // Claude Code injects these into any child process it spawns. If the bridge is
@@ -71,6 +73,30 @@ export class PtyClaudeRunner {
     ];
   }
 
+  static buildSpawnCommand(input: { claudeBin?: string; sandboxProfilePath?: string }): {
+    file: string;
+    argsPrefix: string[];
+  } {
+    const claudeBin = input.claudeBin ?? "claude";
+    if (!input.sandboxProfilePath) return { file: claudeBin, argsPrefix: [] };
+    return {
+      file: "/usr/bin/sandbox-exec",
+      argsPrefix: ["-f", input.sandboxProfilePath, claudeBin],
+    };
+  }
+
+  static buildEnv(
+    base: NodeJS.ProcessEnv,
+    extra?: Record<string, string>,
+    tmpDir?: string,
+  ): NodeJS.ProcessEnv {
+    return sanitizeChildEnv({
+      ...base,
+      ...extra,
+      ...(tmpDir ? { TMPDIR: tmpDir, TMP: tmpDir, TEMP: tmpDir } : {}),
+    });
+  }
+
   get pid(): number | undefined {
     return this.pty?.pid;
   }
@@ -82,13 +108,17 @@ export class PtyClaudeRunner {
   async spawn(input: PtySpawnInput): Promise<void> {
     const ptyModule = await import("node-pty");
     const args = PtyClaudeRunner.buildArgs(input);
+    const command = PtyClaudeRunner.buildSpawnCommand({
+      claudeBin: this.options.claudeBin,
+      sandboxProfilePath: input.sandboxProfilePath,
+    });
     this.setState("starting");
-    this.pty = ptyModule.spawn(this.options.claudeBin ?? "claude", args, {
+    this.pty = ptyModule.spawn(command.file, [...command.argsPrefix, ...args], {
       name: "xterm-256color",
       cols: this.options.cols ?? 120,
       rows: this.options.rows ?? 40,
       cwd: this.options.cwd,
-      env: sanitizeChildEnv({ ...process.env, ...this.options.env }),
+      env: PtyClaudeRunner.buildEnv(process.env, this.options.env, input.tmpDir),
     }) as PtyLike;
 
     this.pty.onData((chunk) => {

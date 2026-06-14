@@ -65,6 +65,7 @@ describe('session-scoped cleanup across spawn/resume entrypoints', () => {
     }, {
       botNames: ['ccbot'],
       agentNames: ['mock-agent'],
+      botAgents: { ccbot: 'mock-agent' },
     });
 
     await server.start('127.0.0.1', 0);

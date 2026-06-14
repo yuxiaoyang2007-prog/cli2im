@@ -22,6 +22,7 @@ describe('HttpServer handoff validation', () => {
     const server = new HttpServer('secret-token', deps({ acceptHandoff }), {
       botNames: ['ccbot'],
       agentNames: ['claude-code'],
+      botAgents: { ccbot: 'claude-code' },
     });
 
     await server.start('127.0.0.1', 0);
@@ -46,6 +47,7 @@ describe('HttpServer handoff validation', () => {
     const server = new HttpServer('secret-token', deps({ acceptHandoff }), {
       botNames: ['ccbot'],
       agentNames: ['claude-code'],
+      botAgents: { ccbot: 'claude-code' },
     });
 
     await server.start('127.0.0.1', 0);
@@ -70,6 +72,7 @@ describe('HttpServer handoff validation', () => {
     const server = new HttpServer('secret-token', deps({ acceptHandoff }), {
       botNames: ['ccbot'],
       agentNames: ['claude-code'],
+      botAgents: { ccbot: 'claude-code' },
     });
 
     await server.start('127.0.0.1', 0);
@@ -94,6 +97,7 @@ describe('HttpServer handoff validation', () => {
     const server = new HttpServer('secret-token', deps({ acceptHandoff }), {
       botNames: ['ccbot'],
       agentNames: ['claude-code'],
+      botAgents: { ccbot: 'claude-code' },
     });
 
     await server.start('127.0.0.1', 0);
@@ -118,6 +122,7 @@ describe('HttpServer handoff validation', () => {
     const server = new HttpServer('secret-token', deps({ acceptHandoff }), {
       botNames: ['ccbot'],
       agentNames: ['claude-code'],
+      botAgents: { ccbot: 'claude-code' },
     });
 
     await server.start('127.0.0.1', 0);
@@ -150,11 +155,37 @@ describe('HttpServer handoff validation', () => {
     }
   });
 
+  it('rejects handoff agentName that does not match the bot configuration before spawning', async () => {
+    const acceptHandoff = vi.fn().mockResolvedValue({ success: true });
+    const server = new HttpServer('secret-token', deps({ acceptHandoff }), {
+      botNames: ['ccbot'],
+      agentNames: ['claude-code', 'claude-code-pty'],
+      botAgents: { ccbot: 'claude-code' },
+    });
+
+    await server.start('127.0.0.1', 0);
+    try {
+      const res = await postHandoff(server, {
+        botName: 'ccbot',
+        sessionId: 'session_123',
+        workDir: '/Users/test/project',
+        agentName: 'claude-code-pty',
+      });
+
+      expect(res.status).toBe(400);
+      expect(await res.json()).toEqual({ error: 'Agent does not match bot configuration' });
+      expect(acceptHandoff).not.toHaveBeenCalled();
+    } finally {
+      await server.stop();
+    }
+  });
+
   it('rejects JSON null handoff bodies with 400 before spawning', async () => {
     const acceptHandoff = vi.fn().mockResolvedValue({ success: true });
     const server = new HttpServer('secret-token', deps({ acceptHandoff }), {
       botNames: ['ccbot'],
       agentNames: ['claude-code'],
+      botAgents: { ccbot: 'claude-code' },
     });
 
     await server.start('127.0.0.1', 0);

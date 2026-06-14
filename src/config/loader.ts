@@ -1,5 +1,8 @@
-import { readFileSync } from 'node:fs';
+import { readFileSync, realpathSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { relative } from 'node:path';
 import { parse as parseYaml } from 'yaml';
+import { protectedSandboxSubtrees } from '../agents/pty/SandboxProfile.js';
 import type { AppConfig } from '../types.js';
 
 export function substituteEnvVars(
@@ -54,6 +57,11 @@ function validateConfig(config: AppConfig): void {
     if (bot.userOverrides != null && typeof bot.userOverrides !== 'object') {
       throw new Error(`Config error: bot "${name}" userOverrides must be an object`);
     }
+    if (bot.sandbox == null) {
+      bot.sandbox = 'workdir';
+    } else if (bot.sandbox !== 'workdir' && bot.sandbox !== 'off') {
+      throw new Error(`Config error: bot "${name}" sandbox must be "workdir" or "off"`);
+    }
     if (bot.relay != null) {
       if (typeof bot.relay !== 'object' || Array.isArray(bot.relay)) {
         throw new Error(`Config error: bot "${name}" relay must be an object`);
@@ -101,6 +109,20 @@ function validateConfig(config: AppConfig): void {
   if (!config.agents || typeof config.agents !== 'object') {
     throw new Error('Config error: "agents" section is required');
   }
+  if (config.sandboxExtraRoots != null) {
+    if (!Array.isArray(config.sandboxExtraRoots)) {
+      throw new Error('Config error: "sandboxExtraRoots" must be an array');
+    }
+    const roots = config.sandboxExtraRoots.map((root, index) => {
+      if (typeof root !== 'string') {
+        throw new Error(`Config error: sandboxExtraRoots[${index}] must be a string`);
+      }
+      const resolved = realpathSync(expandHome(root));
+      assertSafeExtraRoot(resolved);
+      return resolved;
+    });
+    config.sandboxExtraRoots = [...new Set(roots)];
+  }
   if (!config.server?.port || !config.server?.token) {
     throw new Error('Config error: "server.port" and "server.token" are required');
   }
@@ -121,4 +143,38 @@ function validateConfig(config: AppConfig): void {
       throw new Error('Config error: "contentGuard.blockThreshold" must be a positive number');
     }
   }
+}
+
+function expandHome(path: string): string {
+  if (path === '~') return homedir();
+  if (path.startsWith('~/')) return `${homedir()}/${path.slice(2)}`;
+  return path;
+}
+
+function assertSafeExtraRoot(path: string): void {
+  const home = realpathSync(expandHome('~'));
+  const denied = new Set([
+    '/',
+    '/Users',
+    home,
+    '/private',
+    '/private/tmp',
+    '/System',
+    '/Library',
+    '/Applications',
+    '/Volumes',
+  ]);
+  if (denied.has(path)) {
+    throw new Error(`Config error: sandboxExtraRoots must not include ${path}`);
+  }
+  if (isPathWithinAnyRoot(path, protectedSandboxSubtrees(home))) {
+    throw new Error(`Config error: sandboxExtraRoots must not include ${path}`);
+  }
+}
+
+function isPathWithinAnyRoot(path: string, roots: string[]): boolean {
+  return roots.some((root) => {
+    const rel = relative(root, path);
+    return rel === '' || (!!rel && !rel.startsWith('..') && !rel.startsWith('/'));
+  });
 }

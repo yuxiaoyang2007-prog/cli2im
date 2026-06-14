@@ -30,7 +30,7 @@ import {
   buildCLISessionCard,
 } from './platforms/feishu/markdown.js';
 import { buildCLISessionText } from './platforms/telegram/markdown.js';
-import { sanitizeVoiceTranscript, validateWorkingDirectory } from './security/validators.js';
+import { sanitizeVoiceTranscript } from './security/validators.js';
 import {
   buildUserMessageForAgent,
   downloadInboundAttachments,
@@ -64,11 +64,12 @@ import {
   clearSessionScopedBuffers,
 } from './runtime/session-scoped-cleanup.js';
 import { getCli2imDataDir } from './util/data-dir.js';
+import { protectedSandboxSubtrees } from './agents/pty/SandboxProfile.js';
 import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { join, relative } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { mkdirSync } from 'node:fs';
-import { readFile } from 'node:fs/promises';
+import { readFile, realpath, stat } from 'node:fs/promises';
 
 const CONFIG_PATH = process.env.CLI2IM_CONFIG ?? join(homedir(), '.cli2im', 'config.yaml');
 const startedAt = Date.now();
@@ -170,12 +171,36 @@ async function main(): Promise<void> {
 
   const pipeline = new InboundPipeline(config);
 
+  async function collectOtherProtectedRoots(currentBotName: string): Promise<string[]> {
+    const configuredRoots = Object.entries(config.bots)
+      .filter(([name]) => name !== currentBotName)
+      .map(([, bot]) => bot.workingDirectory);
+    const sessionRoots = (await Promise.all(
+      Object.keys(config.bots)
+        .filter((name) => name !== currentBotName)
+        .map((name) => store.listByBot(name)),
+    )).flat().map((session) => session.workingDirectory);
+    return [...configuredRoots, ...sessionRoots];
+  }
+
+  function findBotNameForConfig(target: BotConfig): string | undefined {
+    return Object.entries(config.bots).find(([, bot]) => bot === target)?.[0];
+  }
+
   const handoffService = new HandoffService({
     spawnResume: createHandoffSpawnResume(
       agentManager,
       store,
       createEventHandlers,
       (botName) => config.bots[botName],
+      async (params) => {
+        const resolvedBotName = findBotNameForConfig(params.botConfig);
+        return resolveBotSpawnOpts({
+          ...params,
+          sandboxExtraRoots: config.sandboxExtraRoots,
+          otherProtectedRoots: resolvedBotName ? await collectOtherProtectedRoots(resolvedBotName) : [],
+        });
+      },
     ),
     getSession: async (sessionKey) => store.getByKey(sessionKey),
     updateState: async (id, state) => store.updateState(id, state),
@@ -408,9 +433,9 @@ async function main(): Promise<void> {
         const spawnEnv = { ...config.agents[botConfig.agent]?.env, ...senderEnv, ...larkCliEnv };
 
         const isPtyAgent = botConfig.agent === 'claude-code-pty';
-        const spawnOpts: SpawnOpts = {
+        const spawnOpts = await resolveBotSpawnOpts({
+          botConfig,
           workingDirectory: session.workingDirectory,
-          permissionMode: botConfig.permissionMode,
           env: spawnEnv,
           model: config.agents[botConfig.agent]?.defaultModel,
           autoApprove: botConfig.autoApprove,
@@ -423,7 +448,9 @@ async function main(): Promise<void> {
             ? 'low'
             : config.agents[botConfig.agent]?.defaultEffort,
           initialPrompt: messageText,
-        };
+          sandboxExtraRoots: config.sandboxExtraRoots,
+          otherProtectedRoots: await collectOtherProtectedRoots(botName),
+        });
 
         const plugin = agentManager.getPlugin(botConfig.agent);
         const latestId = agentManager.getLatestSessionId(sessionKey) ?? session.agentSessionId;
@@ -475,6 +502,21 @@ async function main(): Promise<void> {
   }, {
     botNames: Object.keys(config.bots),
     agentNames: Object.keys(config.agents),
+    botAgents: Object.fromEntries(Object.entries(config.bots).map(([name, bot]) => [name, bot.agent])),
+    validateWorkDir: async (body) => {
+      const botConfig = config.bots[body.botName];
+      if (!botConfig) return false;
+      try {
+        await resolveBotSpawnOpts({
+          botConfig,
+          workingDirectory: body.workDir,
+          sandboxExtraRoots: config.sandboxExtraRoots,
+        });
+        return true;
+      } catch {
+        return false;
+      }
+    },
   });
 
   await httpServer.start(config.server.host, config.server.port);
@@ -595,14 +637,17 @@ export async function handleBridgeCommand(
         await adapter.send(chatId, { text: '用法: /cwd <path>' });
         break;
       }
-      if (!(await validateWorkingDirectory(newDir))) {
+      let resolvedNewDir: string;
+      try {
+        resolvedNewDir = await resolveStrictDirectory(newDir);
+      } catch {
         await adapter.send(chatId, { text: `无效路径: \`${newDir}\`` });
         break;
       }
       clearSessionScopedBuffers(sessionKey, { voiceSessions, tgStreamController });
       const session = await store.getByKey(sessionKey);
       if (session) {
-        await store.updateWorkingDirectory(session.id, newDir.replace('~', homedir()));
+        await store.updateWorkingDirectory(session.id, resolvedNewDir);
         agentManager.killAgent(sessionKey);
         await adapter.send(chatId, { text: `工作目录已切换到 \`${newDir}\`，下次消息生效` });
       } else {
@@ -620,13 +665,17 @@ export async function handleBridgeCommand(
       const result = await handoffService.acceptHandoff({
         botName,
         sessionId,
-        workDir: '~',
-        agentName: 'claude-code',
+        workDir: botConfig.workingDirectory,
+        agentName: botConfig.agent,
         chatId,
       });
       if (result.success) {
         await adapter.send(chatId, {
-          text: buildHandoffNotification({ sessionId, workDir: '~', agentName: 'Claude Code' }),
+          text: buildHandoffNotification({
+            sessionId,
+            workDir: botConfig.workingDirectory,
+            agentName: botConfig.agent,
+          }),
         });
       } else {
         await adapter.send(chatId, { text: `Resume failed: ${result.error}` });
@@ -867,6 +916,113 @@ export async function sendAgentMessageOrNotify(params: {
   return false;
 }
 
+export interface ResolveBotSpawnOptsInput {
+  botConfig: BotConfig;
+  workingDirectory: string;
+  env?: Record<string, string>;
+  model?: string;
+  autoApprove?: boolean;
+  turnTimeoutMs?: number;
+  idleTimeoutMs?: number;
+  sandboxMode?: string;
+  reasoningEffort?: SpawnOpts['reasoningEffort'];
+  initialPrompt?: string;
+  addDirs?: string[];
+  sandboxExtraRoots?: string[];
+  otherProtectedRoots?: string[];
+}
+
+export type BotSpawnOptsResolver = (params: ResolveBotSpawnOptsInput) => Promise<SpawnOpts>;
+
+export async function resolveBotSpawnOpts(params: ResolveBotSpawnOptsInput): Promise<SpawnOpts> {
+  const workingDirectory = await resolveStrictDirectory(params.workingDirectory);
+  const sandbox = params.botConfig.sandbox ?? 'workdir';
+  const addDirs = params.addDirs?.length
+    ? await Promise.all(params.addDirs.map((dir) => resolveStrictDirectory(dir)))
+    : undefined;
+
+  let sandboxBoxRoots: string[] | undefined;
+  if (sandbox === 'workdir') {
+    sandboxBoxRoots = uniquePaths([
+      workingDirectory,
+      ...await Promise.all((params.sandboxExtraRoots ?? []).map((dir) => resolveStrictDirectory(dir))),
+    ]);
+    const homeDir = await realpath(homedir());
+    for (const root of sandboxBoxRoots) {
+      assertSafeBoxRoot(root, homeDir);
+    }
+    for (const addDir of addDirs ?? []) {
+      if (!isPathWithinAnyRoot(addDir, sandboxBoxRoots)) {
+        throw new Error(`Sandbox add-dir outside box roots: ${addDir}`);
+      }
+    }
+  }
+  const sandboxOtherProtectedRoots = sandbox === 'workdir'
+    ? await resolveExistingDirectories(params.otherProtectedRoots ?? [])
+    : undefined;
+
+  return {
+    workingDirectory,
+    permissionMode: params.botConfig.permissionMode,
+    env: params.env,
+    model: params.model,
+    autoApprove: params.autoApprove,
+    turnTimeoutMs: params.turnTimeoutMs,
+    idleTimeoutMs: params.idleTimeoutMs,
+    sandboxMode: params.sandboxMode,
+    reasoningEffort: params.reasoningEffort,
+    initialPrompt: params.initialPrompt,
+    addDirs,
+    sandbox,
+    ...(sandboxBoxRoots ? { sandboxBoxRoots } : {}),
+    ...(sandboxOtherProtectedRoots?.length ? { sandboxOtherProtectedRoots } : {}),
+  };
+}
+
+async function resolveStrictDirectory(path: string): Promise<string> {
+  const resolved = await realpath(expandHome(path));
+  const info = await stat(resolved);
+  if (!info.isDirectory()) {
+    throw new Error(`Invalid working directory: ${path}`);
+  }
+  return resolved;
+}
+
+function uniquePaths(paths: string[]): string[] {
+  return [...new Set(paths)];
+}
+
+function assertSafeBoxRoot(root: string, homeDir: string): void {
+  if (isPathWithinAnyRoot(homeDir, [root])) {
+    throw new Error(`Unsafe sandbox box root: ${root}`);
+  }
+  if (!root.startsWith('/Users/') && !root.startsWith('/home/')) {
+    throw new Error(`Unsafe sandbox box root: ${root}`);
+  }
+  if (isPathWithinAnyRoot(root, protectedSandboxSubtrees(homeDir))) {
+    throw new Error(`Unsafe sandbox box root: ${root}`);
+  }
+}
+
+async function resolveExistingDirectories(paths: string[]): Promise<string[]> {
+  const resolved: string[] = [];
+  for (const path of paths) {
+    try {
+      resolved.push(await resolveStrictDirectory(path));
+    } catch {
+      // Missing inactive bot roots should not prevent the current bot from starting.
+    }
+  }
+  return uniquePaths(resolved);
+}
+
+function isPathWithinAnyRoot(path: string, roots: string[]): boolean {
+  return roots.some((root) => {
+    const rel = relative(root, path);
+    return rel === '' || (!!rel && !rel.startsWith('..') && !rel.startsWith('/'));
+  });
+}
+
 export function createHandoffSpawnResume(
   agentManager: Pick<AgentManager, 'resumeAgent'>,
   store: Pick<
@@ -875,6 +1031,7 @@ export function createHandoffSpawnResume(
   >,
   createEventHandlers: (sessionKey: SessionKey) => AgentManagerEvents,
   getBotConfig?: (botName: string) => BotConfig | undefined,
+  resolveSpawnOpts?: BotSpawnOptsResolver,
 ): (
   sessionKey: SessionKey,
   agentName: string,
@@ -885,17 +1042,26 @@ export function createHandoffSpawnResume(
     const handlers = createEventHandlers(sessionKey);
     const botName = getSessionBotName(sessionKey);
     const botConfig = botName ? getBotConfig?.(botName) : undefined;
-    const spawnOpts: SpawnOpts = agentName === 'claude-code-pty' && botConfig?.agent === 'claude-code-pty'
-      ? {
-          workingDirectory: workDir,
-          permissionMode: botConfig.permissionMode,
-          turnTimeoutMs: undefined,
-          idleTimeoutMs: Math.max(botConfig.idleTimeoutMs ?? 600_000, 600_000),
-        }
-      : {
-          workingDirectory: workDir,
-          permissionMode: 'blacklist',
-        };
+    let spawnOpts: SpawnOpts;
+    if (agentName === 'claude-code-pty') {
+      if (botConfig?.agent !== 'claude-code-pty') {
+        throw new Error('claude-code-pty handoff requires a PTY bot configuration');
+      }
+      if (!resolveSpawnOpts) {
+        throw new Error('claude-code-pty handoff requires a strict spawn resolver');
+      }
+      spawnOpts = await resolveSpawnOpts({
+        botConfig,
+        workingDirectory: workDir,
+        turnTimeoutMs: undefined,
+        idleTimeoutMs: Math.max(botConfig.idleTimeoutMs ?? 600_000, 600_000),
+      });
+    } else {
+      spawnOpts = {
+        workingDirectory: workDir,
+        permissionMode: 'blacklist',
+      };
+    }
     const proc = await agentManager.resumeAgent(
       sessionKey,
       agentName,

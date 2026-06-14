@@ -1,8 +1,8 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { loadConfig, substituteEnvVars } from '../src/config/loader.js';
-import { writeFileSync, mkdirSync, rmSync } from 'node:fs';
+import { writeFileSync, mkdirSync, rmSync, realpathSync } from 'node:fs';
 import { join } from 'node:path';
-import { tmpdir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 
 describe('substituteEnvVars', () => {
   it('replaces ${VAR} with env value', () => {
@@ -135,7 +135,114 @@ contentGuard:
     expect(config.bots.tgbot.groupPolicy).toBe('allowlist');
     expect(config.bots.tgbot.groupAllowFrom).toEqual(['oc_group']);
     expect(config.bots.tgbot.userOverrides?.ou_user.workingDirectory).toBe('~/projects/user');
+    expect(config.bots.tgbot.sandbox).toBe('workdir');
     expect(config.contentGuard).toEqual({ enabled: true, blockThreshold: 15 });
+  });
+
+  it('defaults bot sandbox to workdir and realpaths global sandbox extra roots', () => {
+    const extraRoot = join(tmpDir, 'extra-root');
+    mkdirSync(extraRoot);
+    const yaml = `
+bots:
+  ccbot:
+    agent: claude-code-pty
+    platform: feishu
+    feishu:
+      appId: cli_abc
+      appSecret: secret123
+    workingDirectory: ${tmpDir}
+    allowFrom: []
+    permissionMode: bypass
+sandboxExtraRoots:
+  - ${extraRoot}
+agents:
+  claude-code-pty:
+    binary: /usr/local/bin/claude
+session:
+  maxActive: 64
+  idleResetMinutes: 120
+  dbPath: ~/.cli2im/cli2im.db
+dangerousPatterns: []
+streaming:
+  intervalMs: 200
+  minDeltaChars: 30
+  highWaterMark: 1048576
+server:
+  port: 3900
+  host: 127.0.0.1
+  token: tok_xyz
+newMessageBehavior: queue
+`;
+    const configPath = join(tmpDir, 'sandbox-default.yaml');
+    writeFileSync(configPath, yaml);
+
+    const config = loadConfig(configPath);
+
+    expect(config.bots.ccbot.sandbox).toBe('workdir');
+    expect(config.sandboxExtraRoots).toEqual([realpathSync(extraRoot)]);
+  });
+
+  it('rejects invalid sandbox values and dangerous extra roots', () => {
+    const invalidSandbox = `
+bots:
+  ccbot:
+    agent: claude-code-pty
+    platform: feishu
+    feishu:
+      appId: cli_abc
+      appSecret: secret123
+    workingDirectory: ~/projects
+    allowFrom: []
+    permissionMode: bypass
+    sandbox: loose
+agents:
+  claude-code-pty:
+    binary: /usr/local/bin/claude
+session:
+  maxActive: 64
+  idleResetMinutes: 120
+  dbPath: ~/.cli2im/cli2im.db
+dangerousPatterns: []
+streaming:
+  intervalMs: 200
+  minDeltaChars: 30
+  highWaterMark: 1048576
+server:
+  port: 3900
+  host: 127.0.0.1
+  token: tok_xyz
+newMessageBehavior: queue
+`;
+    const invalidSandboxPath = join(tmpDir, 'invalid-sandbox.yaml');
+    writeFileSync(invalidSandboxPath, invalidSandbox);
+    expect(() => loadConfig(invalidSandboxPath)).toThrow(
+      'Config error: bot "ccbot" sandbox must be "workdir" or "off"',
+    );
+
+    const rootExtra = invalidSandbox.replace('    sandbox: loose\n', 'sandboxExtraRoots:\n  - /\n');
+    const rootExtraPath = join(tmpDir, 'root-extra.yaml');
+    writeFileSync(rootExtraPath, rootExtra);
+    expect(() => loadConfig(rootExtraPath)).toThrow(
+      'Config error: sandboxExtraRoots must not include /',
+    );
+
+    for (const root of ['/private', '/System', '/Library', '/Applications', '/Volumes']) {
+      const configPath = join(tmpDir, `dangerous-extra-${root.slice(1).toLowerCase()}.yaml`);
+      writeFileSync(
+        configPath,
+        invalidSandbox.replace('    sandbox: loose\n', `sandboxExtraRoots:\n  - ${root}\n`),
+      );
+      expect(() => loadConfig(configPath)).toThrow(
+        `Config error: sandboxExtraRoots must not include ${root}`,
+      );
+    }
+
+    const claudeExtra = invalidSandbox.replace('    sandbox: loose\n', 'sandboxExtraRoots:\n  - ~/.claude\n');
+    const claudeExtraPath = join(tmpDir, 'claude-extra.yaml');
+    writeFileSync(claudeExtraPath, claudeExtra);
+    expect(() => loadConfig(claudeExtraPath)).toThrow(
+      `Config error: sandboxExtraRoots must not include ${join(homedir(), '.claude')}`,
+    );
   });
 
   it('validates new phase 2 config fields', () => {

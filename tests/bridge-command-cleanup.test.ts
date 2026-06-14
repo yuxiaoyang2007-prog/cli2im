@@ -1,4 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { mkdtemp, realpath } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { handleBridgeCommand } from '../src/index.js';
 import { TelegramStreamController } from '../src/platforms/telegram/stream.js';
 import { parseBridgeCommand } from '../src/pipeline.js';
@@ -58,11 +61,14 @@ describe('handleBridgeCommand lifecycle cleanup', () => {
   it('clears Telegram stream buffer on /cwd', async () => {
     const deps = commandDeps({ existingSession: true });
     deps.tgStreamController.appendText(sessionKey, 'chat_1', 'stale buffered text');
+    const cwd = await mkdtemp(join(tmpdir(), 'cli2im-cwd-command-'));
+    const cwdReal = await realpath(cwd);
 
-    await runCommand('cwd', ['/Users/test/project'], deps);
+    await runCommand('cwd', [cwd], deps);
     await deps.tgStreamController.finalize(sessionKey);
 
     expect(deps.adapter.send).toHaveBeenCalledTimes(1);
+    expect(deps.store.updateWorkingDirectory).toHaveBeenCalledWith('session_row_1', cwdReal);
     expect(deps.voiceSessions.has(sessionKey)).toBe(false);
     expect(deps.adapter.send).not.toHaveBeenCalledWith('chat_1', {
       text: 'stale buffered text',
@@ -80,6 +86,31 @@ describe('handleBridgeCommand lifecycle cleanup', () => {
     expect(deps.voiceSessions.has(sessionKey)).toBe(false);
     expect(deps.adapter.send).not.toHaveBeenCalledWith('chat_1', {
       text: 'stale buffered text',
+    });
+  });
+
+  it('resumes with the bot configured agent and working directory', async () => {
+    const deps = commandDeps({
+      botConfig: {
+        agent: 'claude-code-pty',
+        workingDirectory: '/Users/test/project',
+      },
+    });
+
+    await runCommand('resume', ['session_123'], deps);
+
+    expect(deps.handoffService.acceptHandoff).toHaveBeenCalledWith({
+      botName: 'ccbot',
+      sessionId: 'session_123',
+      workDir: '/Users/test/project',
+      agentName: 'claude-code-pty',
+      chatId: 'chat_1',
+    });
+    expect(deps.adapter.send).toHaveBeenCalledWith('chat_1', {
+      text: expect.stringContaining('- 项目: `/Users/test/project`'),
+    });
+    expect(deps.adapter.send).toHaveBeenCalledWith('chat_1', {
+      text: expect.stringContaining('- Agent: claude-code-pty'),
     });
   });
 
@@ -105,7 +136,7 @@ describe('handleBridgeCommand lifecycle cleanup', () => {
   });
 });
 
-function commandDeps(opts: { existingSession?: boolean } = {}) {
+function commandDeps(opts: { existingSession?: boolean; botConfig?: Partial<BotConfig> } = {}) {
   const adapter = adapterStub();
   const tgStreamController = new TelegramStreamController(adapter);
   return {
@@ -137,6 +168,7 @@ function commandDeps(opts: { existingSession?: boolean } = {}) {
       approvePermission: vi.fn(),
     },
     handoffService: {
+      acceptHandoff: vi.fn(async () => ({ success: true })),
       releaseHandoff: vi.fn(async () => ({
         sessionId: 'agent-session-1',
         resumeCommand: 'codex resume agent-session-1',
@@ -152,6 +184,7 @@ function commandDeps(opts: { existingSession?: boolean } = {}) {
       workingDirectory: '/Users/test/project',
       allowFrom: ['user_1'],
       permissionMode: 'blacklist',
+      ...opts.botConfig,
     } satisfies BotConfig,
   };
 }

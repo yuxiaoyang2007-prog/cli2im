@@ -24,6 +24,9 @@ export interface SpawnOpts {
   idleTimeoutMs?: number;
   initialPrompt?: string;
   addDirs?: string[];
+  sandbox?: 'workdir' | 'off';
+  sandboxBoxRoots?: string[];
+  sandboxOtherProtectedRoots?: string[];
 }
 
 export interface AgentProcess {
@@ -252,6 +255,7 @@ export interface BotConfig {
   groupPolicy?: 'all' | 'allowlist';
   groupAllowFrom?: string[];
   userOverrides?: Record<string, { workingDirectory?: string }>;
+  sandbox?: 'workdir' | 'off';
   sandboxMode?: string;
   relay?: {
     enabled: boolean;
@@ -286,6 +290,7 @@ export interface AppConfig {
     token: string;
   };
   newMessageBehavior: 'queue' | 'interrupt';
+  sandboxExtraRoots?: string[];
   contentGuard?: {
     enabled: boolean;
     blockThreshold?: number;
