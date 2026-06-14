@@ -112,6 +112,18 @@ describe('resolveBotSpawnOpts', () => {
     })).rejects.toThrow(`Unsafe sandbox box root: ${rootReal}`);
   });
 
+  it('does NOT sandbox non-pty agents (codex) even with a home workdir or explicit sandbox', async () => {
+    // Regression: sandbox must only apply to claude-code-pty. codexbot's workdir is home
+    // (/Users/<user>); if the box-root check ran for it, resolveBotSpawnOpts would throw
+    // "Unsafe sandbox box root" and break the bot.
+    const opts = await resolveBotSpawnOpts({
+      botConfig: botConfig({ agent: 'codex', sandbox: 'workdir' }),
+      workingDirectory: homedir(),
+    });
+    expect(opts.sandbox).toBe('off');
+    expect(opts.sandboxBoxRoots).toBeUndefined();
+  });
+
   it('accepts a normal project directory under home as a box root', async () => {
     const projectReal = await realpath(process.cwd());
 

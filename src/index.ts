@@ -936,7 +936,13 @@ export type BotSpawnOptsResolver = (params: ResolveBotSpawnOptsInput) => Promise
 
 export async function resolveBotSpawnOpts(params: ResolveBotSpawnOptsInput): Promise<SpawnOpts> {
   const workingDirectory = await resolveStrictDirectory(params.workingDirectory);
-  const sandbox = params.botConfig.sandbox ?? 'workdir';
+  // Sandbox only applies to the claude-code-pty agent (it confines THAT claude child).
+  // Other agents (codex/agy) must never get a box root computed: their workdir may be
+  // home (e.g. codexbot at /Users/<user>), which assertSafeBoxRoot rejects — that would
+  // break those bots even though they were never meant to be sandboxed.
+  const sandbox = params.botConfig.agent === 'claude-code-pty'
+    ? (params.botConfig.sandbox ?? 'workdir')
+    : 'off';
   const addDirs = params.addDirs?.length
     ? await Promise.all(params.addDirs.map((dir) => resolveStrictDirectory(dir)))
     : undefined;

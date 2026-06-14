@@ -81,6 +81,13 @@ export function buildSandboxProfile(input: SandboxProfileInput): string {
         ]
       : []),
     block('deny file-write*', claudeExecutableConfigWriteDenyRules),
+    // Re-allow WRITE to the pty handle dir LAST (last-match-wins). In production the data
+    // dir is ~/.cli2im, which the late deny-write above covers (~/.cli2im is in
+    // denyReadPaths), but that tree also contains the pty handle dir the runner MUST write
+    // (settings, stop marker, tmp). Without this re-allow the handle dir is unwritable ->
+    // PTY init times out -> agent exits code 1. Only the handle subpath is reopened;
+    // ~/.cli2im secrets (config.yaml, cli2im.db, ...) stay denied.
+    block('allow file-write*', [subpathRule(input.ptyHandleDir)]),
     '(deny file-link)',
     '(deny file-clone)',
     '',

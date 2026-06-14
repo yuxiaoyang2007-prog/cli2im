@@ -79,6 +79,12 @@ describe('SandboxProfile', () => {
     ]) {
       expect(lateWriteDeny).toContain(rule);
     }
+    // fix #1: the pty handle dir (here under the denied ~/.cli2im) must be re-allowed for
+    // WRITE after the late deny-write (last-match-wins), else prod (whose data dir IS
+    // ~/.cli2im) cannot write its handle/TMPDIR -> PTY init timeout -> agent exit 1.
+    const lastAllowWriteIndex = profile.lastIndexOf('(allow file-write*');
+    expect(lastAllowWriteIndex).toBeGreaterThan(lateWriteDenyIndex);
+    expect(profile.slice(lastAllowWriteIndex)).toContain('(subpath "/Users/joulian/.cli2im/pty/handle-1")');
     expect(profile.lastIndexOf('(deny file-link)')).toBeGreaterThan(profile.lastIndexOf('(allow file-write*'));
     expect(profile.lastIndexOf('(deny file-clone)')).toBeGreaterThan(profile.lastIndexOf('(allow file-write*'));
   });
