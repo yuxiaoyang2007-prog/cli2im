@@ -1,4 +1,4 @@
-import { mkdtemp, writeFile, appendFile } from 'node:fs/promises';
+import { mkdtemp, readFile, writeFile, appendFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
@@ -6,6 +6,7 @@ import { EventMapper } from '../src/agents/pty/EventMapper.js';
 import { JsonlTailer } from '../src/agents/pty/JsonlTailer.js';
 import { TurnController } from '../src/agents/pty/TurnController.js';
 import { validateInput } from '../src/agents/pty/InputInjector.js';
+import { SettingsInjector } from '../src/agents/pty/SettingsInjector.js';
 
 describe('claude pty transcript layer', () => {
   it('maps transcript records to cli2im agent events and retains usage/session fallback', () => {
@@ -109,5 +110,15 @@ describe('claude pty transcript layer', () => {
     expect(() => validateInput('bad\x1b[31m')).toThrow(/ESC/);
     expect(() => validateInput('bad\rinput')).toThrow(/bare carriage return/);
     expect(() => validateInput('bad [200~ sentinel')).toThrow(/bracketed-paste/);
+  });
+
+  it('builds settings that point at the repo pty hook resources by default', async () => {
+    const runtimeDir = await mkdtemp(join(tmpdir(), 'cli2im-settings-'));
+    const settings = await new SettingsInjector({ runtimeDir }).build({ handle: 'test' });
+    const raw = await readFile(settings.settingsPath, 'utf8');
+
+    expect(raw).toContain('/resources/pty-statusline.cjs');
+    expect(raw).toContain('/resources/pty-stop-hook.cjs');
+    expect(raw).not.toContain('/src/resources/');
   });
 });

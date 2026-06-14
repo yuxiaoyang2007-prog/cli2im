@@ -13,7 +13,7 @@ async function main() {
     target: 'node22',
     format: 'esm',
     outfile: 'dist/index.js',
-    external: ['sql.js', '@larksuiteoapi/node-sdk', '@openai/codex-sdk', '@anthropic-ai/claude-agent-sdk'],
+    external: ['sql.js', '@larksuiteoapi/node-sdk', '@openai/codex-sdk', '@anthropic-ai/claude-agent-sdk', 'node-pty'],
     sourcemap: true,
     banner: { js: "import { createRequire as _cR } from 'module'; const require = _cR(import.meta.url);" },
   });
@@ -32,6 +32,9 @@ async function main() {
   const sqlJsDir = dirname(require.resolve('sql.js/dist/sql-wasm.wasm'));
   mkdirSync('dist', { recursive: true });
   cpSync(join(sqlJsDir, 'sql-wasm.wasm'), 'dist/sql-wasm.wasm');
+  mkdirSync('dist/resources', { recursive: true });
+  cpSync('resources/pty-statusline.cjs', 'dist/resources/pty-statusline.cjs');
+  cpSync('resources/pty-stop-hook.cjs', 'dist/resources/pty-stop-hook.cjs');
 
   console.log('Build complete');
 }

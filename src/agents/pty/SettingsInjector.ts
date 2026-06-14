@@ -1,5 +1,5 @@
 import { access, mkdir, readFile, writeFile } from "node:fs/promises";
-import { constants } from "node:fs";
+import { constants, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -180,5 +180,11 @@ export function shellJoin(parts: string[]): string {
 }
 
 function defaultResourcesDir(): string {
-  return path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../resources");
+  const here = path.dirname(fileURLToPath(import.meta.url));
+  const candidates = [
+    path.resolve(here, "../../../resources"),
+    path.resolve(here, "resources"),
+    path.resolve(process.cwd(), "resources"),
+  ];
+  return candidates.find((candidate) => existsSync(path.join(candidate, "pty-statusline.cjs"))) ?? candidates[0];
 }
