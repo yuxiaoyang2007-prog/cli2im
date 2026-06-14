@@ -226,38 +226,9 @@ describe('handleCLISessionResume', () => {
     expect(store.updateState).toHaveBeenCalledWith('session_row_1', 'active');
   });
 
-  it('rejects claude-code-pty callback resume when callback cwd is outside the bot working directory', async () => {
+  it('rejects claude-code-pty callback resume when scanner has no matching session even if callback cwd matches the bot working directory', async () => {
     validatorMock.validateWorkingDirectory.mockResolvedValue(true);
-    const store = storeDeps();
-    const handoffService = handoffDeps({ success: true });
-    const adapter = { send: vi.fn().mockResolvedValue('msg_1') };
-
-    await handleCLISessionResume({
-      callback: callback(),
-      resume: { sessionId: 'session_123', cwd: process.cwd() },
-      botName: 'ccbot',
-      botConfig: botConfig({
-        agent: 'claude-code-pty',
-        workingDirectory: '/tmp/cli2im-different-project',
-      }),
-      adapter,
-      store,
-      agentManager: { cancelAgent: vi.fn() },
-      handoffService,
-      cardController: undefined,
-      tgStreamController: undefined,
-    });
-
-    expect(adapter.send).toHaveBeenCalledWith('chat_1', {
-      text: expect.stringContaining('Resume failed'),
-    });
-    expect(adapter.send.mock.calls[0][1].text).toContain('outside this bot working directory');
-    expect(handoffService.acceptHandoff).not.toHaveBeenCalled();
-    expect(store.getOrCreate).not.toHaveBeenCalled();
-  });
-
-  it('allows claude-code-pty callback resume when callback cwd realpath matches the bot working directory', async () => {
-    validatorMock.validateWorkingDirectory.mockResolvedValue(true);
+    cliScannerMock.scan.mockResolvedValueOnce([]);
     const store = storeDeps();
     const handoffService = handoffDeps({ success: true });
     const adapter = { send: vi.fn().mockResolvedValue('msg_1') };
@@ -278,6 +249,44 @@ describe('handleCLISessionResume', () => {
       tgStreamController: undefined,
     });
 
+    expect(adapter.send).toHaveBeenCalledWith('chat_1', {
+      text: expect.stringContaining('Resume failed'),
+    });
+    expect(adapter.send.mock.calls[0][1].text).toContain('could not resolve cwd');
+    expect(handoffService.acceptHandoff).not.toHaveBeenCalled();
+    expect(store.getOrCreate).not.toHaveBeenCalled();
+  });
+
+  it('allows claude-code-pty callback resume using the scanned cwd even when callback carries a cwd', async () => {
+    validatorMock.validateWorkingDirectory.mockResolvedValue(true);
+    cliScannerMock.scan.mockResolvedValueOnce([{
+      sessionId: 'session_123',
+      cwd: process.cwd(),
+      title: 'Project session',
+      lastModified: Date.now(),
+      status: 'historical',
+    }]);
+    const store = storeDeps();
+    const handoffService = handoffDeps({ success: true });
+    const adapter = { send: vi.fn().mockResolvedValue('msg_1') };
+
+    await handleCLISessionResume({
+      callback: callback(),
+      resume: { sessionId: 'session_123', cwd: '/Users/test/project' },
+      botName: 'ccbot',
+      botConfig: botConfig({
+        agent: 'claude-code-pty',
+        workingDirectory: process.cwd(),
+      }),
+      adapter,
+      store,
+      agentManager: { cancelAgent: vi.fn() },
+      handoffService,
+      cardController: undefined,
+      tgStreamController: undefined,
+    });
+
+    expect(cliScannerMock.scan).toHaveBeenCalledWith({ cwdFilter: process.cwd() });
     expect(handoffService.acceptHandoff).toHaveBeenCalledWith(expect.objectContaining({
       workDir: process.cwd(),
       agentName: 'claude-code-pty',
@@ -285,6 +294,32 @@ describe('handleCLISessionResume', () => {
     expect(adapter.send).toHaveBeenCalledWith('chat_1', {
       text: expect.stringContaining('**已接管会话**'),
     });
+  });
+
+  it('keeps non-pty callback resume behavior unchanged', async () => {
+    validatorMock.validateWorkingDirectory.mockResolvedValue(true);
+    const store = storeDeps();
+    const handoffService = handoffDeps({ success: true });
+    const adapter = { send: vi.fn().mockResolvedValue('msg_1') };
+
+    await handleCLISessionResume({
+      callback: callback(),
+      resume: { sessionId: 'session_123', cwd: '/Users/test/project' },
+      botName: 'ccbot',
+      botConfig: botConfig({ agent: 'codex' }),
+      adapter,
+      store,
+      agentManager: { cancelAgent: vi.fn() },
+      handoffService,
+      cardController: undefined,
+      tgStreamController: undefined,
+    });
+
+    expect(cliScannerMock.scan).not.toHaveBeenCalled();
+    expect(handoffService.acceptHandoff).toHaveBeenCalledWith(expect.objectContaining({
+      workDir: '/Users/test/project',
+      agentName: 'codex',
+    }), { lockAlreadyAcquired: true });
   });
 
   it('rejects claude-code-pty no-cwd resume when scanner has no match instead of falling back to homedir', async () => {

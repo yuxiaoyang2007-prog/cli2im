@@ -585,8 +585,10 @@ export class ClaudePtyVirtualProcess implements AgentProcess {
       return err instanceof Error ? err : new Error(String(err));
     }
     const screenTail = redactInitScreenTail(await screen.renderedText());
-    const suffix = screenTail ? `\n${screenTail}` : '';
-    return new Error(`Claude 会话启动超时(30s),可能卡在启动确认界面:${suffix}`);
+    if (screenTail) {
+      console.log(`[claude-pty] init timeout screen tail:\n${screenTail}`);
+    }
+    return new Error('Claude 会话启动超时(30s),可能卡在某个启动确认界面(详情见服务端日志)');
   }
 
   private failInit(err: unknown): void {

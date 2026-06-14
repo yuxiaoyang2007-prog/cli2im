@@ -42,22 +42,25 @@ export async function handleCLISessionResume(params: {
 
   try {
     let workDir = resume.cwd;
-    if (!workDir) {
-      const scanner = botConfig.agent === 'gemini'
-        ? new GeminiSessionScanner(join(homedir(), '.gemini'))
-        : botConfig.agent === 'codex'
-          ? new CodexSessionScanner(join(homedir(), '.codex'))
-          : new CLISessionScanner(join(homedir(), '.claude'));
-      const sessions = botConfig.agent === 'claude-code-pty'
-        ? await scanner.scan({ cwdFilter: botConfig.workingDirectory })
-        : await scanner.scan();
+    if (botConfig.agent === 'claude-code-pty') {
+      const scanner = new CLISessionScanner(join(homedir(), '.claude'));
+      const sessions = await scanner.scan({ cwdFilter: botConfig.workingDirectory });
       const match = sessions.find((s) => s.sessionId === resume.sessionId);
-      if (!match?.cwd && botConfig.agent === 'claude-code-pty') {
+      if (!match?.cwd) {
         await adapter.send(callback.chatId, {
           text: `Resume failed: could not resolve cwd for session \`${resume.sessionId}\``,
         });
         return;
       }
+      workDir = match.cwd;
+    } else if (!workDir) {
+      const scanner = botConfig.agent === 'gemini'
+        ? new GeminiSessionScanner(join(homedir(), '.gemini'))
+        : botConfig.agent === 'codex'
+          ? new CodexSessionScanner(join(homedir(), '.codex'))
+          : new CLISessionScanner(join(homedir(), '.claude'));
+      const sessions = await scanner.scan();
+      const match = sessions.find((s) => s.sessionId === resume.sessionId);
       workDir = match?.cwd || homedir();
     }
 

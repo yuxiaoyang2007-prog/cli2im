@@ -317,10 +317,11 @@ describe('ClaudePtyVirtualProcess', () => {
     proc.kill();
   });
 
-  it('adds a redacted init screen tail when statusline init times out', async () => {
+  it('logs a redacted init screen tail without adding it to the timeout error event', async () => {
     const runner = new FakeRunner();
     const deps = makeDeps({ runners: [runner] });
     const home = process.env.HOME ?? '/Users/test';
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
     deps.waitForStatuslinePayload = async () => {
       runner.emitData([
         'Allow external CLAUDE.md file imports?',
@@ -337,16 +338,25 @@ describe('ClaudePtyVirtualProcess', () => {
     const exit = vi.fn();
     proc.on('exit', exit);
 
-    await vi.waitFor(() => expect(exit).toHaveBeenCalledWith(1));
-    expect(events).toHaveLength(1);
-    expect(events[0]).toMatchObject({ type: 'error' });
-    const message = events[0].type === 'error' ? events[0].message : '';
-    expect(message).toContain('Claude 会话启动超时');
-    expect(message).toContain('Allow external CLAUDE.md file imports?');
-    expect(message).toContain('~/project/CLAUDE.md');
-    expect(message).toContain('MY_TOKEN=<redacted>');
-    expect(message).not.toContain(home);
-    expect(message).not.toContain('super-secret-value');
+    try {
+      await vi.waitFor(() => expect(exit).toHaveBeenCalledWith(1));
+      expect(events).toHaveLength(1);
+      expect(events[0]).toMatchObject({ type: 'error' });
+      const message = events[0].type === 'error' ? events[0].message : '';
+      expect(message).toBe('Claude 会话启动超时(30s),可能卡在某个启动确认界面(详情见服务端日志)');
+      expect(message).not.toContain('Allow external CLAUDE.md file imports?');
+      expect(message).not.toContain('~/project/CLAUDE.md');
+      expect(message).not.toContain('MY_TOKEN');
+      expect(message).not.toContain(home);
+      expect(message).not.toContain('super-secret-value');
+      expect(logSpy).toHaveBeenCalledWith(expect.stringContaining('Allow external CLAUDE.md file imports?'));
+      expect(logSpy).toHaveBeenCalledWith(expect.stringContaining('~/project/CLAUDE.md'));
+      expect(logSpy).toHaveBeenCalledWith(expect.stringContaining('MY_TOKEN=<redacted>'));
+      expect(logSpy).not.toHaveBeenCalledWith(expect.stringContaining(home));
+      expect(logSpy).not.toHaveBeenCalledWith(expect.stringContaining('super-secret-value'));
+    } finally {
+      logSpy.mockRestore();
+    }
   });
 
   it('disposes a timed out runtime and rebuilds before the next message', async () => {
