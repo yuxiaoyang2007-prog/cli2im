@@ -10,7 +10,11 @@ class FakeRunner {
   writes: string[] = [];
   writeTimes: number[] = [];
   spawn = vi.fn(async () => {});
-  kill = vi.fn(() => {});
+  kill = vi.fn((_signal?: string) => {
+    this.currentState = 'exited';
+  });
+  dataListenerDisposes = 0;
+  exitListenerDisposes = 0;
   private events = new EventEmitter();
 
   write(data: string): void {
@@ -20,12 +24,18 @@ class FakeRunner {
 
   onData(cb: (chunk: string) => void): () => void {
     this.events.on('data', cb);
-    return () => this.events.off('data', cb);
+    return () => {
+      this.dataListenerDisposes += 1;
+      this.events.off('data', cb);
+    };
   }
 
   onExit(cb: (event: { exitCode: number; signal?: number }) => void): () => void {
     this.events.on('exit', cb);
-    return () => this.events.off('exit', cb);
+    return () => {
+      this.exitListenerDisposes += 1;
+      this.events.off('exit', cb);
+    };
   }
 
   emitData(chunk: string): void {
@@ -36,15 +46,17 @@ class FakeRunner {
 class FakeTailer {
   drains = 0;
   seekToEnd = vi.fn(async () => {});
-  private batches: unknown[][] = [];
+  onDrain?: () => void;
+  private batches: Array<unknown[] | Promise<unknown[]>> = [];
 
-  push(records: unknown[]): void {
+  push(records: unknown[] | Promise<unknown[]>): void {
     this.batches.push(records);
   }
 
   async drain(): Promise<unknown[]> {
     this.drains += 1;
-    return this.batches.shift() ?? [];
+    this.onDrain?.();
+    return await (this.batches.shift() ?? []);
   }
 }
 
@@ -156,6 +168,26 @@ describe('ClaudePtyVirtualProcess', () => {
     expect(proc.stdout.readableEnded).toBe(true);
   });
 
+  it('cleans up the runner when statusline init fails after spawn', async () => {
+    const runner = new FakeRunner();
+    const deps = makeDeps({
+      runners: [runner],
+      statusError: new Error('statusline missing'),
+    });
+    const proc = new ClaudePtyVirtualProcess('claude', {
+      workingDirectory: process.cwd(),
+      permissionMode: 'bypass',
+    }, undefined, deps);
+    const exit = vi.fn();
+    proc.on('exit', exit);
+
+    await vi.waitFor(() => expect(exit).toHaveBeenCalledWith(1));
+    expect(runner.spawn).toHaveBeenCalledTimes(1);
+    expect(runner.kill).toHaveBeenCalledWith('SIGTERM');
+    expect(runner.dataListenerDisposes).toBe(1);
+    expect(runner.exitListenerDisposes).toBe(1);
+  });
+
   it('can be killed before init finishes without emitting a stale status', async () => {
     let resolveStatus!: (value: { sessionId: string; transcriptPath: string }) => void;
     const deps = makeDeps();
@@ -254,6 +286,104 @@ describe('ClaudePtyVirtualProcess', () => {
 
     await vi.waitFor(() => expect(events.some((event) => event.type === 'text' && event.content === 'after rebuild')).toBe(true));
     expect(secondRunner.writes.join('')).toContain('next');
+  });
+
+  it('uses the outer deadline path even when elapsed fallback would fire first', async () => {
+    let now = 0;
+    const nowSpy = vi.spyOn(Date, 'now').mockImplementation(() => now);
+    try {
+      const firstRunner = new FakeRunner();
+      const secondRunner = new FakeRunner();
+      const firstTailer = new FakeTailer();
+      firstTailer.onDrain = () => {
+        now = 25;
+      };
+      const secondTailer = new FakeTailer();
+      secondTailer.push([
+        {
+          type: 'assistant',
+          session_id: 'sess_1',
+          message: { content: [{ type: 'text', text: 'after fallback deadline' }] },
+        },
+      ]);
+      const deps = makeDeps({
+        status: [
+          { sessionId: 'sess_1', transcriptPath: '/tmp/transcript-1.jsonl' },
+          { sessionId: 'sess_1', transcriptPath: '/tmp/transcript-2.jsonl' },
+        ],
+        runners: [firstRunner, secondRunner],
+        tailers: [firstTailer, secondTailer],
+      });
+      const proc = new ClaudePtyVirtualProcess('claude', {
+        workingDirectory: process.cwd(),
+        permissionMode: 'bypass',
+      }, 'sess_1', deps, { turnTimeoutMs: 20, pollIntervalMs: 1 });
+      const events = collectEvents(proc);
+
+      proc.stdin.write(userPayload('will timeout via elapsed fallback'));
+      await vi.waitFor(() => expect(events.some((event) => event.type === 'error')).toBe(true));
+      expect(firstRunner.kill).toHaveBeenCalledWith('SIGTERM');
+
+      proc.stdin.write(userPayload('next'));
+      await vi.waitFor(() => expect(deps.stopCallbacks.length).toBe(2));
+      deps.stopCallbacks[1]({
+        hook_event_name: 'Stop',
+        session_id: 'sess_1',
+        transcript_path: '/tmp/transcript-2.jsonl',
+        turnSeq: 1,
+      });
+
+      await vi.waitFor(() => expect(events.some((event) => event.type === 'text' && event.content === 'after fallback deadline')).toBe(true));
+      expect(secondRunner.writes.join('')).toContain('next');
+    } finally {
+      nowSpy.mockRestore();
+    }
+  });
+
+  it('ignores a Stop decision that completes after the turn is cancelled', async () => {
+    let resolveStopDrain!: (records: unknown[]) => void;
+    const tailer = new FakeTailer();
+    tailer.push([]);
+    tailer.push(new Promise<unknown[]>((resolve) => {
+      resolveStopDrain = resolve;
+    }));
+    const deps = makeDeps({ tailers: [tailer] });
+    const proc = new ClaudePtyVirtualProcess('claude', {
+      workingDirectory: process.cwd(),
+      permissionMode: 'bypass',
+    }, undefined, deps);
+    const events = collectEvents(proc);
+
+    await vi.waitFor(() => expect(events).toContainEqual({ type: 'status', sessionId: 'sess_1' }));
+    deps.stopCallbacks[0]({
+      hook_event_name: 'Stop',
+      session_id: 'sess_1',
+      transcript_path: '/tmp/transcript-1.jsonl',
+      turnSeq: 1,
+    });
+    const cancel = { cancelled: false };
+    (proc as unknown as { activeCancel: { cancelled: boolean } }).activeCancel = cancel;
+    const waitForTurn = (proc as unknown as {
+      waitForPtyTurn: () => Promise<{ branch: string; events: AgentEvent[]; reason?: string }>;
+    }).waitForPtyTurn();
+
+    await vi.waitFor(() => expect(tailer.drains).toBe(2));
+    cancel.cancelled = true;
+    resolveStopDrain([
+      {
+        type: 'assistant',
+        session_id: 'sess_1',
+        message: { content: [{ type: 'text', text: 'late stop result' }] },
+      },
+    ]);
+
+    await expect(waitForTurn).resolves.toEqual({
+      branch: 'ignored',
+      events: [],
+      reason: 'turn cancelled',
+    });
+    expect(events).not.toContainEqual({ type: 'text', content: 'late stop result' });
+    proc.kill();
   });
 
   it('runs an anchored SDK slash command without sender or relay prefixes and seeks the tailer afterward', async () => {

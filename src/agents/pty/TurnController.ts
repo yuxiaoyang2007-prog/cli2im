@@ -109,7 +109,7 @@ export class TurnController {
     if (input.prompt && input.ptyReady) {
       return this.decision("needs_input", [], input.prompt, input.elapsedMs);
     }
-    if (input.elapsedMs >= this.maxTurnMs) {
+    if (Number.isFinite(this.maxTurnMs) && input.elapsedMs >= this.maxTurnMs) {
       return this.decision("error", [{ type: "error", message: "Turn timed out before Stop hook" }], undefined, input.elapsedMs);
     }
     return this.decision("waiting", [], undefined, input.elapsedMs);

@@ -128,9 +128,9 @@ export class PtyClaudeRunner {
     return () => this.events.off("exit", cb);
   }
 
-  kill(): void {
+  kill(signal?: string): void {
     if (!this.pty) return;
-    this.pty.kill();
+    this.pty.kill(signal);
   }
 
   private markBusy(): void {

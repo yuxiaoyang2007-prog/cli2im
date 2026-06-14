@@ -1,7 +1,7 @@
 import { mkdtemp, readFile, writeFile, appendFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { EventMapper } from '../src/agents/pty/EventMapper.js';
 import { JsonlTailer } from '../src/agents/pty/JsonlTailer.js';
 import { TurnController } from '../src/agents/pty/TurnController.js';
@@ -164,5 +164,21 @@ describe('claude pty transcript layer', () => {
       '--add-dir',
       '/repo/inbox',
     ]);
+  });
+
+  it('passes kill signals through to the underlying pty', () => {
+    const runner = new PtyClaudeRunner({ cwd: process.cwd() });
+    const pty = {
+      pid: 123,
+      write: vi.fn(),
+      kill: vi.fn(),
+      onData: vi.fn(() => ({ dispose: vi.fn() })),
+      onExit: vi.fn(() => ({ dispose: vi.fn() })),
+    };
+
+    (runner as unknown as { pty: typeof pty }).pty = pty;
+    runner.kill('SIGKILL');
+
+    expect(pty.kill).toHaveBeenCalledWith('SIGKILL');
   });
 });

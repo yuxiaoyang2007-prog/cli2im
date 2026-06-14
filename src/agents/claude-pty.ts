@@ -319,70 +319,78 @@ export class ClaudePtyVirtualProcess implements AgentProcess {
       void initScreen.write(chunk);
     });
 
-    await runner.spawn({
-      settingsPath: settings.settingsPath,
-      resumeSessionId,
-      model: this.opts.model,
-      permissionMode: this.opts.permissionMode,
-      addDirs: buildAddDirs(this.opts.workingDirectory, this.opts.addDirs),
-    });
-
-    const stopInitMenuWatcher = this.watchInitMenus(initScreen, runner);
-    let payload: StatuslinePayload;
+    let disposeStopWatch: (() => void) | undefined;
+    let spawned = false;
     try {
-      payload = await this.deps.waitForStatuslinePayload(settings.rawPayloadFile);
-    } finally {
-      stopInitMenuWatcher();
-    }
-    if (!payload.sessionId) {
-      throw new Error('Claude PTY did not report a session id');
-    }
-    if (!payload.transcriptPath) {
-      throw new Error('Claude PTY did not report a transcript path');
-    }
-    if (this.terminated) {
+      await runner.spawn({
+        settingsPath: settings.settingsPath,
+        resumeSessionId,
+        model: this.opts.model,
+        permissionMode: this.opts.permissionMode,
+        addDirs: buildAddDirs(this.opts.workingDirectory, this.opts.addDirs),
+      });
+      spawned = true;
+
+      const stopInitMenuWatcher = this.watchInitMenus(initScreen, runner);
+      let payload: StatuslinePayload;
+      try {
+        payload = await this.deps.waitForStatuslinePayload(settings.rawPayloadFile);
+      } finally {
+        stopInitMenuWatcher();
+      }
+      if (!payload.sessionId) {
+        throw new Error('Claude PTY did not report a session id');
+      }
+      if (!payload.transcriptPath) {
+        throw new Error('Claude PTY did not report a transcript path');
+      }
+      if (this.terminated) {
+        throw new Error('Claude PTY init terminated');
+      }
+
+      this.sessionId = payload.sessionId;
+      const tailer = this.deps.createTailer(payload.transcriptPath);
+      if (resumeSessionId) await tailer.seekToEnd();
+      this.stopQueue = createStopQueue();
+      disposeStopWatch = this.deps.watchStop(
+        settings.stopMarkerFile,
+        { sessionId: payload.sessionId },
+        (marker) => this.stopQueue.push(marker),
+      );
+      const injector = new InputInjector(runner as InputWriteTarget);
+      const session = new InteractiveClaudeSession({
+        injector,
+        turnTimeoutMs: this.turnTimeoutMs,
+        beginTurn: () => this.currentController?.beginTurn(),
+        waitForTurn: (input) => this.waitForPtyTurn(input?.onEvents),
+        onTurnDeadline: () => this.handleTurnDeadline(),
+        onDispose: async () => {
+          this.disposeRuntime('SIGTERM', true);
+        },
+        slash: {
+          runner,
+          quietMs: this.slashQuietMs,
+          timeoutMs: this.slashTimeoutMs,
+        },
+      });
+
+      return {
+        settings,
+        runner,
+        tailer,
+        injector,
+        session,
+        disposeStopWatch,
+        disposeRunnerData,
+        disposeRunnerExit,
+      };
+    } catch (err) {
+      disposeStopWatch?.();
       disposeRunnerData();
       disposeRunnerExit();
-      runner.kill('SIGTERM');
-      throw new Error('Claude PTY init terminated');
+      if (spawned) runner.kill('SIGTERM');
+      throw err;
     }
-
-    this.sessionId = payload.sessionId;
-    const tailer = this.deps.createTailer(payload.transcriptPath);
-    if (resumeSessionId) await tailer.seekToEnd();
-    this.stopQueue = createStopQueue();
-    const disposeStopWatch = this.deps.watchStop(
-      settings.stopMarkerFile,
-      { sessionId: payload.sessionId },
-      (marker) => this.stopQueue.push(marker),
-    );
-    const injector = new InputInjector(runner as InputWriteTarget);
-    const session = new InteractiveClaudeSession({
-      injector,
-      turnTimeoutMs: this.turnTimeoutMs,
-      beginTurn: () => this.currentController?.beginTurn(),
-      waitForTurn: (input) => this.waitForPtyTurn(input?.onEvents),
-      onTurnDeadline: () => this.handleTurnDeadline(),
-      onDispose: async () => {
-        this.disposeRuntime('SIGTERM', true);
-      },
-      slash: {
-        runner,
-        quietMs: this.slashQuietMs,
-        timeoutMs: this.slashTimeoutMs,
-      },
-    });
-
-    return {
-      settings,
-      runner,
-      tailer,
-      injector,
-      session,
-      disposeStopWatch,
-      disposeRunnerData,
-      disposeRunnerExit,
-    };
   }
 
   private currentController?: TurnController;
@@ -396,7 +404,7 @@ export class ClaudePtyVirtualProcess implements AgentProcess {
       tailer: runtime.tailer as JsonlTailer,
       sessionId: this.sessionId || undefined,
       transcriptPath: this.currentTranscriptPath(),
-      maxTurnMs: this.turnTimeoutMs,
+      maxTurnMs: Number.POSITIVE_INFINITY,
       stopDrainPollMs: this.pollIntervalMs,
     });
     this.currentController = controller;
@@ -423,6 +431,9 @@ export class ClaudePtyVirtualProcess implements AgentProcess {
       const marker = this.stopQueue.shift();
       if (marker) {
         const decision = await controller.handleStop(marker);
+        if (this.isTurnCancelled(cancel)) {
+          return { branch: 'ignored', events: [], reason: 'turn cancelled' };
+        }
         if (decision.branch !== 'waiting' && decision.branch !== 'ignored') {
           this.currentController = undefined;
           return decision;
