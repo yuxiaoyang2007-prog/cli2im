@@ -255,4 +255,36 @@ describe('ClaudePtyVirtualProcess', () => {
     await vi.waitFor(() => expect(events.some((event) => event.type === 'text' && event.content === 'after rebuild')).toBe(true));
     expect(secondRunner.writes.join('')).toContain('next');
   });
+
+  it('runs an anchored SDK slash command without sender or relay prefixes and seeks the tailer afterward', async () => {
+    const runner = new FakeRunner();
+    const tailer = new FakeTailer();
+    const deps = makeDeps({ runners: [runner], tailers: [tailer] });
+    const proc = new ClaudePtyVirtualProcess('claude', {
+      workingDirectory: process.cwd(),
+      permissionMode: 'bypass',
+    }, undefined, deps, { slashQuietMs: 100, slashTimeoutMs: 500 });
+    const events = collectEvents(proc);
+
+    await vi.waitFor(() => expect(events).toContainEqual({ type: 'status', sessionId: 'sess_1' }));
+    proc.stdin.write(userPayload([
+      '<cti-sender channel="relay" user_id="relay:codexbot" bot="codexbot"/>',
+      '',
+      '<cti-relay>relay directive</cti-relay>',
+      '',
+      '/review',
+    ].join('\n')));
+
+    await vi.waitFor(() => expect(runner.writes).toContain('/review\r'));
+    runner.emitData('Review output\n');
+
+    await vi.waitFor(() => expect(events.some((event) => event.type === 'result' && event.noRelay)).toBe(true));
+    expect(runner.writes).toContain('/review\r');
+    expect(runner.writes.join('')).not.toContain('<cti-sender');
+    expect(runner.writes.join('')).not.toContain('<cti-relay>');
+    expect(events).toContainEqual({ type: 'text', content: 'Review output', noRelay: true });
+    expect(events).toContainEqual({ type: 'result', sessionId: 'sess_1', noRelay: true });
+    expect(tailer.seekToEnd).toHaveBeenCalledTimes(1);
+    proc.kill();
+  });
 });

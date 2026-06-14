@@ -31,6 +31,7 @@ export function buildSenderEnv(sender: SenderInfo): Record<string, string> {
 
 const BRIDGE_COMMANDS = new Set([
   'new',
+  'clear',
   'list',
   'switch',
   'cwd',
@@ -61,7 +62,7 @@ export function isBridgeCommand(text: string): boolean {
 export function parseBridgeCommand(text: string): BridgeCommand | null {
   if (!text.startsWith('/')) return null;
   const parts = text.slice(1).trim().split(/\s+/);
-  const command = parts[0];
+  const command = parts[0] === 'clear' ? 'new' : parts[0];
   if (!BRIDGE_COMMANDS.has(command)) return null;
   return { command, args: parts.slice(1) };
 }

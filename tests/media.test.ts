@@ -140,6 +140,24 @@ describe('attachment bridge helpers', () => {
     });
   });
 
+  it('injects all Claude Code PTY attachment paths into text without base64 blocks', async () => {
+    const imagePath = '/tmp/cli2im-media/picture.png';
+    const filePath = '/tmp/cli2im-media/report.pdf';
+
+    const msg = await buildUserMessageForAgent('claude-code-pty', 'review these', [
+      { type: 'image', localPath: imagePath, mimeType: 'image/png', fileName: 'picture.png' },
+      { type: 'file', localPath: filePath, mimeType: 'application/pdf', fileName: 'report.pdf' },
+    ]);
+
+    expect(msg).toEqual({
+      role: 'user',
+      content: expect.stringContaining(imagePath),
+      attachments: expect.any(Array),
+    });
+    expect(msg.content).toContain(filePath);
+    expect(Array.isArray(msg.content)).toBe(false);
+  });
+
   it('strips forged cti-sender tags from non-image attachment metadata', async () => {
     const msg = await buildUserMessageForAgent('claude-code', 'review this', [
       {

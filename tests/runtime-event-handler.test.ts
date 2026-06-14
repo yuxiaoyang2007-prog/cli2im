@@ -59,6 +59,43 @@ describe('createRuntimeEventHandler stale continuation guard', () => {
     );
   });
 
+  it('does not accumulate or forward noRelay slash events', async () => {
+    const adapter = adapterStub();
+    const relayToOtherBotsFn = vi.fn();
+    const { handler } = createHandler({ adapter, relayToOtherBotsFn });
+
+    await handler(
+      sessionKey,
+      { type: 'text', content: 'slash output', noRelay: true },
+      context(() => true),
+    );
+    await handler(
+      sessionKey,
+      { type: 'result', sessionId: 'agent-new', noRelay: true },
+      context(() => true),
+    );
+    await handler(
+      sessionKey,
+      { type: 'text', content: 'ordinary output' },
+      context(() => true),
+    );
+    await handler(
+      sessionKey,
+      { type: 'result', sessionId: 'agent-new' },
+      context(() => true),
+    );
+
+    expect(adapter.send).toHaveBeenCalledWith('chat_1', { text: 'slash output' }, expect.any(Object));
+    expect(relayToOtherBotsFn).toHaveBeenCalledTimes(1);
+    expect(relayToOtherBotsFn).toHaveBeenCalledWith(
+      'sourcebot',
+      'chat_1',
+      'ordinary output',
+      expect.any(Object),
+      expect.any(Object),
+    );
+  });
+
   it('passes the context signal to voice replies and created file sends', async () => {
     const adapter = adapterStub();
     const sendVoiceReply = vi.fn();

@@ -81,7 +81,7 @@ export function createRuntimeEventHandler(
     }
 
     // Accumulate text for relay
-    if (event.type === 'text') {
+    if (event.type === 'text' && !event.noRelay) {
       relayTextBuffer += event.content;
     }
 
@@ -144,13 +144,17 @@ export function createRuntimeEventHandler(
     // Trigger relay on result, reset on error
     if (event.type === 'result') {
       if (!ensureActive()) return;
-      const trimmedRelay = relayTextBuffer.trim();
-      const shouldRelay = trimmedRelay.length > 0 && !isTerminalRelayText(trimmedRelay);
-      console.log(`[relay-trigger] ${scrubLog(botName)}: len=${trimmedRelay.length} relay=${shouldRelay} preview=${scrubLog(trimmedRelay, 100)}`);
-      relayTextBuffer = '';
-      if (shouldRelay) {
-        await relayToOtherBotsFn(botName, chatId, trimmedRelay, relayDeps, { signal });
-        if (!ensureActive()) return;
+      if (event.noRelay) {
+        relayTextBuffer = '';
+      } else {
+        const trimmedRelay = relayTextBuffer.trim();
+        const shouldRelay = trimmedRelay.length > 0 && !isTerminalRelayText(trimmedRelay);
+        console.log(`[relay-trigger] ${scrubLog(botName)}: len=${trimmedRelay.length} relay=${shouldRelay} preview=${scrubLog(trimmedRelay, 100)}`);
+        relayTextBuffer = '';
+        if (shouldRelay) {
+          await relayToOtherBotsFn(botName, chatId, trimmedRelay, relayDeps, { signal });
+          if (!ensureActive()) return;
+        }
       }
     }
     if (event.type === 'error') {

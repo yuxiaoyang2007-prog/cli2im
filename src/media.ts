@@ -53,7 +53,15 @@ export async function buildUserMessageForAgent(
     return { role: 'user', content: text, attachments };
   }
 
-  const contentText = appendNonImageAttachmentPaths(text, attachments);
+  if (agentName === 'claude-code-pty') {
+    return {
+      role: 'user',
+      content: appendAttachmentPaths(text, attachments, true),
+      attachments,
+    };
+  }
+
+  const contentText = appendAttachmentPaths(text, attachments, false);
   if (agentName !== 'claude-code') {
     return { role: 'user', content: contentText };
   }
@@ -84,9 +92,9 @@ export async function buildUserMessageForAgent(
   return { role: 'user', content };
 }
 
-function appendNonImageAttachmentPaths(text: string, attachments: FileAttachment[]): string {
+function appendAttachmentPaths(text: string, attachments: FileAttachment[], includeImages: boolean): string {
   const lines = attachments
-    .filter((attachment) => attachment.type !== 'image')
+    .filter((attachment) => includeImages || attachment.type !== 'image')
     .map((attachment) => {
       const metadata = formatAttachmentMetadataFields(attachment);
       if (metadata.length === 0) return '- attachment: "unavailable"';

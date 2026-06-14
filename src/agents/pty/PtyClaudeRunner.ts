@@ -16,6 +16,7 @@ export interface PtySpawnInput {
   resumeSessionId?: string;
   model?: string;
   permissionMode?: "bypass" | "blacklist";
+  addDirs?: string[];
 }
 
 // Claude Code injects these into any child process it spawns. If the bridge is
@@ -26,7 +27,14 @@ export interface PtySpawnInput {
 export function sanitizeChildEnv(base: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...base };
   for (const key of Object.keys(env)) {
-    if (key === "CLAUDECODE" || key === "AI_AGENT" || key === "CLAUDE_EFFORT" || key.startsWith("CLAUDE_CODE_")) {
+    if (
+      key === "CLAUDECODE"
+      || key === "AI_AGENT"
+      || key === "CLAUDE_EFFORT"
+      || key === "ANTHROPIC_API_KEY"
+      || key === "ANTHROPIC_AUTH_TOKEN"
+      || key.startsWith("CLAUDE_CODE_")
+    ) {
       delete env[key];
     }
   }
@@ -57,6 +65,7 @@ export class PtyClaudeRunner {
       "--settings",
       input.settingsPath,
       ...(input.permissionMode === "bypass" ? ["--dangerously-skip-permissions"] : []),
+      ...addDirArgs(input.addDirs ?? []),
       ...(input.model ? ["--model", input.model] : []),
       ...(input.resumeSessionId ? ["--resume", input.resumeSessionId] : []),
     ];
@@ -137,4 +146,10 @@ export class PtyClaudeRunner {
     this.state = state;
     this.events.emit("state", state);
   }
+}
+
+function addDirArgs(addDirs: string[]): string[] {
+  return [...new Set(addDirs)]
+    .filter((dir) => dir.length > 0)
+    .flatMap((dir) => ["--add-dir", dir]);
 }

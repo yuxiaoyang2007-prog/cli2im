@@ -58,8 +58,10 @@ export class SettingsInjector {
     this.runtimeDir = options.runtimeDir ?? path.join(tmpdir(), "cc-pty-spike");
     this.nodePath = options.nodePath ?? process.execPath;
     this.resourcesDir = options.resourcesDir ?? defaultResourcesDir();
-    this.permissionsAllow = options.permissionsAllow ?? DEFAULT_PERMISSIONS_ALLOW;
     this.permissionsDeny = options.permissionsDeny ?? [];
+    const denied = new Set(this.permissionsDeny);
+    this.permissionsAllow = (options.permissionsAllow ?? DEFAULT_PERMISSIONS_ALLOW)
+      .filter((tool) => !denied.has(tool));
   }
 
   async build(handle: SettingsBuildInput): Promise<BuiltSettings> {

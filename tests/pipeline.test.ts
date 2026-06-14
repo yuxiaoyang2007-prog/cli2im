@@ -30,6 +30,7 @@ describe('isBridgeCommand', () => {
     expect(isBridgeCommand('/handoff')).toBe(true);
     expect(isBridgeCommand('/force-approve')).toBe(true);
     expect(isBridgeCommand('/model opus')).toBe(true);
+    expect(isBridgeCommand('/clear')).toBe(true);
     expect(isBridgeCommand('/thinking')).toBe(true);
     expect(isBridgeCommand('/fast')).toBe(true);
     expect(isBridgeCommand('/perm allow req_123')).toBe(true);
@@ -52,6 +53,11 @@ describe('isBridgeCommand', () => {
 describe('parseBridgeCommand', () => {
   it('parses /new', () => {
     const cmd = parseBridgeCommand('/new');
+    expect(cmd).toEqual({ command: 'new', args: [] });
+  });
+
+  it('parses /clear as a bridge reset command', () => {
+    const cmd = parseBridgeCommand('/clear');
     expect(cmd).toEqual({ command: 'new', args: [] });
   });
 

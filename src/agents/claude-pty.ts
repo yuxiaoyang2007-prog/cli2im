@@ -86,6 +86,8 @@ export interface ClaudePtyRuntimeDeps {
 interface ClaudePtyRuntimeTuning {
   turnTimeoutMs?: number;
   pollIntervalMs?: number;
+  slashQuietMs?: number;
+  slashTimeoutMs?: number;
 }
 
 type StdinPayload =
@@ -103,6 +105,8 @@ export class ClaudePtyVirtualProcess implements AgentProcess {
   private readonly deps: Required<ClaudePtyRuntimeDeps>;
   private readonly turnTimeoutMs: number;
   private readonly pollIntervalMs: number;
+  private readonly slashQuietMs?: number;
+  private readonly slashTimeoutMs?: number;
   private inputBuffer = '';
   private state: ProcessState;
   private ready: Promise<void>;
@@ -126,6 +130,8 @@ export class ClaudePtyVirtualProcess implements AgentProcess {
     this.state = resumeSessionId ? 'rebuilding' : 'starting';
     this.turnTimeoutMs = tuning.turnTimeoutMs ?? DEFAULT_TURN_TIMEOUT_MS;
     this.pollIntervalMs = tuning.pollIntervalMs ?? POLL_INTERVAL_MS;
+    this.slashQuietMs = tuning.slashQuietMs;
+    this.slashTimeoutMs = tuning.slashTimeoutMs;
     this.deps = withDefaultDeps(deps);
     this.stdout = new PassThrough({ objectMode: true });
     this.stdin = new Writable({
@@ -212,6 +218,12 @@ export class ClaudePtyVirtualProcess implements AgentProcess {
     const cancel = { cancelled: false };
     this.activeCancel = cancel;
     const prompt = messageToText(message);
+    const slashCommand = extractAgentSlashCommand(prompt);
+    if (slashCommand) {
+      await this.processSlashTurn(runtime, slashCommand, cancel);
+      if (this.activeCancel === cancel) this.activeCancel = undefined;
+      return;
+    }
 
     const decision = await runtime.session.send(prompt, {
       onEvent: (event) => this.emitIfCurrent(event, cancel),
@@ -226,6 +238,31 @@ export class ClaudePtyVirtualProcess implements AgentProcess {
     }
     if (this.activeCancel === cancel) this.activeCancel = undefined;
 
+  }
+
+  private async processSlashTurn(
+    runtime: Runtime,
+    command: string,
+    cancel: { cancelled: boolean },
+  ): Promise<void> {
+    try {
+      const result = await runtime.session.runSlashCommand(command);
+      if (this.isTurnCancelled(cancel)) return;
+      const output = redactSlashOutput(result.output);
+      if (output) {
+        this.writeEvent({ type: 'text', content: output, noRelay: true });
+      }
+      this.writeEvent({ type: 'result', sessionId: this.sessionId, noRelay: true });
+    } catch (err) {
+      if (!this.isTurnCancelled(cancel)) {
+        this.writeEvent({
+          type: 'error',
+          message: redactSlashOutput(err instanceof Error ? err.message : String(err)),
+        });
+      }
+    } finally {
+      await runtime.tailer.seekToEnd();
+    }
   }
 
   private async init(resumeSessionId?: string): Promise<void> {
@@ -287,6 +324,7 @@ export class ClaudePtyVirtualProcess implements AgentProcess {
       resumeSessionId,
       model: this.opts.model,
       permissionMode: this.opts.permissionMode,
+      addDirs: buildAddDirs(this.opts.workingDirectory, this.opts.addDirs),
     });
 
     const stopInitMenuWatcher = this.watchInitMenus(initScreen, runner);
@@ -327,6 +365,11 @@ export class ClaudePtyVirtualProcess implements AgentProcess {
       onTurnDeadline: () => this.handleTurnDeadline(),
       onDispose: async () => {
         this.disposeRuntime('SIGTERM', true);
+      },
+      slash: {
+        runner,
+        quietMs: this.slashQuietMs,
+        timeoutMs: this.slashTimeoutMs,
       },
     });
 
@@ -551,6 +594,7 @@ export class ClaudePtyPlugin implements AgentPlugin {
       settingsPath: '<runtime-settings>',
       model: opts.model,
       permissionMode: opts.permissionMode,
+      addDirs: buildAddDirs(opts.workingDirectory, opts.addDirs),
     });
   }
 
@@ -627,6 +671,27 @@ function messageToText(message: UserMessage): string {
   return message.content
     .flatMap((part) => part.type === 'text' ? [part.text] : [])
     .join('\n');
+}
+
+function extractAgentSlashCommand(input: string): string | undefined {
+  let text = input.replace(/^<cti-sender\b[^>]*\/>\n\n/, '');
+  text = text.replace(/^<cti-relay>[\s\S]*?<\/cti-relay>\n\n/, '');
+  const trimmed = text.trim();
+  if (!trimmed.startsWith('/')) return undefined;
+  const command = trimmed.split(/\s+/)[0];
+  if (!AGENT_SLASH_COMMANDS.includes(command)) return undefined;
+  return trimmed;
+}
+
+function redactSlashOutput(input: string): string {
+  return input
+    .replace(/sk-ant-[A-Za-z0-9_-]+/g, '<redacted>')
+    .replace(/\b(ANTHROPIC_API_KEY|ANTHROPIC_AUTH_TOKEN)=\S+/g, '$1=<redacted>')
+    .trim();
+}
+
+function buildAddDirs(workingDirectory: string, addDirs: string[] = []): string[] {
+  return [...new Set([workingDirectory, ...addDirs])].filter((dir) => dir.length > 0);
 }
 
 function sleep(ms: number): Promise<void> {

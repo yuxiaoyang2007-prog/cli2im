@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { handleBridgeCommand } from '../src/index.js';
 import { TelegramStreamController } from '../src/platforms/telegram/stream.js';
+import { parseBridgeCommand } from '../src/pipeline.js';
 import type { BotConfig, PlatformAdapter, SessionKey } from '../src/types.js';
 
 const validatorMock = vi.hoisted(() => ({
@@ -32,6 +33,23 @@ describe('handleBridgeCommand lifecycle cleanup', () => {
 
     expect(deps.adapter.send).toHaveBeenCalledTimes(1);
     expect(deps.voiceSessions.has(sessionKey)).toBe(false);
+    expect(deps.adapter.send).not.toHaveBeenCalledWith('chat_1', {
+      text: 'stale buffered text',
+    });
+  });
+
+  it('handles /clear with the same reset behavior as /new for SDK bots', async () => {
+    const deps = commandDeps({ existingSession: true });
+    deps.tgStreamController.appendText(sessionKey, 'chat_1', 'stale buffered text');
+
+    const command = parseBridgeCommand('/clear');
+    expect(command).toEqual({ command: 'new', args: [] });
+    await runCommand(command!.command, command!.args, deps);
+    await deps.tgStreamController.finalize(sessionKey);
+
+    expect(deps.agentManager.killAgent).toHaveBeenCalledWith(sessionKey);
+    expect(deps.store.delete).toHaveBeenCalledWith('session_row_1');
+    expect(deps.adapter.send).toHaveBeenCalledWith('chat_1', { text: '新会话已创建，发消息开始' });
     expect(deps.adapter.send).not.toHaveBeenCalledWith('chat_1', {
       text: 'stale buffered text',
     });

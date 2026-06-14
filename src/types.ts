@@ -23,6 +23,7 @@ export interface SpawnOpts {
   turnTimeoutMs?: number;
   idleTimeoutMs?: number;
   initialPrompt?: string;
+  addDirs?: string[];
 }
 
 export interface AgentProcess {
@@ -52,13 +53,13 @@ export interface AgentPlugin {
 // === Agent Events ===
 
 export type AgentEvent =
-  | { type: 'text'; content: string }
+  | { type: 'text'; content: string; noRelay?: boolean }
   | { type: 'thinking'; content: string }
   | { type: 'tool_use'; id: string; name: string; input: Record<string, unknown> }
   | { type: 'tool_result'; id: string; name: string; output: string; isError?: boolean }
   | { type: 'permission_request'; id: string; tool: string; input: Record<string, unknown> }
   | { type: 'status'; sessionId?: string; message?: string }
-  | { type: 'result'; sessionId: string; usage?: TokenUsage; createdFiles?: Array<string | FilePayload> }
+  | { type: 'result'; sessionId: string; usage?: TokenUsage; createdFiles?: Array<string | FilePayload>; noRelay?: boolean }
   | { type: 'error'; message: string }
   | { type: 'file'; path: string; mimeType?: string };
 

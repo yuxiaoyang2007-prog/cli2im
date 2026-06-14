@@ -7,6 +7,7 @@ import { JsonlTailer } from '../src/agents/pty/JsonlTailer.js';
 import { TurnController } from '../src/agents/pty/TurnController.js';
 import { validateInput } from '../src/agents/pty/InputInjector.js';
 import { SettingsInjector } from '../src/agents/pty/SettingsInjector.js';
+import { PtyClaudeRunner, sanitizeChildEnv } from '../src/agents/pty/PtyClaudeRunner.js';
 
 describe('claude pty transcript layer', () => {
   it('maps transcript records to cli2im agent events and retains usage/session fallback', () => {
@@ -120,5 +121,48 @@ describe('claude pty transcript layer', () => {
     expect(raw).toContain('/resources/pty-statusline.cjs');
     expect(raw).toContain('/resources/pty-stop-hook.cjs');
     expect(raw).not.toContain('/src/resources/');
+  });
+
+  it('strips Anthropic API credentials from the child environment', () => {
+    expect(sanitizeChildEnv({
+      ANTHROPIC_API_KEY: 'api-key',
+      ANTHROPIC_AUTH_TOKEN: 'auth-token',
+      CLAUDE_CODE_SSE_PORT: '1234',
+      PATH: '/bin',
+    })).toEqual({ PATH: '/bin' });
+  });
+
+  it('removes denied tools from blacklist settings allow rules', async () => {
+    const runtimeDir = await mkdtemp(join(tmpdir(), 'cli2im-settings-'));
+    const settings = await new SettingsInjector({
+      runtimeDir,
+      permissionsDeny: ['Bash', 'Write', 'Edit', 'MultiEdit'],
+    }).build({ handle: 'test' });
+    const raw = JSON.parse(await readFile(settings.settingsPath, 'utf8')) as {
+      permissions: { allow: string[]; deny: string[] };
+    };
+
+    expect(raw.permissions.deny).toEqual(['Bash', 'Write', 'Edit', 'MultiEdit']);
+    expect(raw.permissions.allow).not.toContain('Bash');
+    expect(raw.permissions.allow).not.toContain('Write');
+    expect(raw.permissions.allow).not.toContain('Edit');
+    expect(raw.permissions.allow).not.toContain('MultiEdit');
+    expect(raw.permissions.allow).toContain('Read');
+  });
+
+  it('builds narrow add-dir args from cwd and explicit attachment parent dirs', () => {
+    expect(PtyClaudeRunner.buildArgs({
+      settingsPath: '/tmp/settings.json',
+      permissionMode: 'bypass',
+      addDirs: ['/repo', '/repo/inbox', '/repo/inbox'],
+    })).toEqual([
+      '--settings',
+      '/tmp/settings.json',
+      '--dangerously-skip-permissions',
+      '--add-dir',
+      '/repo',
+      '--add-dir',
+      '/repo/inbox',
+    ]);
   });
 });
