@@ -25,6 +25,23 @@ describe('GeminiSessionScanner', () => {
     return dir;
   }
 
+  async function writeGeminiSession(
+    geminiDir: string,
+    projectDir: string,
+    sessionId: string,
+    prompt: string,
+  ): Promise<void> {
+    await mkdir(join(geminiDir, 'tmp', projectDir, 'chats'), { recursive: true });
+    await writeFile(
+      join(geminiDir, 'tmp', projectDir, 'chats', `session-${sessionId}.jsonl`),
+      [
+        JSON.stringify({ sessionId }),
+        JSON.stringify({ type: 'user', content: prompt }),
+      ].join('\n') + '\n',
+      'utf8',
+    );
+  }
+
   it('handles a 10MB session file by reading only bounded head and tail windows', async () => {
     const geminiDir = await makeGeminiDir();
     const sessionPath = join(geminiDir, 'tmp', 'project-1', 'chats', 'session-big.jsonl');
@@ -73,5 +90,47 @@ describe('GeminiSessionScanner', () => {
       cwd: '/Users/test/huge-project',
       title: 'Prompt from capped registry test',
     });
+  });
+
+  it('filters sessions to the resolved matching cwd when cwdFilter is set', async () => {
+    const geminiDir = mkdtempSync(join(tmpdir(), 'cli2im-gemini-'));
+    const ownProject = mkdtempSync(join(tmpdir(), 'cli2im-gemini-own-'));
+    const otherProject = mkdtempSync(join(tmpdir(), 'cli2im-gemini-other-'));
+    dirs.push(geminiDir, ownProject, otherProject);
+    await writeFile(
+      join(geminiDir, 'projects.json'),
+      JSON.stringify({
+        projects: {
+          [ownProject]: 'project-own',
+          [otherProject]: 'project-other',
+        },
+      }),
+      'utf8',
+    );
+    await writeGeminiSession(geminiDir, 'project-own', 'own', 'Own prompt');
+    await writeGeminiSession(geminiDir, 'project-other', 'other', 'Other prompt');
+
+    const scanner = new GeminiSessionScanner(geminiDir);
+
+    await expect(scanner.scan({ limit: 10 })).resolves.toHaveLength(2);
+    await expect(scanner.scan({ limit: 10, cwdFilter: ownProject })).resolves.toMatchObject([
+      {
+        sessionId: 'own',
+        cwd: ownProject,
+        title: 'Own prompt',
+      },
+    ]);
+  });
+
+  it('returns no sessions when cwdFilter cannot be resolved', async () => {
+    const geminiDir = await makeGeminiDir();
+    await writeGeminiSession(geminiDir, 'project-1', 'unresolved-filter', 'Prompt');
+
+    const sessions = await new GeminiSessionScanner(geminiDir).scan({
+      limit: 10,
+      cwdFilter: join(geminiDir, 'does-not-exist'),
+    });
+
+    expect(sessions).toEqual([]);
   });
 });

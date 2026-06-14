@@ -401,6 +401,44 @@ describe('ClaudePtyVirtualProcess', () => {
     expect(secondRunner.writes.join('')).toContain('next');
   });
 
+  it('clears pre-injection Stop markers when a turn begins', async () => {
+    const deps = makeDeps();
+    const proc = new ClaudePtyVirtualProcess('claude', {
+      workingDirectory: process.cwd(),
+      permissionMode: 'bypass',
+    }, undefined, deps);
+    const events = collectEvents(proc);
+
+    try {
+      await vi.waitFor(() => expect(events).toContainEqual({ type: 'status', sessionId: 'sess_1' }));
+      deps.stopCallbacks[0]({
+        hook_event_name: 'Stop',
+        session_id: 'sess_1',
+        transcript_path: '/tmp/transcript-1.jsonl',
+        turnSeq: 1,
+      });
+
+      const internals = proc as unknown as {
+        runtime: {
+          session: {
+            options: {
+              beginTurn?: () => void;
+            };
+          };
+        };
+        stopQueue: {
+          shift: () => StopMarker | undefined;
+        };
+      };
+
+      internals.runtime.session.options.beginTurn?.();
+
+      expect(internals.stopQueue.shift()).toBeUndefined();
+    } finally {
+      proc.kill();
+    }
+  });
+
   it('uses the outer deadline path even when elapsed fallback would fire first', async () => {
     let now = 0;
     const nowSpy = vi.spyOn(Date, 'now').mockImplementation(() => now);

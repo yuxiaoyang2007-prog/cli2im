@@ -374,7 +374,13 @@ export class ClaudePtyVirtualProcess implements AgentProcess {
       const session = new InteractiveClaudeSession({
         injector,
         turnTimeoutMs: this.turnTimeoutMs,
-        beginTurn: () => this.currentController?.beginTurn(),
+        beginTurn: () => {
+          // Drop stale/ghost Stop markers queued before this turn's message is injected
+          // (else the next turn consumes them -> off-by-one shift). Markers present before
+          // injection cannot belong to the message we are about to send.
+          this.stopQueue.clear();
+          this.currentController?.beginTurn();
+        },
         waitForTurn: (input) => this.waitForPtyTurn(input?.onEvents),
         onTurnDeadline: () => this.handleTurnDeadline(),
         onDispose: async () => {

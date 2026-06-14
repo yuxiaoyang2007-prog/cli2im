@@ -1,4 +1,5 @@
-import { readdir, stat } from 'node:fs/promises';
+import { readdir, realpath, stat } from 'node:fs/promises';
+import { homedir } from 'node:os';
 import { join } from 'node:path';
 import type { CLISession, CLISessionStatus } from './cli-scanner.js';
 import { readCappedTextFile, readHeadTailWindow } from './file-window.js';
@@ -19,8 +20,13 @@ const DEFAULT_LIMIT = 15;
 export class GeminiSessionScanner {
   constructor(private readonly geminiDir: string) {}
 
-  async scan(opts: { limit?: number } = {}): Promise<CLISession[]> {
+  async scan(opts: { limit?: number; cwdFilter?: string } = {}): Promise<CLISession[]> {
     const limit = opts.limit ?? DEFAULT_LIMIT;
+    const cwdFilterRealpath = opts.cwdFilter
+      ? await resolveComparablePath(opts.cwdFilter)
+      : undefined;
+    if (opts.cwdFilter && !cwdFilterRealpath) return [];
+
     const tmpDir = join(this.geminiDir, 'tmp');
 
     const pathMap = await this.loadProjectRegistry();
@@ -46,6 +52,10 @@ export class GeminiSessionScanner {
       }
 
       const cwd = pathMap.get(projectDir) ?? projectDir;
+      if (cwdFilterRealpath) {
+        const cwdRealpath = await resolveComparablePath(cwd);
+        if (cwdRealpath !== cwdFilterRealpath) return;
+      }
 
       await Promise.all(files.map(async (file) => {
         const filePath = join(chatsDir, file);
@@ -142,4 +152,19 @@ export class GeminiSessionScanner {
     }
     return '';
   }
+}
+
+async function resolveComparablePath(path: string): Promise<string | undefined> {
+  if (!path) return undefined;
+  try {
+    return await realpath(expandHome(path));
+  } catch {
+    return undefined;
+  }
+}
+
+function expandHome(path: string): string {
+  if (path === '~') return homedir();
+  if (path.startsWith('~/')) return join(homedir(), path.slice(2));
+  return path;
 }

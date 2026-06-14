@@ -70,6 +70,36 @@ describe('/sessions command scanner selection', () => {
     await runCommand('sessions', [], codexDeps);
     expect(scannerMocks.codexScan).toHaveBeenLastCalledWith();
   });
+
+  it('treats agy default /sessions as Gemini scoped to the bot workdir', async () => {
+    const deps = commandDeps({
+      botConfig: botConfig({
+        agent: 'agy',
+        workingDirectory: '/Users/test/agy-bot',
+      }),
+    });
+
+    await runCommand('sessions', [], deps);
+
+    expect(scannerMocks.geminiScan).toHaveBeenCalledWith({ cwdFilter: '/Users/test/agy-bot' });
+    expect(scannerMocks.cliScan).not.toHaveBeenCalled();
+    expect(scannerMocks.codexScan).not.toHaveBeenCalled();
+  });
+
+  it('keeps explicit Gemini /sessions requests unfiltered', async () => {
+    const deps = commandDeps({
+      botConfig: botConfig({
+        agent: 'agy',
+        workingDirectory: '/Users/test/agy-bot',
+      }),
+    });
+
+    await runCommand('sessions', ['gemini'], deps);
+
+    expect(scannerMocks.geminiScan).toHaveBeenCalledWith();
+    expect(scannerMocks.cliScan).not.toHaveBeenCalled();
+    expect(scannerMocks.codexScan).not.toHaveBeenCalled();
+  });
 });
 
 async function runCommand(

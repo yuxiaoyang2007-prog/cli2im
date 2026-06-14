@@ -776,11 +776,16 @@ export async function handleBridgeCommand(
         break;
       }
 
-      const useGemini = sub === 'gemini' || (!sub && botConfig.agent === 'gemini');
+      const useOwnGemini = !sub && (botConfig.agent === 'gemini' || botConfig.agent === 'agy');
+      const useGemini = sub === 'gemini' || useOwnGemini;
       const useCodex = sub === 'codex' || (!sub && botConfig.agent === 'codex');
       const agentLabel = useGemini ? 'Gemini' : useCodex ? 'Codex' : 'Claude Code';
       const sessions = useGemini
-        ? await new GeminiSessionScanner(join(homedir(), '.gemini')).scan()
+        ? useOwnGemini
+          ? await new GeminiSessionScanner(join(homedir(), '.gemini')).scan({
+              cwdFilter: botConfig.workingDirectory,
+            })
+          : await new GeminiSessionScanner(join(homedir(), '.gemini')).scan()
         : useCodex
           ? await new CodexSessionScanner(join(homedir(), '.codex')).scan()
           : botConfig.agent === 'claude-code-pty'
@@ -935,7 +940,6 @@ export interface ResolveBotSpawnOptsInput {
 export type BotSpawnOptsResolver = (params: ResolveBotSpawnOptsInput) => Promise<SpawnOpts>;
 
 export async function resolveBotSpawnOpts(params: ResolveBotSpawnOptsInput): Promise<SpawnOpts> {
-  const workingDirectory = await resolveStrictDirectory(params.workingDirectory);
   // Sandbox only applies to the claude-code-pty agent (it confines THAT claude child).
   // Other agents (codex/agy) must never get a box root computed: their workdir may be
   // home (e.g. codexbot at /Users/<user>), which assertSafeBoxRoot rejects — that would
@@ -943,6 +947,13 @@ export async function resolveBotSpawnOpts(params: ResolveBotSpawnOptsInput): Pro
   const sandbox = params.botConfig.agent === 'claude-code-pty'
     ? (params.botConfig.sandbox ?? 'workdir')
     : 'off';
+  // Only the sandbox path needs a strictly-validated (realpath'd, existing) box root.
+  // Non-sandbox bots keep the legacy lenient behavior (expandHome only) so a missing or
+  // non-realpath workdir does not break them — matches pre-sandbox behavior for codex/agy
+  // (and for claude-code-pty when sandbox is explicitly off).
+  const workingDirectory = sandbox === 'workdir'
+    ? await resolveStrictDirectory(params.workingDirectory)
+    : expandHome(params.workingDirectory);
   const addDirs = params.addDirs?.length
     ? await Promise.all(params.addDirs.map((dir) => resolveStrictDirectory(dir)))
     : undefined;
