@@ -5,13 +5,12 @@ import { basename, extname, join } from 'node:path';
 import type { FileAttachment, InboundMessage, PlatformAdapter, UserMessage } from './types.js';
 import { formatAttachmentMetadataFields } from './security/attachment-metadata.js';
 import { assertWithinAttachmentDownloadLimit } from './security/download-limits.js';
-
-const DEFAULT_MEDIA_DIR = join(homedir(), '.cli2im', 'media');
+import { getCli2imDataDir } from './util/data-dir.js';
 
 export async function downloadInboundAttachments(
   msg: InboundMessage,
   adapter: Pick<PlatformAdapter, 'downloadFile'>,
-  targetDir = DEFAULT_MEDIA_DIR,
+  targetDir = join(getCli2imDataDir(), 'media'),
 ): Promise<void> {
   if (!msg.attachments?.length || !adapter.downloadFile) return;
 

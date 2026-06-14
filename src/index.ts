@@ -61,6 +61,7 @@ import {
   commitVoiceSessionWhenContextReady,
   clearSessionScopedBuffers,
 } from './runtime/session-scoped-cleanup.js';
+import { getCli2imDataDir } from './util/data-dir.js';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -83,7 +84,7 @@ async function main(): Promise<void> {
     initContentGuard({ blockThreshold: config.contentGuard?.blockThreshold });
   }
 
-  const dataDir = join(homedir(), '.cli2im');
+  const dataDir = getCli2imDataDir();
   const mediaDir = join(dataDir, 'media');
   mkdirSync(dataDir, { recursive: true });
   mkdirSync(mediaDir, { recursive: true });
