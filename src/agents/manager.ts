@@ -157,14 +157,19 @@ export class AgentManager {
     }
   }
 
-  sendMessage(sessionKey: SessionKey, agentName: string, msg: UserMessage): void {
+  sendMessage(sessionKey: SessionKey, agentName: string, msg: UserMessage): boolean {
     const ctx = this.getProcessContext(sessionKey);
     const plugin = this.plugins.get(agentName);
-    if (!ctx || !plugin) return;
-    if (ctx.signal.aborted) return;
+    if (!ctx || !plugin) return false;
+    if (ctx.signal.aborted) return false;
 
     const formatted = plugin.formatStdinMessage(msg);
-    ctx.proc.stdin.write(formatted);
+    try {
+      ctx.proc.stdin.write(formatted);
+    } catch {
+      return false;
+    }
+    return true;
   }
 
   approvePermission(sessionKey: SessionKey, requestId: string): boolean {

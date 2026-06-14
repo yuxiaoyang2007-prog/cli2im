@@ -648,6 +648,104 @@ describe('AgentManager', () => {
     expect(replacementWrite).toHaveBeenCalledWith(expect.stringContaining('after handoff'));
   });
 
+  it('returns true after writing to stdin even when Writable.write reports backpressure', async () => {
+    const plugin = createMockPlugin();
+    manager.registerPlugin(plugin);
+    const sessionKey = 'feishu:chat_1:ccbot' as const;
+
+    const proc = await manager.spawnAgent(
+      sessionKey,
+      'mock-agent',
+      {
+        workingDirectory: '/Users/test/project',
+        permissionMode: 'blacklist',
+      },
+      {
+        onEvent: vi.fn(),
+        onToolBlocked: vi.fn(),
+        onPermissionTimeout: vi.fn(),
+        onProcessExit: vi.fn(),
+      },
+    );
+    const write = vi.spyOn(proc.stdin, 'write').mockImplementation(() => false);
+
+    const delivered = manager.sendMessage(sessionKey, 'mock-agent', {
+      role: 'user',
+      content: 'backpressure is not failure',
+    });
+
+    expect(delivered).toBe(true);
+    expect(write).toHaveBeenCalledWith(expect.stringContaining('backpressure is not failure'));
+  });
+
+  it('returns false when no active process context can receive the message', () => {
+    const plugin = createMockPlugin();
+    manager.registerPlugin(plugin);
+
+    expect(manager.sendMessage('feishu:chat_1:ccbot', 'mock-agent', {
+      role: 'user',
+      content: 'lost',
+    })).toBe(false);
+  });
+
+  it('returns false instead of writing to an aborted process context', async () => {
+    const plugin = createMockPlugin();
+    manager.registerPlugin(plugin);
+    const sessionKey = 'feishu:chat_1:ccbot' as const;
+
+    const proc = await manager.spawnAgent(
+      sessionKey,
+      'mock-agent',
+      {
+        workingDirectory: '/Users/test/project',
+        permissionMode: 'blacklist',
+      },
+      {
+        onEvent: vi.fn(),
+        onToolBlocked: vi.fn(),
+        onPermissionTimeout: vi.fn(),
+        onProcessExit: vi.fn(),
+      },
+    );
+    manager.cancelAgent(sessionKey);
+    const write = vi.spyOn(proc.stdin, 'write');
+
+    expect(manager.sendMessage(sessionKey, 'mock-agent', {
+      role: 'user',
+      content: 'aborted',
+    })).toBe(false);
+    expect(write).not.toHaveBeenCalledWith(expect.stringContaining('aborted'));
+  });
+
+  it('returns false when stdin.write throws', async () => {
+    const plugin = createMockPlugin();
+    manager.registerPlugin(plugin);
+    const sessionKey = 'feishu:chat_1:ccbot' as const;
+
+    const proc = await manager.spawnAgent(
+      sessionKey,
+      'mock-agent',
+      {
+        workingDirectory: '/Users/test/project',
+        permissionMode: 'blacklist',
+      },
+      {
+        onEvent: vi.fn(),
+        onToolBlocked: vi.fn(),
+        onPermissionTimeout: vi.fn(),
+        onProcessExit: vi.fn(),
+      },
+    );
+    vi.spyOn(proc.stdin, 'write').mockImplementation(() => {
+      throw new Error('stdin closed');
+    });
+
+    expect(manager.sendMessage(sessionKey, 'mock-agent', {
+      role: 'user',
+      content: 'throws',
+    })).toBe(false);
+  });
+
   it('does not let a stale process exit clear a replacement process', async () => {
     const plugin = createMockPlugin();
     manager.registerPlugin(plugin);

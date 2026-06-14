@@ -1,5 +1,9 @@
 import { describe, expect, it, vi } from 'vitest';
 import {
+  createCallbackHandler,
+  sendAgentMessageOrNotify,
+} from '../src/index.js';
+import {
   handlePermissionCallback,
   isCallbackAuthorized,
   parseSessionResumeCallback,
@@ -26,6 +30,131 @@ describe('parsePermissionCallbackData', () => {
     expect(parsePermissionCallbackData('noop')).toBeNull();
     expect(parsePermissionCallbackData('{"action":"noop"}')).toBeNull();
     expect(parsePermissionCallbackData('perm:maybe:req_3')).toBeNull();
+  });
+});
+
+describe('createCallbackHandler', () => {
+  it('serializes session resume callbacks through the chat queue', async () => {
+    const queue = {
+      enqueue: vi.fn(() => Promise.resolve()),
+    };
+    const handleSessionResume = vi.fn(() => Promise.resolve());
+    const adapter = adapterStub();
+    const deps = callbackDeps({ queue, adapter, handleSessionResume });
+    const handler = createCallbackHandler(deps);
+    const callback: CallbackQuery = {
+      platform: 'feishu',
+      chatId: 'chat_1',
+      userId: 'ou_allowed',
+      chatType: 'p2p',
+      data: JSON.stringify({
+        action: 'resume_cli',
+        sessionId: 'session_1',
+        cwd: '/Users/test/project',
+      }),
+      messageId: 'msg_1',
+    };
+
+    handler(callback);
+
+    expect(queue.enqueue).toHaveBeenCalledTimes(1);
+    expect(queue.enqueue).toHaveBeenCalledWith('chat_1', expect.any(Function));
+    expect(handleSessionResume).not.toHaveBeenCalled();
+
+    const task = (queue.enqueue as any).mock.calls[0][1] as () => Promise<void>;
+    await task();
+
+    expect(handleSessionResume).toHaveBeenCalledWith(expect.objectContaining({
+      callback,
+      resume: {
+        action: 'resume_cli',
+        sessionId: 'session_1',
+        cwd: '/Users/test/project',
+      },
+      botName: 'ccbot',
+      botConfig: deps.botConfig,
+      adapter,
+    }));
+  });
+
+  it('handles permission callbacks directly without queueing', () => {
+    const queue = {
+      enqueue: vi.fn(() => Promise.resolve()),
+    };
+    const handleSessionResume = vi.fn(() => Promise.resolve());
+    const agentManager = {
+      approvePermission: vi.fn(),
+      denyPermission: vi.fn().mockReturnValue(true),
+    };
+    const handler = createCallbackHandler(callbackDeps({
+      queue,
+      agentManager,
+      handleSessionResume,
+    }));
+
+    handler({
+      platform: 'feishu',
+      chatId: 'chat_1',
+      userId: 'ou_allowed',
+      chatType: 'p2p',
+      data: 'perm:deny:req_1',
+      messageId: 'msg_1',
+    });
+
+    expect(agentManager.denyPermission).toHaveBeenCalledWith('feishu:chat_1:ccbot', 'req_1');
+    expect(queue.enqueue).not.toHaveBeenCalled();
+    expect(handleSessionResume).not.toHaveBeenCalled();
+  });
+});
+
+describe('sendAgentMessageOrNotify', () => {
+  it('does not notify when the agent message is delivered', async () => {
+    const adapter = adapterStub();
+    const agentManager = {
+      sendMessage: vi.fn().mockReturnValue(true),
+    };
+
+    await sendAgentMessageOrNotify({
+      agentManager,
+      adapter,
+      chatId: 'chat_1',
+      sessionKey: 'feishu:chat_1:ccbot',
+      agentName: 'claude-code',
+      message: { role: 'user', content: 'hello' },
+    });
+
+    expect(agentManager.sendMessage).toHaveBeenCalledWith(
+      'feishu:chat_1:ccbot',
+      'claude-code',
+      { role: 'user', content: 'hello' },
+    );
+    expect(adapter.send).not.toHaveBeenCalled();
+  });
+
+  it('warns and asks the user to resend when delivery fails', async () => {
+    const adapter = adapterStub();
+    const agentManager = {
+      sendMessage: vi.fn().mockReturnValue(false),
+    };
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    try {
+      await sendAgentMessageOrNotify({
+        agentManager,
+        adapter,
+        chatId: 'chat_1',
+        sessionKey: 'feishu:chat_1:ccbot',
+        agentName: 'claude-code',
+        message: { role: 'user', content: 'hello' },
+      });
+
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining('message not delivered'));
+      expect(adapter.send).toHaveBeenCalledWith('chat_1', {
+        text: '消息未送达（会话正在切换或重启），请重发',
+      });
+    } finally {
+      warn.mockRestore();
+    }
   });
 });
 
@@ -257,4 +386,32 @@ function botConfig(overrides: Partial<BotConfig> = {}): BotConfig {
     permissionMode: 'blacklist',
     ...overrides,
   };
+}
+
+function callbackDeps(overrides: Record<string, unknown> = {}) {
+  return {
+    botName: 'ccbot',
+    botConfig: botConfig(),
+    adapter: adapterStub(),
+    store: {},
+    agentManager: {
+      approvePermission: vi.fn(),
+      denyPermission: vi.fn().mockReturnValue(true),
+    },
+    handoffService: {},
+    queue: {
+      enqueue: vi.fn(() => Promise.resolve()),
+    },
+    cardController: undefined,
+    tgStreamController: undefined,
+    handleSessionResume: vi.fn(() => Promise.resolve()),
+    ...overrides,
+  } as any;
+}
+
+function adapterStub() {
+  return {
+    name: 'feishu',
+    send: vi.fn(() => Promise.resolve('msg_1')),
+  } as any;
 }

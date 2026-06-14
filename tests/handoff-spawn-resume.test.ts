@@ -3,7 +3,7 @@ import { join } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
 import { createHandoffSpawnResume, startAgentProcessForSession } from '../src/index.js';
 import type { AgentManagerEvents } from '../src/agents/manager.js';
-import type { AgentPlugin, AgentProcess, Session, SessionKey } from '../src/types.js';
+import type { AgentPlugin, AgentProcess, BotConfig, Session, SessionKey } from '../src/types.js';
 
 describe('handoff spawnResume store sync', () => {
   it('updates an existing row after resume succeeds', async () => {
@@ -51,6 +51,75 @@ describe('handoff spawnResume store sync', () => {
     expect(store.updateAgentSessionId).toHaveBeenCalledWith('row_created', 'agent_session_2');
     expect(store.updateState).toHaveBeenCalledWith('row_created', 'active');
     expect(store.touch).toHaveBeenCalledWith('row_created');
+  });
+
+  it('applies PTY bot idle watchdog and configured permission mode when resuming claude-code-pty', async () => {
+    const sessionKey = 'feishu:chat:with:colon:ptybot' as SessionKey;
+    const existingSession = sessionRow('row_pty', sessionKey);
+    const getBotConfig = vi.fn(() => botConfig({
+      agent: 'claude-code-pty',
+      permissionMode: 'bypass',
+      idleTimeoutMs: 30_000,
+    }));
+    const { spawnResume, agentManager } = createDeps(existingSession, getBotConfig);
+
+    await spawnResume(sessionKey, 'claude-code-pty', 'agent_session_pty', '~/project-pty');
+
+    expect(getBotConfig).toHaveBeenCalledWith('ptybot');
+    expect(agentManager.resumeAgent).toHaveBeenCalledWith(
+      sessionKey,
+      'claude-code-pty',
+      'agent_session_pty',
+      {
+        workingDirectory: '~/project-pty',
+        permissionMode: 'bypass',
+        turnTimeoutMs: undefined,
+        idleTimeoutMs: 600_000,
+      },
+      expect.any(Object),
+    );
+  });
+
+  it('keeps legacy opts for non-PTY handoff resumes', async () => {
+    const sessionKey = 'feishu:chat_1:codexbot' as SessionKey;
+    const existingSession = sessionRow('row_codex', sessionKey);
+    const getBotConfig = vi.fn(() => botConfig({
+      agent: 'claude-code-pty',
+      permissionMode: 'bypass',
+      idleTimeoutMs: 30_000,
+    }));
+    const { spawnResume, agentManager } = createDeps(existingSession, getBotConfig);
+
+    await spawnResume(sessionKey, 'codex', 'agent_session_codex', '~/project-codex');
+
+    expect(agentManager.resumeAgent).toHaveBeenCalledWith(
+      sessionKey,
+      'codex',
+      'agent_session_codex',
+      { workingDirectory: '~/project-codex', permissionMode: 'blacklist' },
+      expect.any(Object),
+    );
+  });
+
+  it('keeps legacy opts when HTTP requests claude-code-pty for a non-PTY bot', async () => {
+    const sessionKey = 'feishu:chat_1:codexbot' as SessionKey;
+    const existingSession = sessionRow('row_http', sessionKey);
+    const getBotConfig = vi.fn(() => botConfig({
+      agent: 'codex',
+      permissionMode: 'bypass',
+      idleTimeoutMs: 30_000,
+    }));
+    const { spawnResume, agentManager } = createDeps(existingSession, getBotConfig);
+
+    await spawnResume(sessionKey, 'claude-code-pty', 'agent_session_http', '~/project-http');
+
+    expect(agentManager.resumeAgent).toHaveBeenCalledWith(
+      sessionKey,
+      'claude-code-pty',
+      'agent_session_http',
+      { workingDirectory: '~/project-http', permissionMode: 'blacklist' },
+      expect.any(Object),
+    );
   });
 });
 
@@ -110,7 +179,7 @@ describe('startAgentProcessForSession session resume id selection', () => {
   });
 });
 
-function createDeps(session: Session) {
+function createDeps(session: Session, getBotConfig?: (botName: string) => BotConfig | undefined) {
   const agentManager = {
     resumeAgent: vi.fn(async () => ({ pid: 123 }) as AgentProcess),
   };
@@ -129,7 +198,7 @@ function createDeps(session: Session) {
     agentManager,
     store,
     createEventHandlers,
-    spawnResume: createHandoffSpawnResume(agentManager, store, createEventHandlers),
+    spawnResume: createHandoffSpawnResume(agentManager, store, createEventHandlers, getBotConfig),
   };
 }
 
@@ -161,5 +230,17 @@ function sessionRow(id: string, key: SessionKey): Session {
     state: 'active',
     createdAt: 0,
     lastActiveAt: 0,
+  };
+}
+
+function botConfig(overrides: Partial<BotConfig> = {}): BotConfig {
+  return {
+    agent: 'codex',
+    platform: 'feishu',
+    feishu: { appId: 'cli_abc', appSecret: 'secret' },
+    workingDirectory: '/Users/test/project',
+    allowFrom: ['ou_allowed'],
+    permissionMode: 'blacklist',
+    ...overrides,
   };
 }

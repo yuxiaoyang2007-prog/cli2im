@@ -52,6 +52,7 @@ import type {
   PlatformAdapter,
   BotConfig,
   SpawnOpts,
+  UserMessage,
 } from './types.js';
 import { RelayManager } from './relay/manager.js';
 import { scrubLog } from './security/logging.js';
@@ -170,7 +171,12 @@ async function main(): Promise<void> {
   const pipeline = new InboundPipeline(config);
 
   const handoffService = new HandoffService({
-    spawnResume: createHandoffSpawnResume(agentManager, store, createEventHandlers),
+    spawnResume: createHandoffSpawnResume(
+      agentManager,
+      store,
+      createEventHandlers,
+      (botName) => config.bots[botName],
+    ),
     getSession: async (sessionKey) => store.getByKey(sessionKey),
     updateState: async (id, state) => store.updateState(id, state),
   });
@@ -251,47 +257,17 @@ async function main(): Promise<void> {
       });
     });
 
-    adapter.onCallback?.((callback) => {
-      const permission = parsePermissionCallbackData(callback.data);
-      if (permission) {
-        if (!isCallbackAuthorized(callback, botConfig)) {
-          void adapter.send(callback.chatId, { text: 'Unauthorized callback user' });
-          return;
-        }
-
-        const accepted = handlePermissionCallback(callback, agentManager, botConfig, botName);
-        if (accepted) return;
-      }
-
-      const resume = parseSessionResumeCallback(callback.data);
-      if (resume) {
-        if (!isCallbackAuthorized(callback, botConfig)) {
-          void adapter.send(callback.chatId, { text: 'Unauthorized callback user' });
-          return;
-        }
-
-        void handleCLISessionResume({
-          callback,
-          resume,
-          botName,
-          botConfig,
-          adapter,
-          store,
-          agentManager,
-          handoffService,
-          cardController: cardControllers.get(botName),
-          tgStreamController: telegramStreams.get(botName),
-        }).catch((err) => {
-          console.error('[pipeline] CLI session resume failed:', scrubLog(err));
-          void adapter.send(callback.chatId, {
-            text: `Resume failed: ${err instanceof Error ? err.message : String(err)}`,
-          });
-        });
-        return;
-      }
-
-      console.log(`[pipeline] Ignored callback: ${scrubLog(callback.data)}`);
-    });
+    adapter.onCallback?.(createCallbackHandler({
+      botName,
+      botConfig,
+      adapter,
+      store,
+      agentManager,
+      handoffService,
+      queue,
+      cardController: cardControllers.get(botName),
+      tgStreamController: telegramStreams.get(botName),
+    }));
   }
 
   function createMessageProcessor(
@@ -474,7 +450,14 @@ async function main(): Promise<void> {
           getContextSignal: (key) => agentManager.getContextSignal(key),
         });
       }
-      agentManager.sendMessage(sessionKey, botConfig.agent, userMessage);
+      await sendAgentMessageOrNotify({
+        agentManager,
+        adapter,
+        chatId: msg.chatId,
+        sessionKey,
+        agentName: botConfig.agent,
+        message: userMessage,
+      });
     };
   }
 
@@ -794,6 +777,96 @@ export async function handleBridgeCommand(
   }
 }
 
+export function createCallbackHandler(params: {
+  botName: string;
+  botConfig: BotConfig;
+  adapter: PlatformAdapter;
+  store: Parameters<typeof handleCLISessionResume>[0]['store'];
+  agentManager: Parameters<typeof handleCLISessionResume>[0]['agentManager']
+    & Pick<AgentManager, 'approvePermission' | 'denyPermission'>;
+  handoffService: Parameters<typeof handleCLISessionResume>[0]['handoffService'];
+  queue: Pick<ChatQueue, 'enqueue'>;
+  cardController?: StreamingCardController;
+  tgStreamController?: TelegramStreamController;
+  handleSessionResume?: typeof handleCLISessionResume;
+}): (callback: import('./types.js').CallbackQuery) => void {
+  const {
+    botName,
+    botConfig,
+    adapter,
+    store,
+    agentManager,
+    handoffService,
+    queue,
+    cardController,
+    tgStreamController,
+    handleSessionResume = handleCLISessionResume,
+  } = params;
+
+  return (callback) => {
+    const permission = parsePermissionCallbackData(callback.data);
+    if (permission) {
+      if (!isCallbackAuthorized(callback, botConfig)) {
+        void adapter.send(callback.chatId, { text: 'Unauthorized callback user' });
+        return;
+      }
+
+      const accepted = handlePermissionCallback(callback, agentManager, botConfig, botName);
+      if (accepted) return;
+    }
+
+    const resume = parseSessionResumeCallback(callback.data);
+    if (resume) {
+      if (!isCallbackAuthorized(callback, botConfig)) {
+        void adapter.send(callback.chatId, { text: 'Unauthorized callback user' });
+        return;
+      }
+
+      void queue.enqueue(callback.chatId, () =>
+        handleSessionResume({
+          callback,
+          resume,
+          botName,
+          botConfig,
+          adapter,
+          store,
+          agentManager,
+          handoffService,
+          cardController,
+          tgStreamController,
+        })
+      ).catch((err) => {
+        console.error('[pipeline] CLI session resume failed:', scrubLog(err));
+        void adapter.send(callback.chatId, {
+          text: `Resume failed: ${err instanceof Error ? err.message : String(err)}`,
+        });
+      });
+      return;
+    }
+
+    console.log(`[pipeline] Ignored callback: ${scrubLog(callback.data)}`);
+  };
+}
+
+export async function sendAgentMessageOrNotify(params: {
+  agentManager: Pick<AgentManager, 'sendMessage'>;
+  adapter: PlatformAdapter;
+  chatId: string;
+  sessionKey: SessionKey;
+  agentName: string;
+  message: UserMessage;
+}): Promise<boolean> {
+  const { agentManager, adapter, chatId, sessionKey, agentName, message } = params;
+  const delivered = agentManager.sendMessage(sessionKey, agentName, message);
+  if (delivered) return true;
+
+  console.warn(
+    `[pipeline] message not delivered (session switching/restarting): session=${scrubLog(sessionKey)} agent=${scrubLog(agentName)}`,
+  );
+  await adapter.send(chatId, { text: '消息未送达（会话正在切换或重启），请重发' });
+  return false;
+}
+
 export function createHandoffSpawnResume(
   agentManager: Pick<AgentManager, 'resumeAgent'>,
   store: Pick<
@@ -801,6 +874,7 @@ export function createHandoffSpawnResume(
     'getOrCreate' | 'updateWorkingDirectory' | 'updateAgentSessionId' | 'updateState' | 'touch'
   >,
   createEventHandlers: (sessionKey: SessionKey) => AgentManagerEvents,
+  getBotConfig?: (botName: string) => BotConfig | undefined,
 ): (
   sessionKey: SessionKey,
   agentName: string,
@@ -809,14 +883,24 @@ export function createHandoffSpawnResume(
 ) => Promise<{ pid: number; sessionId: string }> {
   return async (sessionKey, agentName, sessionId, workDir) => {
     const handlers = createEventHandlers(sessionKey);
+    const botName = getSessionBotName(sessionKey);
+    const botConfig = botName ? getBotConfig?.(botName) : undefined;
+    const spawnOpts: SpawnOpts = agentName === 'claude-code-pty' && botConfig?.agent === 'claude-code-pty'
+      ? {
+          workingDirectory: workDir,
+          permissionMode: botConfig.permissionMode,
+          turnTimeoutMs: undefined,
+          idleTimeoutMs: Math.max(botConfig.idleTimeoutMs ?? 600_000, 600_000),
+        }
+      : {
+          workingDirectory: workDir,
+          permissionMode: 'blacklist',
+        };
     const proc = await agentManager.resumeAgent(
       sessionKey,
       agentName,
       sessionId,
-      {
-        workingDirectory: workDir,
-        permissionMode: 'blacklist',
-      },
+      spawnOpts,
       handlers,
     );
     const normalizedWorkDir = expandHome(workDir);
@@ -868,6 +952,11 @@ function formatDateTime(value: number): string {
 function getAdapterBotOpenId(adapter: PlatformAdapter): string | undefined {
   const candidate = adapter as PlatformAdapter & { getBotOpenId?: () => string | undefined };
   return candidate.getBotOpenId?.();
+}
+
+function getSessionBotName(sessionKey: SessionKey): string | undefined {
+  const parts = sessionKey.split(':');
+  return parts[parts.length - 1];
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
