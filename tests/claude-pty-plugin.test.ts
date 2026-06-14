@@ -8,12 +8,14 @@ class FakeRunner {
   pid = 4242;
   currentState: 'starting' | 'ready' | 'busy' | 'exited' = 'ready';
   writes: string[] = [];
+  writeTimes: number[] = [];
   spawn = vi.fn(async () => {});
   kill = vi.fn(() => {});
   private events = new EventEmitter();
 
   write(data: string): void {
     this.writes.push(data);
+    this.writeTimes.push(Date.now());
   }
 
   onData(cb: (chunk: string) => void): () => void {
@@ -24,6 +26,10 @@ class FakeRunner {
   onExit(cb: (event: { exitCode: number; signal?: number }) => void): () => void {
     this.events.on('exit', cb);
     return () => this.events.off('exit', cb);
+  }
+
+  emitData(chunk: string): void {
+    this.events.emit('data', chunk);
   }
 }
 
@@ -171,6 +177,41 @@ describe('ClaudePtyVirtualProcess', () => {
     await vi.waitFor(() => expect(exit).toHaveBeenCalledWith(null));
     expect(events).toEqual([]);
     expect(proc.sessionId).toBe('');
+  });
+
+  it('accepts the bypass permissions init menu with separated keypresses once', async () => {
+    const runner = new FakeRunner();
+    const deps = makeDeps({ runners: [runner] });
+    deps.waitForStatuslinePayload = async () => {
+      await vi.waitFor(() => {
+        expect(runner.writes).toEqual(['\x1b[B', '\r']);
+      });
+      return { sessionId: 'sess_1', transcriptPath: '/tmp/transcript-1.jsonl' };
+    };
+    const proc = new ClaudePtyVirtualProcess('claude', {
+      workingDirectory: process.cwd(),
+      permissionMode: 'bypass',
+    }, undefined, deps);
+    const events = collectEvents(proc);
+
+    await vi.waitFor(() => expect(runner.spawn).toHaveBeenCalled());
+    runner.emitData([
+      'WARNING: Claude Code running in Bypass Permissions mode',
+      '❯ 1. No, exit',
+      '  2. Yes, I accept',
+      'Enter to confirm · Esc to cancel',
+    ].join('\n'));
+    runner.emitData([
+      'WARNING: Claude Code running in Bypass Permissions mode',
+      '❯ 1. No, exit',
+      '  2. Yes, I accept',
+      'Enter to confirm · Esc to cancel',
+    ].join('\n'));
+
+    await vi.waitFor(() => expect(events).toContainEqual({ type: 'status', sessionId: 'sess_1' }));
+    expect(runner.writes).toEqual(['\x1b[B', '\r']);
+    expect(runner.writeTimes[1] - runner.writeTimes[0]).toBeGreaterThanOrEqual(250);
+    proc.kill();
   });
 
   it('disposes a timed out runtime and rebuilds before the next message', async () => {

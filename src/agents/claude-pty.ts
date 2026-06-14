@@ -16,6 +16,7 @@ import { InputInjector, type InputWriteTarget } from './pty/InputInjector.js';
 import { InteractiveClaudeSession } from './pty/InteractiveClaudeSession.js';
 import { JsonlTailer } from './pty/JsonlTailer.js';
 import { PtyClaudeRunner, type PtySpawnInput, type PtyState } from './pty/PtyClaudeRunner.js';
+import { PtyScreenRenderer } from './pty/screen.js';
 import {
   SettingsInjector,
   type BuiltSettings,
@@ -276,7 +277,10 @@ export class ClaudePtyVirtualProcess implements AgentProcess {
       this.state = 'terminated';
       this.emitExit(event.exitCode ?? null);
     });
-    const disposeRunnerData = runner.onData(() => {});
+    const initScreen = new PtyScreenRenderer();
+    const disposeRunnerData = runner.onData((chunk) => {
+      void initScreen.write(chunk);
+    });
 
     await runner.spawn({
       settingsPath: settings.settingsPath,
@@ -285,7 +289,13 @@ export class ClaudePtyVirtualProcess implements AgentProcess {
       permissionMode: this.opts.permissionMode,
     });
 
-    const payload = await this.deps.waitForStatuslinePayload(settings.rawPayloadFile);
+    const stopInitMenuWatcher = this.watchInitMenus(initScreen, runner);
+    let payload: StatuslinePayload;
+    try {
+      payload = await this.deps.waitForStatuslinePayload(settings.rawPayloadFile);
+    } finally {
+      stopInitMenuWatcher();
+    }
     if (!payload.sessionId) {
       throw new Error('Claude PTY did not report a session id');
     }
@@ -449,6 +459,36 @@ export class ClaudePtyVirtualProcess implements AgentProcess {
 
   private currentTranscriptPath(): string | undefined {
     return undefined;
+  }
+
+  private watchInitMenus(screen: PtyScreenRenderer, runner: PtyRunnerLike): () => void {
+    let disposed = false;
+    let bypassAccepted = false;
+
+    const poll = async (): Promise<void> => {
+      if (disposed) return;
+      const rendered = (await screen.renderedText()).toLowerCase();
+      if (
+        !bypassAccepted
+        && rendered.includes('bypass permissions mode')
+        && rendered.includes('yes, i accept')
+      ) {
+        bypassAccepted = true;
+        await Promise.resolve(runner.write('\x1b[B'));
+        await sleep(300);
+        if (!disposed) await Promise.resolve(runner.write('\r'));
+      }
+    };
+
+    const timer = setInterval(() => {
+      void poll().catch(() => undefined);
+    }, this.pollIntervalMs);
+    void poll().catch(() => undefined);
+
+    return () => {
+      disposed = true;
+      clearInterval(timer);
+    };
   }
 
   private failInit(err: unknown): void {
