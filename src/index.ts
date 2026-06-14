@@ -948,12 +948,13 @@ export async function resolveBotSpawnOpts(params: ResolveBotSpawnOptsInput): Pro
     : undefined;
 
   let sandboxBoxRoots: string[] | undefined;
+  let sandboxOtherProtectedRoots: string[] | undefined;
   if (sandbox === 'workdir') {
+    const homeDir = await realpath(homedir());
     sandboxBoxRoots = uniquePaths([
       workingDirectory,
       ...await Promise.all((params.sandboxExtraRoots ?? []).map((dir) => resolveStrictDirectory(dir))),
     ]);
-    const homeDir = await realpath(homedir());
     for (const root of sandboxBoxRoots) {
       assertSafeBoxRoot(root, homeDir);
     }
@@ -962,10 +963,17 @@ export async function resolveBotSpawnOpts(params: ResolveBotSpawnOptsInput): Pro
         throw new Error(`Sandbox add-dir outside box roots: ${addDir}`);
       }
     }
+    // Cross-bot protected roots (other bots' workdirs). Drop any that would deny THIS bot's
+    // own workspace — an ancestor-or-equal of a box root — or that are overly broad
+    // (home/ancestors, or outside the user home trees). A sibling non-PTY bot can have a
+    // home/broad workdir (e.g. codex running in ~); denying that whole tree would break this
+    // PTY bot instead of isolating the sibling. Secrets stay covered by the deny-read list.
+    sandboxOtherProtectedRoots = (await resolveExistingDirectories(params.otherProtectedRoots ?? []))
+      .filter((root) =>
+        !sandboxBoxRoots!.some((box) => isPathWithinAnyRoot(box, [root]))
+        && !isPathWithinAnyRoot(homeDir, [root])
+        && (root.startsWith('/Users/') || root.startsWith('/home/')));
   }
-  const sandboxOtherProtectedRoots = sandbox === 'workdir'
-    ? await resolveExistingDirectories(params.otherProtectedRoots ?? [])
-    : undefined;
 
   return {
     workingDirectory,

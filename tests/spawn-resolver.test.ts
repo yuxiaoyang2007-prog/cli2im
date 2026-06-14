@@ -124,6 +124,25 @@ describe('resolveBotSpawnOpts', () => {
     expect(opts.sandboxBoxRoots).toBeUndefined();
   });
 
+  it('drops broad/ancestor other-protected roots so a sibling bot at home cannot deny the PTY bot', async () => {
+    // Regression: collectOtherProtectedRoots gathers every other bot's workdir. A sibling
+    // codex/agy bot running in home would otherwise put ~ into a PTY bot's protected roots,
+    // making the profile deny the whole home tree -> the PTY bot can't access its own workdir.
+    const projectReal = await realpath(process.cwd());
+    const narrowReal = await realpath(join(projectReal, 'tests'));
+    const homeReal = await realpath(homedir());
+    const opts = await resolveBotSpawnOpts({
+      botConfig: botConfig(),
+      workingDirectory: projectReal,
+      otherProtectedRoots: [homedir(), '/tmp', join(projectReal, 'tests')],
+    });
+    const protectedRoots = opts.sandboxOtherProtectedRoots ?? [];
+    expect(protectedRoots).not.toContain(homeReal);  // broad/ancestor dropped
+    expect(protectedRoots).not.toContain('/tmp');     // outside user home trees dropped
+    expect(protectedRoots).toContain(narrowReal);     // safe narrow root kept
+    expect(opts.sandboxBoxRoots).toEqual([projectReal]);
+  });
+
   it('accepts a normal project directory under home as a box root', async () => {
     const projectReal = await realpath(process.cwd());
 
