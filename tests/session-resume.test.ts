@@ -6,15 +6,25 @@ import type { BotConfig, CallbackQuery, SessionKey } from '../src/types.js';
 const validatorMock = vi.hoisted(() => ({
   validateWorkingDirectory: vi.fn(),
 }));
+const cliScannerMock = vi.hoisted(() => ({
+  scan: vi.fn(),
+}));
 
 vi.mock('../src/security/validators.js', () => ({
   validateWorkingDirectory: validatorMock.validateWorkingDirectory,
+}));
+vi.mock('../src/session/cli-scanner.js', () => ({
+  CLISessionScanner: vi.fn(() => ({
+    scan: cliScannerMock.scan,
+  })),
 }));
 
 describe('handleCLISessionResume', () => {
   beforeEach(() => {
     validatorMock.validateWorkingDirectory.mockReset();
     validatorMock.validateWorkingDirectory.mockImplementation(async (path: string) => path.startsWith('/Users/'));
+    cliScannerMock.scan.mockReset();
+    cliScannerMock.scan.mockResolvedValue([]);
   });
 
   it('claims the resume lock before validating callback cwd', async () => {
@@ -215,19 +225,148 @@ describe('handleCLISessionResume', () => {
     expect(store.getOrCreate).toHaveBeenCalledTimes(1);
     expect(store.updateState).toHaveBeenCalledWith('session_row_1', 'active');
   });
+
+  it('rejects claude-code-pty callback resume when callback cwd is outside the bot working directory', async () => {
+    validatorMock.validateWorkingDirectory.mockResolvedValue(true);
+    const store = storeDeps();
+    const handoffService = handoffDeps({ success: true });
+    const adapter = { send: vi.fn().mockResolvedValue('msg_1') };
+
+    await handleCLISessionResume({
+      callback: callback(),
+      resume: { sessionId: 'session_123', cwd: process.cwd() },
+      botName: 'ccbot',
+      botConfig: botConfig({
+        agent: 'claude-code-pty',
+        workingDirectory: '/tmp/cli2im-different-project',
+      }),
+      adapter,
+      store,
+      agentManager: { cancelAgent: vi.fn() },
+      handoffService,
+      cardController: undefined,
+      tgStreamController: undefined,
+    });
+
+    expect(adapter.send).toHaveBeenCalledWith('chat_1', {
+      text: expect.stringContaining('Resume failed'),
+    });
+    expect(adapter.send.mock.calls[0][1].text).toContain('outside this bot working directory');
+    expect(handoffService.acceptHandoff).not.toHaveBeenCalled();
+    expect(store.getOrCreate).not.toHaveBeenCalled();
+  });
+
+  it('allows claude-code-pty callback resume when callback cwd realpath matches the bot working directory', async () => {
+    validatorMock.validateWorkingDirectory.mockResolvedValue(true);
+    const store = storeDeps();
+    const handoffService = handoffDeps({ success: true });
+    const adapter = { send: vi.fn().mockResolvedValue('msg_1') };
+
+    await handleCLISessionResume({
+      callback: callback(),
+      resume: { sessionId: 'session_123', cwd: process.cwd() },
+      botName: 'ccbot',
+      botConfig: botConfig({
+        agent: 'claude-code-pty',
+        workingDirectory: process.cwd(),
+      }),
+      adapter,
+      store,
+      agentManager: { cancelAgent: vi.fn() },
+      handoffService,
+      cardController: undefined,
+      tgStreamController: undefined,
+    });
+
+    expect(handoffService.acceptHandoff).toHaveBeenCalledWith(expect.objectContaining({
+      workDir: process.cwd(),
+      agentName: 'claude-code-pty',
+    }), { lockAlreadyAcquired: true });
+    expect(adapter.send).toHaveBeenCalledWith('chat_1', {
+      text: expect.stringContaining('**已接管会话**'),
+    });
+  });
+
+  it('rejects claude-code-pty no-cwd resume when scanner has no match instead of falling back to homedir', async () => {
+    validatorMock.validateWorkingDirectory.mockResolvedValue(true);
+    cliScannerMock.scan.mockResolvedValueOnce([]);
+    const store = storeDeps();
+    const handoffService = handoffDeps({ success: true });
+    const adapter = { send: vi.fn().mockResolvedValue('msg_1') };
+
+    await handleCLISessionResume({
+      callback: callback({ platform: 'telegram' }),
+      resume: { sessionId: 'missing_session', cwd: '' },
+      botName: 'ccbot',
+      botConfig: botConfig({
+        agent: 'claude-code-pty',
+        workingDirectory: process.cwd(),
+      }),
+      adapter,
+      store,
+      agentManager: { cancelAgent: vi.fn() },
+      handoffService,
+      cardController: undefined,
+      tgStreamController: undefined,
+    });
+
+    expect(cliScannerMock.scan).toHaveBeenCalled();
+    expect(adapter.send).toHaveBeenCalledWith('chat_1', {
+      text: expect.stringContaining('Resume failed'),
+    });
+    expect(adapter.send.mock.calls[0][1].text).toContain('could not resolve cwd');
+    expect(handoffService.acceptHandoff).not.toHaveBeenCalled();
+  });
+
+  it('rejects claude-code-pty no-cwd resume when the scanned cwd cannot be realpathed', async () => {
+    validatorMock.validateWorkingDirectory.mockResolvedValue(true);
+    cliScannerMock.scan.mockResolvedValueOnce([{
+      sessionId: 'session_123',
+      cwd: '/tmp/cli2im-deleted-cwd',
+      title: 'Deleted',
+      lastModified: Date.now(),
+      status: 'historical',
+    }]);
+    const store = storeDeps();
+    const handoffService = handoffDeps({ success: true });
+    const adapter = { send: vi.fn().mockResolvedValue('msg_1') };
+
+    await handleCLISessionResume({
+      callback: callback({ platform: 'telegram' }),
+      resume: { sessionId: 'session_123', cwd: '' },
+      botName: 'ccbot',
+      botConfig: botConfig({
+        agent: 'claude-code-pty',
+        workingDirectory: process.cwd(),
+      }),
+      adapter,
+      store,
+      agentManager: { cancelAgent: vi.fn() },
+      handoffService,
+      cardController: undefined,
+      tgStreamController: undefined,
+    });
+
+    expect(adapter.send).toHaveBeenCalledWith('chat_1', {
+      text: expect.stringContaining('Resume failed'),
+    });
+    expect(adapter.send.mock.calls[0][1].text).toContain('outside this bot working directory');
+    expect(handoffService.acceptHandoff).not.toHaveBeenCalled();
+  });
 });
 
-function callback(): CallbackQuery {
+function callback(overrides: Partial<CallbackQuery> = {}): CallbackQuery {
   return {
     platform: 'feishu',
     chatId: 'chat_1',
     userId: 'ou_allowed',
     data: 'resume:session_123',
     messageId: 'msg_1',
+    ...overrides,
   };
 }
 
-function botConfig(): BotConfig {
+function botConfig(overrides: Partial<BotConfig> = {}): BotConfig {
   return {
     agent: 'claude-code',
     platform: 'feishu',
@@ -235,6 +374,7 @@ function botConfig(): BotConfig {
     workingDirectory: '/Users/test/project',
     allowFrom: ['ou_allowed'],
     permissionMode: 'blacklist',
+    ...overrides,
   };
 }
 

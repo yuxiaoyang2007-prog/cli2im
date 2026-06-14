@@ -1,3 +1,4 @@
+import { realpath } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { CLISessionScanner } from '../session/cli-scanner.js';
@@ -47,9 +48,27 @@ export async function handleCLISessionResume(params: {
         : botConfig.agent === 'codex'
           ? new CodexSessionScanner(join(homedir(), '.codex'))
           : new CLISessionScanner(join(homedir(), '.claude'));
-      const sessions = await scanner.scan();
+      const sessions = botConfig.agent === 'claude-code-pty'
+        ? await scanner.scan({ cwdFilter: botConfig.workingDirectory })
+        : await scanner.scan();
       const match = sessions.find((s) => s.sessionId === resume.sessionId);
+      if (!match?.cwd && botConfig.agent === 'claude-code-pty') {
+        await adapter.send(callback.chatId, {
+          text: `Resume failed: could not resolve cwd for session \`${resume.sessionId}\``,
+        });
+        return;
+      }
       workDir = match?.cwd || homedir();
+    }
+
+    if (botConfig.agent === 'claude-code-pty') {
+      const allowed = await cwdMatchesBotWorkingDirectory(workDir, botConfig.workingDirectory);
+      if (!allowed) {
+        await adapter.send(callback.chatId, {
+          text: `Resume failed: session cwd is outside this bot working directory \`${botConfig.workingDirectory}\``,
+        });
+        return;
+      }
     }
 
     if (!(await validateWorkingDirectory(workDir))) {
@@ -95,4 +114,27 @@ export async function handleCLISessionResume(params: {
   } finally {
     handoffService.releaseLock(sessionKey);
   }
+}
+
+async function cwdMatchesBotWorkingDirectory(cwd: string, workingDirectory: string): Promise<boolean> {
+  const [cwdRealpath, workingDirectoryRealpath] = await Promise.all([
+    resolveComparablePath(cwd),
+    resolveComparablePath(workingDirectory),
+  ]);
+  return !!cwdRealpath && cwdRealpath === workingDirectoryRealpath;
+}
+
+async function resolveComparablePath(path: string): Promise<string | undefined> {
+  if (!path) return undefined;
+  try {
+    return await realpath(expandHome(path));
+  } catch {
+    return undefined;
+  }
+}
+
+function expandHome(path: string): string {
+  if (path === '~') return homedir();
+  if (path.startsWith('~/')) return join(homedir(), path.slice(2));
+  return path;
 }

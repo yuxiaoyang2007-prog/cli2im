@@ -751,7 +751,11 @@ export async function handleBridgeCommand(
         ? await new GeminiSessionScanner(join(homedir(), '.gemini')).scan()
         : useCodex
           ? await new CodexSessionScanner(join(homedir(), '.codex')).scan()
-          : await new CLISessionScanner(join(homedir(), '.claude')).scan();
+          : botConfig.agent === 'claude-code-pty'
+            ? await new CLISessionScanner(join(homedir(), '.claude')).scan({
+                cwdFilter: botConfig.workingDirectory,
+              })
+            : await new CLISessionScanner(join(homedir(), '.claude')).scan();
 
       if (sessions.length === 0) {
         await adapter.send(chatId, { text: `没有找到 ${agentLabel} CLI 会话` });

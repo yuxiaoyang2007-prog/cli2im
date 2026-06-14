@@ -1,4 +1,4 @@
-import { mkdir, rm, stat, utimes, writeFile } from 'node:fs/promises';
+import { mkdir, rm, stat, symlink, utimes, writeFile } from 'node:fs/promises';
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -180,5 +180,36 @@ describe('CLISessionScanner', () => {
       title: 'Huge Active Session',
       status: 'idle',
     });
+  });
+
+  it('filters sessions by cwd before applying the limit and compares realpaths', async () => {
+    const claudeDir = await makeClaudeDir();
+    const projectDir = join(claudeDir, 'projects', 'test-project');
+    const wantedReal = mkdtempSync(join(tmpdir(), 'cli2im-wanted-real-'));
+    const wantedLink = join(tmpdir(), `cli2im-wanted-link-${Date.now()}`);
+    const otherDir = mkdtempSync(join(tmpdir(), 'cli2im-other-'));
+    dirs.push(wantedReal, wantedLink, otherDir);
+    await symlink(wantedReal, wantedLink);
+    const baseTime = Date.now() / 1000;
+
+    const otherPath = join(projectDir, 'session-other.jsonl');
+    await writeJsonl(otherPath, [
+      { type: 'user', message: { content: 'new but wrong cwd' }, cwd: otherDir },
+    ]);
+    await utimes(otherPath, baseTime + 3, baseTime + 3);
+
+    const wantedPath = join(projectDir, 'session-wanted.jsonl');
+    await writeJsonl(wantedPath, [
+      { type: 'user', message: { content: 'older but matching cwd' }, cwd: wantedReal },
+    ]);
+    await utimes(wantedPath, baseTime + 2, baseTime + 2);
+
+    const sessions = await new CLISessionScanner(claudeDir).scan({
+      limit: 1,
+      cwdFilter: wantedLink,
+    });
+
+    expect(sessions.map((s) => s.sessionId)).toEqual(['session-wanted']);
+    expect(sessions[0].cwd).toBe(wantedReal);
   });
 });

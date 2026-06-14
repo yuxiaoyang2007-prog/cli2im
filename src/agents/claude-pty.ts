@@ -1,6 +1,7 @@
 import { EventEmitter } from 'node:events';
 import { existsSync } from 'node:fs';
 import { mkdir } from 'node:fs/promises';
+import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { PassThrough, Transform, Writable } from 'node:stream';
 import type {
@@ -335,6 +336,8 @@ export class ClaudePtyVirtualProcess implements AgentProcess {
       let payload: StatuslinePayload;
       try {
         payload = await this.deps.waitForStatuslinePayload(settings.rawPayloadFile);
+      } catch (err) {
+        throw await this.decorateInitTimeoutError(err, initScreen);
       } finally {
         stopInitMenuWatcher();
       }
@@ -517,20 +520,52 @@ export class ClaudePtyVirtualProcess implements AgentProcess {
 
   private watchInitMenus(screen: PtyScreenRenderer, runner: PtyRunnerLike): () => void {
     let disposed = false;
-    let bypassAccepted = false;
+    let polling = false;
+    const handlers: Array<{
+      handled: boolean;
+      match: (rendered: string) => boolean;
+      keys: Array<{ value: string; delayMs?: number }>;
+    }> = [
+      {
+        handled: false,
+        match: (rendered) => (
+          rendered.includes('bypass permissions mode')
+          && rendered.includes('1. no, exit')
+          && rendered.includes('yes, i accept')
+        ),
+        keys: [
+          { value: '\x1b[B' },
+          { value: '\r', delayMs: 300 },
+        ],
+      },
+      {
+        handled: false,
+        match: (rendered) => (
+          rendered.includes('allow external claude.md file imports')
+          && rendered.includes('yes, allow external imports')
+        ),
+        keys: [{ value: '\r' }],
+      },
+    ];
 
     const poll = async (): Promise<void> => {
-      if (disposed) return;
-      const rendered = (await screen.renderedText()).toLowerCase();
-      if (
-        !bypassAccepted
-        && rendered.includes('bypass permissions mode')
-        && rendered.includes('yes, i accept')
-      ) {
-        bypassAccepted = true;
-        await Promise.resolve(runner.write('\x1b[B'));
-        await sleep(300);
-        if (!disposed) await Promise.resolve(runner.write('\r'));
+      if (disposed || polling) return;
+      polling = true;
+      try {
+        const rendered = (await screen.renderedText()).toLowerCase();
+        for (const handler of handlers) {
+          if (disposed) return;
+          if (handler.handled || !handler.match(rendered)) continue;
+          handler.handled = true;
+          for (const key of handler.keys) {
+            if (key.delayMs) await sleep(key.delayMs);
+            if (disposed) return;
+            await Promise.resolve(runner.write(key.value));
+          }
+          return;
+        }
+      } finally {
+        polling = false;
       }
     };
 
@@ -543,6 +578,15 @@ export class ClaudePtyVirtualProcess implements AgentProcess {
       disposed = true;
       clearInterval(timer);
     };
+  }
+
+  private async decorateInitTimeoutError(err: unknown, screen: PtyScreenRenderer): Promise<Error> {
+    if (!isStatuslineTimeoutError(err)) {
+      return err instanceof Error ? err : new Error(String(err));
+    }
+    const screenTail = redactInitScreenTail(await screen.renderedText());
+    const suffix = screenTail ? `\n${screenTail}` : '';
+    return new Error(`Claude 会话启动超时(30s),可能卡在启动确认界面:${suffix}`);
   }
 
   private failInit(err: unknown): void {
@@ -695,10 +739,30 @@ function extractAgentSlashCommand(input: string): string | undefined {
 }
 
 function redactSlashOutput(input: string): string {
-  return input
+  const home = homedir();
+  let output = input
     .replace(/sk-ant-[A-Za-z0-9_-]+/g, '<redacted>')
     .replace(/\b(ANTHROPIC_API_KEY|ANTHROPIC_AUTH_TOKEN)=\S+/g, '$1=<redacted>')
+    .replace(/\b(\w*(?:KEY|TOKEN|SECRET)\w*)=\S+/gi, '$1=<redacted>');
+  if (home) {
+    output = output.replace(new RegExp(escapeRegExp(home), 'g'), '~');
+  }
+  return output
     .trim();
+}
+
+function redactInitScreenTail(input: string): string {
+  const lastLines = input.split('\n').slice(-20).join('\n');
+  return redactSlashOutput(lastLines.length > 2048 ? lastLines.slice(-2048) : lastLines);
+}
+
+function isStatuslineTimeoutError(err: unknown): boolean {
+  const message = err instanceof Error ? err.message : String(err);
+  return message.toLowerCase().includes('timed out waiting for claude pty statusline');
+}
+
+function escapeRegExp(input: string): string {
+  return input.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
 function buildAddDirs(workingDirectory: string, addDirs: string[] = []): string[] {

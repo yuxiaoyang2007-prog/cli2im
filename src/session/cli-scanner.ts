@@ -1,4 +1,5 @@
-import { open, readdir, stat } from 'node:fs/promises';
+import { open, readdir, realpath, stat } from 'node:fs/promises';
+import { homedir } from 'node:os';
 import { basename, join } from 'node:path';
 import { readCappedTextFile } from './file-window.js';
 
@@ -39,8 +40,12 @@ const TAIL_BYTES = 32768;
 export class CLISessionScanner {
   constructor(private readonly claudeDir: string) {}
 
-  async scan(opts: { limit?: number } = {}): Promise<CLISession[]> {
+  async scan(opts: { limit?: number; cwdFilter?: string } = {}): Promise<CLISession[]> {
     const limit = opts.limit ?? DEFAULT_LIMIT;
+    const cwdFilterRealpath = opts.cwdFilter
+      ? await resolveComparablePath(opts.cwdFilter)
+      : undefined;
+    if (opts.cwdFilter && !cwdFilterRealpath) return [];
 
     const [allJnl, activeMap] = await Promise.all([
       this.indexJsonlFiles(),
@@ -67,6 +72,12 @@ export class CLISessionScanner {
       const titleInfo = extractTitle(combined);
       const cwdInfo = extractField(tail, 'cwd');
       const branch = extractField(tail, 'gitBranch');
+      const cwd = active?.cwd ?? cwdInfo ?? '';
+
+      if (cwdFilterRealpath) {
+        const cwdRealpath = await resolveComparablePath(cwd);
+        if (cwdRealpath !== cwdFilterRealpath) continue;
+      }
 
       const title = active?.name
         ?? titleInfo.customTitle
@@ -83,7 +94,7 @@ export class CLISessionScanner {
 
       sessions.push({
         sessionId: jnl.sessionId,
-        cwd: active?.cwd ?? cwdInfo ?? '',
+        cwd,
         title,
         lastModified: jnl.mtimeMs,
         status,
@@ -314,4 +325,19 @@ function isMissingPathError(err: unknown): boolean {
 
 function isNodeError(err: unknown): err is NodeJS.ErrnoException {
   return err instanceof Error && 'code' in err;
+}
+
+async function resolveComparablePath(path: string): Promise<string | undefined> {
+  if (!path) return undefined;
+  try {
+    return await realpath(expandHome(path));
+  } catch {
+    return undefined;
+  }
+}
+
+function expandHome(path: string): string {
+  if (path === '~') return homedir();
+  if (path.startsWith('~/')) return join(homedir(), path.slice(2));
+  return path;
 }

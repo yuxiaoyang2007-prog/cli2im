@@ -246,6 +246,109 @@ describe('ClaudePtyVirtualProcess', () => {
     proc.kill();
   });
 
+  it('auto-allows the external imports init menu with enter once', async () => {
+    const runner = new FakeRunner();
+    const deps = makeDeps({ runners: [runner] });
+    deps.waitForStatuslinePayload = async () => {
+      await vi.waitFor(() => {
+        expect(runner.writes).toEqual(['\r']);
+      });
+      return { sessionId: 'sess_1', transcriptPath: '/tmp/transcript-1.jsonl' };
+    };
+    const proc = new ClaudePtyVirtualProcess('claude', {
+      workingDirectory: process.cwd(),
+      permissionMode: 'bypass',
+    }, undefined, deps);
+    const events = collectEvents(proc);
+
+    await vi.waitFor(() => expect(runner.spawn).toHaveBeenCalled());
+    runner.emitData([
+      'Allow external CLAUDE.md file imports?',
+      '❯ 1. Yes, allow external imports',
+      '  2. No, disable external imports',
+      'Enter to confirm · Esc to cancel',
+    ].join('\n'));
+    runner.emitData([
+      'Allow external CLAUDE.md file imports?',
+      '❯ 1. Yes, allow external imports',
+      '  2. No, disable external imports',
+      'Enter to confirm · Esc to cancel',
+    ].join('\n'));
+
+    await vi.waitFor(() => expect(events).toContainEqual({ type: 'status', sessionId: 'sess_1' }));
+    expect(runner.writes).toEqual(['\r']);
+    proc.kill();
+  });
+
+  it('handles bypass followed by external imports during init', async () => {
+    const runner = new FakeRunner();
+    const deps = makeDeps({ runners: [runner] });
+    deps.waitForStatuslinePayload = async () => {
+      await vi.waitFor(() => {
+        expect(runner.writes).toEqual(['\x1b[B', '\r']);
+      });
+      runner.emitData('\x1b[2J\x1b[H' + [
+        'Allow external CLAUDE.md file imports?',
+        '❯ 1. Yes, allow external imports',
+        '  2. No, disable external imports',
+        'Enter to confirm · Esc to cancel',
+      ].join('\n'));
+      await vi.waitFor(() => {
+        expect(runner.writes).toEqual(['\x1b[B', '\r', '\r']);
+      });
+      return { sessionId: 'sess_1', transcriptPath: '/tmp/transcript-1.jsonl' };
+    };
+    const proc = new ClaudePtyVirtualProcess('claude', {
+      workingDirectory: process.cwd(),
+      permissionMode: 'bypass',
+    }, undefined, deps);
+    const events = collectEvents(proc);
+
+    await vi.waitFor(() => expect(runner.spawn).toHaveBeenCalled());
+    runner.emitData([
+      'WARNING: Claude Code running in Bypass Permissions mode',
+      '❯ 1. No, exit',
+      '  2. Yes, I accept',
+      'Enter to confirm · Esc to cancel',
+    ].join('\n'));
+
+    await vi.waitFor(() => expect(events).toContainEqual({ type: 'status', sessionId: 'sess_1' }));
+    expect(runner.writes).toEqual(['\x1b[B', '\r', '\r']);
+    proc.kill();
+  });
+
+  it('adds a redacted init screen tail when statusline init times out', async () => {
+    const runner = new FakeRunner();
+    const deps = makeDeps({ runners: [runner] });
+    const home = process.env.HOME ?? '/Users/test';
+    deps.waitForStatuslinePayload = async () => {
+      runner.emitData([
+        'Allow external CLAUDE.md file imports?',
+        `${home}/project/CLAUDE.md`,
+        'MY_TOKEN=super-secret-value',
+      ].join('\n'));
+      throw new Error('Timed out waiting for Claude PTY statusline');
+    };
+    const proc = new ClaudePtyVirtualProcess('claude', {
+      workingDirectory: process.cwd(),
+      permissionMode: 'bypass',
+    }, undefined, deps);
+    const events = collectEvents(proc);
+    const exit = vi.fn();
+    proc.on('exit', exit);
+
+    await vi.waitFor(() => expect(exit).toHaveBeenCalledWith(1));
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({ type: 'error' });
+    const message = events[0].type === 'error' ? events[0].message : '';
+    expect(message).toContain('Claude 会话启动超时');
+    expect(message).toContain('Allow external CLAUDE.md file imports?');
+    expect(message).toContain('~/project/CLAUDE.md');
+    expect(message).toContain('MY_TOKEN=<redacted>');
+    expect(message).not.toContain(home);
+    expect(message).not.toContain('super-secret-value');
+  });
+
   it('disposes a timed out runtime and rebuilds before the next message', async () => {
     const firstRunner = new FakeRunner();
     const secondRunner = new FakeRunner();
