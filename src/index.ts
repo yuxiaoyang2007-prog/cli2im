@@ -7,6 +7,7 @@ import { ChatQueue } from './session/queue.js';
 import { AgentManager, type AgentManagerEvents } from './agents/manager.js';
 import { ToolGate } from './agents/tool-gate.js';
 import { ClaudeCodePlugin } from './agents/claude-code.js';
+import { ClaudePtyPlugin } from './agents/claude-pty.js';
 import { CodexPlugin } from './agents/codex.js';
 import { GeminiPlugin } from './agents/gemini.js';
 import { AgyPlugin } from './agents/agy.js';
@@ -131,6 +132,8 @@ async function main(): Promise<void> {
   for (const [name, agentConfig] of Object.entries(config.agents)) {
     if (name === 'claude-code') {
       agentManager.registerPlugin(new ClaudeCodePlugin(agentConfig.binary));
+    } else if (name === 'claude-code-pty') {
+      agentManager.registerPlugin(new ClaudePtyPlugin(agentConfig.binary));
     } else if (name === 'codex') {
       agentManager.registerPlugin(new CodexPlugin(agentConfig.binary));
     } else if (name === 'gemini') {
@@ -428,14 +431,17 @@ async function main(): Promise<void> {
           : {};
         const spawnEnv = { ...config.agents[botConfig.agent]?.env, ...senderEnv, ...larkCliEnv };
 
+        const isPtyAgent = botConfig.agent === 'claude-code-pty';
         const spawnOpts: SpawnOpts = {
           workingDirectory: session.workingDirectory,
           permissionMode: botConfig.permissionMode,
           env: spawnEnv,
           model: config.agents[botConfig.agent]?.defaultModel,
           autoApprove: botConfig.autoApprove,
-          turnTimeoutMs: botConfig.turnTimeoutMs,
-          idleTimeoutMs: botConfig.idleTimeoutMs,
+          turnTimeoutMs: isPtyAgent ? undefined : botConfig.turnTimeoutMs,
+          idleTimeoutMs: isPtyAgent
+            ? Math.max(botConfig.idleTimeoutMs ?? 600_000, 600_000)
+            : botConfig.idleTimeoutMs,
           sandboxMode: botConfig.sandboxMode,
           reasoningEffort: runtimeState.fastModeBySession.get(sessionKey)
             ? 'low'

@@ -15,6 +15,7 @@ export interface PtySpawnInput {
   settingsPath: string;
   resumeSessionId?: string;
   model?: string;
+  permissionMode?: "bypass" | "blacklist";
 }
 
 // Claude Code injects these into any child process it spawns. If the bridge is
@@ -55,6 +56,7 @@ export class PtyClaudeRunner {
     return [
       "--settings",
       input.settingsPath,
+      ...(input.permissionMode === "bypass" ? ["--dangerously-skip-permissions"] : []),
       ...(input.model ? ["--model", input.model] : []),
       ...(input.resumeSessionId ? ["--resume", input.resumeSessionId] : []),
     ];

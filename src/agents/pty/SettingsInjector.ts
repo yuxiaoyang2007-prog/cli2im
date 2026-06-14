@@ -40,6 +40,7 @@ interface SettingsInjectorOptions {
   nodePath?: string;
   resourcesDir?: string;
   permissionsAllow?: string[];
+  permissionsDeny?: string[];
 }
 
 interface WatchOptions {
@@ -51,12 +52,14 @@ export class SettingsInjector {
   private readonly nodePath: string;
   private readonly resourcesDir: string;
   private readonly permissionsAllow: string[];
+  private readonly permissionsDeny: string[];
 
   constructor(options: SettingsInjectorOptions = {}) {
     this.runtimeDir = options.runtimeDir ?? path.join(tmpdir(), "cc-pty-spike");
     this.nodePath = options.nodePath ?? process.execPath;
     this.resourcesDir = options.resourcesDir ?? defaultResourcesDir();
     this.permissionsAllow = options.permissionsAllow ?? DEFAULT_PERMISSIONS_ALLOW;
+    this.permissionsDeny = options.permissionsDeny ?? [];
   }
 
   async build(handle: SettingsBuildInput): Promise<BuiltSettings> {
@@ -77,6 +80,7 @@ export class SettingsInjector {
       permissions: {
         defaultMode: "default",
         allow: [...this.permissionsAllow],
+        ...(this.permissionsDeny.length > 0 ? { deny: [...this.permissionsDeny] } : {}),
       },
       hooks: {
         Stop: [
