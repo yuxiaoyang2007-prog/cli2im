@@ -1002,6 +1002,7 @@ export async function resolveBotSpawnOpts(params: ResolveBotSpawnOptsInput): Pro
     initialPrompt: params.initialPrompt,
     ackWindowMs,
     maxInjectRetries,
+    strictMcp: params.botConfig.strictMcp,
     addDirs,
     sandbox,
     ...(sandboxBoxRoots ? { sandboxBoxRoots } : {}),

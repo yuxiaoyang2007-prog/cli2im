@@ -132,6 +132,19 @@ describe('claude pty transcript layer', () => {
     })).toEqual({ PATH: '/bin' });
   });
 
+  it('strips third-party endpoint/model routing so a polluted parent shell cannot 401 the PTY claude', () => {
+    // If the bridge is launched from inside a Claude Code session pointed at a relay
+    // (e.g. claude-glm → open.bigmodel.cn), the PTY claude must NOT inherit that
+    // endpoint: it has no matching token (auth vars stripped) → 401 storm.
+    expect(sanitizeChildEnv({
+      ANTHROPIC_BASE_URL: 'https://open.bigmodel.cn/api/anthropic',
+      ANTHROPIC_API_URL: 'https://open.bigmodel.cn/api/anthropic',
+      ANTHROPIC_MODEL: 'glm-5.2[1m]',
+      ANTHROPIC_AUTH_TOKEN: 'token',
+      PATH: '/bin',
+    })).toEqual({ PATH: '/bin' });
+  });
+
   it('removes denied tools from blacklist settings allow rules', async () => {
     const runtimeDir = await mkdtemp(join(tmpdir(), 'cli2im-settings-'));
     const settings = await new SettingsInjector({
@@ -148,6 +161,18 @@ describe('claude pty transcript layer', () => {
     expect(raw.permissions.allow).not.toContain('Edit');
     expect(raw.permissions.allow).not.toContain('MultiEdit');
     expect(raw.permissions.allow).toContain('Read');
+  });
+
+  it('adds --strict-mcp-config when strictMcp is set (loads 0 global MCP servers)', () => {
+    expect(PtyClaudeRunner.buildArgs({
+      settingsPath: '/tmp/settings.json',
+      permissionMode: 'bypass',
+      strictMcp: true,
+    })).toContain('--strict-mcp-config');
+    expect(PtyClaudeRunner.buildArgs({
+      settingsPath: '/tmp/settings.json',
+      permissionMode: 'bypass',
+    })).not.toContain('--strict-mcp-config');
   });
 
   it('builds narrow add-dir args from cwd and explicit attachment parent dirs', () => {

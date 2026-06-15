@@ -19,6 +19,7 @@ export interface PtySpawnInput {
   addDirs?: string[];
   sandboxProfilePath?: string;
   tmpDir?: string;
+  strictMcp?: boolean;
 }
 
 // Claude Code injects these into any child process it spawns. If the bridge is
@@ -26,6 +27,13 @@ export interface PtySpawnInput {
 // the PTY `claude` inherits CLAUDECODE / CLAUDE_CODE_* and starts as a NESTED
 // child session — in that mode it does not write the transcript JSONL we tail, so
 // every turn comes back empty. Strip them so it starts as a fresh top-level session.
+//
+// Also strip endpoint/model ROUTING vars (ANTHROPIC_BASE_URL/API_URL/MODEL): if the
+// parent session is pointed at a third-party relay (e.g. claude-glm → open.bigmodel.cn),
+// the PTY claude would inherit that endpoint but NOT the matching token (the auth vars
+// above are stripped), so it sends the Max OAuth token to the relay → 401 storm → the
+// turn never completes → 180s deadline. The PTY claude must reach Anthropic directly
+// over OAuth. (A bot that genuinely needs a custom endpoint must not rely on env leak.)
 export function sanitizeChildEnv(base: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...base };
   for (const key of Object.keys(env)) {
@@ -35,6 +43,9 @@ export function sanitizeChildEnv(base: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
       || key === "CLAUDE_EFFORT"
       || key === "ANTHROPIC_API_KEY"
       || key === "ANTHROPIC_AUTH_TOKEN"
+      || key === "ANTHROPIC_BASE_URL"
+      || key === "ANTHROPIC_API_URL"
+      || key === "ANTHROPIC_MODEL"
       || key.startsWith("CLAUDE_CODE_")
     ) {
       delete env[key];
@@ -67,6 +78,7 @@ export class PtyClaudeRunner {
       "--settings",
       input.settingsPath,
       ...(input.permissionMode === "bypass" ? ["--dangerously-skip-permissions"] : []),
+      ...(input.strictMcp ? ["--strict-mcp-config"] : []),
       ...addDirArgs(input.addDirs ?? []),
       ...(input.model ? ["--model", input.model] : []),
       ...(input.resumeSessionId ? ["--resume", input.resumeSessionId] : []),

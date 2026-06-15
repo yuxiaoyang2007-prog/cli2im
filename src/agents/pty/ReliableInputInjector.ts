@@ -17,6 +17,10 @@ export interface ReliableInputInjectorOptions {
   ackWindowMs?: number;
   maxInjectRetries?: number;
   pollIntervalMs?: number;
+  // Observability hook (handoff §8): emit per-attempt lines so a soak hang is not a black box.
+  // Default logs to console with a [pty-injector] prefix; callers pass a prefixed logger to
+  // disambiguate concurrent runtimes.
+  log?: (message: string) => void;
 }
 
 export interface TranscriptAckPeek {
@@ -37,16 +41,23 @@ export function createReliableInputInjector(options: ReliableInputInjectorOption
     options.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS,
     'pollIntervalMs',
   );
+  const log = options.log ?? ((message: string) => console.log(`[pty-injector] ${message}`));
 
   return {
     clearInput: () => options.injector.clearInput(),
     async send(text: string): Promise<InputResult> {
+      const preview = previewText(text);
       for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
         const injectOffset = await transcriptSize(options.transcriptPath);
         await options.inputReady();
         const injected = await options.injector.send(text);
-        if (!injected.ok) return injected;
+        if (!injected.ok) {
+          log(`attempt ${attempt}/${maxAttempts} offset=${injectOffset} inject FAILED: ${injected.error ?? 'unknown'}`);
+          return injected;
+        }
+        log(`attempt ${attempt}/${maxAttempts} offset=${injectOffset} injected ${injected.bytes}b waiting ack <=${ackWindowMs}ms: "${preview}"`);
 
+        const ackStart = Date.now();
         const ack = await waitForPromptAck({
           transcriptPath: options.transcriptPath,
           injectOffset,
@@ -54,11 +65,24 @@ export function createReliableInputInjector(options: ReliableInputInjectorOption
           ackWindowMs,
           pollIntervalMs,
         });
-        if (ack.matched) return injected;
-        if (ack.humanPromptSeen) break;
-        if (attempt < maxAttempts) await options.injector.clearInput();
+        const waitedMs = Date.now() - ackStart;
+        if (ack.matched) {
+          log(`ack matched in ${waitedMs}ms (attempt ${attempt}/${maxAttempts})`);
+          return injected;
+        }
+        if (ack.humanPromptSeen) {
+          log(`human prompt seen at offset but NO match after ${waitedMs}ms (attempt ${attempt}/${maxAttempts}) — stop, runtime tainted`);
+          break;
+        }
+        if (attempt < maxAttempts) {
+          log(`no ack after ${waitedMs}ms (attempt ${attempt}/${maxAttempts}) — clear input + re-inject`);
+          await options.injector.clearInput();
+        } else {
+          log(`no ack after ${waitedMs}ms (attempt ${attempt}/${maxAttempts}) — attempts exhausted`);
+        }
       }
 
+      log(`ack_exhausted: input never acknowledged after ${maxAttempts} attempt(s) — runtime tainted`);
       return {
         ok: false,
         bytes: 0,
@@ -68,6 +92,10 @@ export function createReliableInputInjector(options: ReliableInputInjectorOption
       };
     },
   };
+}
+
+function previewText(text: string): string {
+  return text.replace(/\s+/g, ' ').trim().slice(0, 80);
 }
 
 function normalizePositiveFiniteInteger(value: number, name: string): number {

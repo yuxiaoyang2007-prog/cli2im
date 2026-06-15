@@ -248,7 +248,8 @@ export class ClaudePtyVirtualProcess implements AgentProcess {
       this.sessionId = decision.sessionId;
     }
     if (decision?.taintedRuntime) {
-      this.quarantineRuntimeForResume(runtime);
+      console.log(`[pty-turn] ack_exhausted/tainted — emit error then quarantine (session=${this.sessionId || '?'}, reason=${decision.reason ?? '?'})`);
+      this.quarantineRuntimeForResume(runtime, decision.reason ?? 'tainted');
     }
     if (this.activeCancel === cancel) this.activeCancel = undefined;
 
@@ -347,6 +348,7 @@ export class ClaudePtyVirtualProcess implements AgentProcess {
         addDirs: buildAddDirs(this.opts.workingDirectory, this.opts.addDirs),
         sandboxProfilePath,
         tmpDir: sandboxProfilePath ? tmpDir : undefined,
+        strictMcp: this.opts.strictMcp,
       });
       spawned = true;
 
@@ -379,6 +381,7 @@ export class ClaudePtyVirtualProcess implements AgentProcess {
         (marker) => this.stopQueue.push(marker),
       );
       const injector = new InputInjector(runner as InputWriteTarget);
+      const runtimeTag = handle.slice(-12);
       const reliableInjector = createReliableInputInjector({
         transcriptPath: payload.transcriptPath,
         inputReady: () => this.waitForInputReady(runner),
@@ -386,6 +389,7 @@ export class ClaudePtyVirtualProcess implements AgentProcess {
         ackWindowMs: this.opts.ackWindowMs ?? DEFAULT_ACK_WINDOW_MS,
         maxInjectRetries: this.opts.maxInjectRetries ?? DEFAULT_MAX_INJECT_RETRIES,
         pollIntervalMs: this.pollIntervalMs,
+        log: (message) => console.log(`[pty-injector ${runtimeTag}] ${message}`),
       });
       const session = new InteractiveClaudeSession({
         injector: reliableInjector,
@@ -541,11 +545,12 @@ export class ClaudePtyVirtualProcess implements AgentProcess {
       this.writeEvent(event);
     }
     if (cancel) cancel.cancelled = true;
-    this.quarantineRuntimeForResume();
+    this.quarantineRuntimeForResume(undefined, `turn deadline ${this.turnTimeoutMs}ms`);
     return { ...decision, events: [] };
   }
 
-  private quarantineRuntimeForResume(runtime = this.runtime): void {
+  private quarantineRuntimeForResume(runtime = this.runtime, reason = 'unknown'): void {
+    console.log(`[pty-quarantine] dispose runtime + set degradedNeedsResume (reason=${reason}, session=${this.sessionId || '?'})`);
     this.disposeRuntime('SIGTERM', false, runtime);
     this.state = this.terminated ? 'terminated' : 'degradedNeedsResume';
     this.currentController = undefined;

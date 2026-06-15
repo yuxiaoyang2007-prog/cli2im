@@ -29,6 +29,7 @@ export interface SpawnOpts {
   sandboxOtherProtectedRoots?: string[];
   ackWindowMs?: number;
   maxInjectRetries?: number;
+  strictMcp?: boolean;
 }
 
 export interface AgentProcess {
@@ -255,6 +256,7 @@ export interface BotConfig {
   idleTimeoutMs?: number;
   ackWindowMs?: number;
   maxInjectRetries?: number;
+  strictMcp?: boolean;
   requireMention?: boolean;
   groupPolicy?: 'all' | 'allowlist';
   groupAllowFrom?: string[];
