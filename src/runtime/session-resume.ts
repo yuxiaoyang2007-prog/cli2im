@@ -53,6 +53,11 @@ export async function handleCLISessionResume(params: {
         return;
       }
       workDir = match.cwd;
+    } else if (botConfig.agent === 'agy') {
+      // Antigravity does not persist a per-conversation cwd; it always runs in
+      // the bot's working directory, so resume there rather than scanning the
+      // Gemini CLI store (which holds unrelated sessions).
+      workDir = botConfig.workingDirectory || homedir();
     } else if (!workDir) {
       const scanner = botConfig.agent === 'gemini'
         ? new GeminiSessionScanner(join(homedir(), '.gemini'))

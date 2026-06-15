@@ -3,6 +3,7 @@ import { SessionStore } from './session/store.js';
 import { CLISessionScanner } from './session/cli-scanner.js';
 import { CodexSessionScanner } from './session/codex-scanner.js';
 import { GeminiSessionScanner } from './session/gemini-scanner.js';
+import { AntigravitySessionScanner } from './session/antigravity-scanner.js';
 import { ChatQueue } from './session/queue.js';
 import { AgentManager, type AgentManagerEvents } from './agents/manager.js';
 import { ToolGate } from './agents/tool-gate.js';
@@ -776,23 +777,21 @@ export async function handleBridgeCommand(
         break;
       }
 
-      const useOwnGemini = !sub && (botConfig.agent === 'gemini' || botConfig.agent === 'agy');
-      const useGemini = sub === 'gemini' || useOwnGemini;
+      const useAntigravity = sub === 'antigravity' || sub === 'agy' || (!sub && botConfig.agent === 'agy');
+      const useGemini = sub === 'gemini' || (!sub && botConfig.agent === 'gemini');
       const useCodex = sub === 'codex' || (!sub && botConfig.agent === 'codex');
-      const agentLabel = useGemini ? 'Gemini' : useCodex ? 'Codex' : 'Claude Code';
-      const sessions = useGemini
-        ? useOwnGemini
-          ? await new GeminiSessionScanner(join(homedir(), '.gemini')).scan({
-              cwdFilter: botConfig.workingDirectory,
-            })
-          : await new GeminiSessionScanner(join(homedir(), '.gemini')).scan()
-        : useCodex
-          ? await new CodexSessionScanner(join(homedir(), '.codex')).scan()
-          : botConfig.agent === 'claude-code-pty'
-            ? await new CLISessionScanner(join(homedir(), '.claude')).scan({
-                cwdFilter: botConfig.workingDirectory,
-              })
-            : await new CLISessionScanner(join(homedir(), '.claude')).scan();
+      const agentLabel = useAntigravity ? 'Antigravity' : useGemini ? 'Gemini' : useCodex ? 'Codex' : 'Claude Code';
+      const sessions = useAntigravity
+        ? await new AntigravitySessionScanner(join(homedir(), '.gemini', 'antigravity-cli')).scan()
+        : useGemini
+          ? await new GeminiSessionScanner(join(homedir(), '.gemini')).scan()
+          : useCodex
+            ? await new CodexSessionScanner(join(homedir(), '.codex')).scan()
+            : botConfig.agent === 'claude-code-pty'
+              ? await new CLISessionScanner(join(homedir(), '.claude')).scan({
+                  cwdFilter: botConfig.workingDirectory,
+                })
+              : await new CLISessionScanner(join(homedir(), '.claude')).scan();
 
       if (sessions.length === 0) {
         await adapter.send(chatId, { text: `没有找到 ${agentLabel} CLI 会话` });

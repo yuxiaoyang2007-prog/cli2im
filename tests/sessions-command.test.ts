@@ -6,6 +6,7 @@ const scannerMocks = vi.hoisted(() => ({
   cliScan: vi.fn(),
   codexScan: vi.fn(),
   geminiScan: vi.fn(),
+  antigravityScan: vi.fn(),
 }));
 
 vi.mock('../src/session/cli-scanner.js', () => ({
@@ -23,6 +24,11 @@ vi.mock('../src/session/gemini-scanner.js', () => ({
     scan: scannerMocks.geminiScan,
   })),
 }));
+vi.mock('../src/session/antigravity-scanner.js', () => ({
+  AntigravitySessionScanner: vi.fn(() => ({
+    scan: scannerMocks.antigravityScan,
+  })),
+}));
 
 const sessionKey = 'telegram:chat_1:ccbot' as SessionKey;
 
@@ -31,9 +37,11 @@ describe('/sessions command scanner selection', () => {
     scannerMocks.cliScan.mockReset();
     scannerMocks.codexScan.mockReset();
     scannerMocks.geminiScan.mockReset();
+    scannerMocks.antigravityScan.mockReset();
     scannerMocks.cliScan.mockResolvedValue([session('claude-session')]);
     scannerMocks.codexScan.mockResolvedValue([session('codex-session')]);
     scannerMocks.geminiScan.mockResolvedValue([session('gemini-session')]);
+    scannerMocks.antigravityScan.mockResolvedValue([session('antigravity-session')]);
   });
 
   it('passes cwdFilter only for the claude-code-pty bot default /sessions path', async () => {
@@ -71,7 +79,7 @@ describe('/sessions command scanner selection', () => {
     expect(scannerMocks.codexScan).toHaveBeenLastCalledWith();
   });
 
-  it('treats agy default /sessions as Gemini scoped to the bot workdir', async () => {
+  it('treats agy default /sessions as Antigravity, not Gemini', async () => {
     const deps = commandDeps({
       botConfig: botConfig({
         agent: 'agy',
@@ -81,12 +89,13 @@ describe('/sessions command scanner selection', () => {
 
     await runCommand('sessions', [], deps);
 
-    expect(scannerMocks.geminiScan).toHaveBeenCalledWith({ cwdFilter: '/Users/test/agy-bot' });
+    expect(scannerMocks.antigravityScan).toHaveBeenCalledWith();
+    expect(scannerMocks.geminiScan).not.toHaveBeenCalled();
     expect(scannerMocks.cliScan).not.toHaveBeenCalled();
     expect(scannerMocks.codexScan).not.toHaveBeenCalled();
   });
 
-  it('keeps explicit Gemini /sessions requests unfiltered', async () => {
+  it('keeps explicit Gemini /sessions requests on the Gemini scanner', async () => {
     const deps = commandDeps({
       botConfig: botConfig({
         agent: 'agy',
@@ -97,6 +106,7 @@ describe('/sessions command scanner selection', () => {
     await runCommand('sessions', ['gemini'], deps);
 
     expect(scannerMocks.geminiScan).toHaveBeenCalledWith();
+    expect(scannerMocks.antigravityScan).not.toHaveBeenCalled();
     expect(scannerMocks.cliScan).not.toHaveBeenCalled();
     expect(scannerMocks.codexScan).not.toHaveBeenCalled();
   });
