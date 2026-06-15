@@ -439,6 +439,35 @@ describe('ClaudePtyVirtualProcess', () => {
     }
   });
 
+  it('waits for the PTY to become ready before injecting a queued turn', async () => {
+    vi.useFakeTimers();
+    const runner = new FakeRunner();
+    runner.currentState = 'busy';
+    const deps = makeDeps({ runners: [runner] });
+    const proc = new ClaudePtyVirtualProcess('claude', {
+      workingDirectory: process.cwd(),
+      permissionMode: 'bypass',
+    }, undefined, deps, { pollIntervalMs: 10 });
+    const events = collectEvents(proc);
+
+    try {
+      await vi.waitFor(() => expect(events).toContainEqual({ type: 'status', sessionId: 'sess_1' }));
+
+      proc.stdin.write(userPayload('wait for prompt'));
+      await vi.advanceTimersByTimeAsync(50);
+
+      expect(runner.writes.join('')).not.toContain('wait for prompt');
+
+      runner.currentState = 'ready';
+      await vi.advanceTimersByTimeAsync(10);
+
+      expect(runner.writes.join('')).toContain('wait for prompt');
+    } finally {
+      proc.kill();
+      vi.useRealTimers();
+    }
+  });
+
   it('uses the outer deadline path even when elapsed fallback would fire first', async () => {
     let now = 0;
     const nowSpy = vi.spyOn(Date, 'now').mockImplementation(() => now);

@@ -38,6 +38,7 @@ const AGENT_SLASH_COMMANDS = [
 const DEFAULT_TURN_TIMEOUT_MS = 180_000;
 const STATUSLINE_TIMEOUT_MS = 30_000;
 const POLL_INTERVAL_MS = 50;
+const INPUT_READY_TIMEOUT_MS = 15_000;
 const BLACKLIST_DENY_TOOLS = ['Bash', 'Write', 'Edit', 'MultiEdit'];
 
 type ProcessState = 'starting' | 'ready' | 'rebuilding' | 'degradedNeedsResume' | 'failed' | 'terminated';
@@ -381,6 +382,7 @@ export class ClaudePtyVirtualProcess implements AgentProcess {
           this.stopQueue.clear();
           this.currentController?.beginTurn();
         },
+        beforeInject: () => this.waitForInputReady(runner),
         waitForTurn: (input) => this.waitForPtyTurn(input?.onEvents),
         onTurnDeadline: () => this.handleTurnDeadline(),
         onDispose: async () => {
@@ -431,6 +433,27 @@ export class ClaudePtyVirtualProcess implements AgentProcess {
   }
 
   private currentController?: TurnController;
+
+  private async waitForInputReady(runner: PtyRunnerLike): Promise<void> {
+    const deadline = Date.now() + Math.min(INPUT_READY_TIMEOUT_MS, this.turnTimeoutMs);
+    for (;;) {
+      if (this.terminated || this.state === 'terminated') {
+        throw new Error('Claude PTY runtime is terminated');
+      }
+      if (runner.currentState === 'exited') {
+        throw new Error('Claude PTY exited before input could be sent');
+      }
+      if (runner.currentState === 'ready') {
+        return;
+      }
+
+      const remainingMs = deadline - Date.now();
+      if (remainingMs <= 0) {
+        throw new Error('Claude PTY did not become ready for input');
+      }
+      await sleep(Math.min(this.pollIntervalMs, remainingMs));
+    }
+  }
 
   private async waitForPtyTurn(onEvents?: (events: AgentEvent[]) => void | Promise<void>): Promise<TurnDecision> {
     const runtime = this.runtime;

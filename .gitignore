@@ -21,3 +21,6 @@ Thumbs.db
 *.swp
 *.swo
 paired-build/
+
+# Diagnostic / repro scratch (not shipped)
+repro-*.ts

@@ -32,6 +32,7 @@ export interface InteractiveClaudeSessionOptions {
   injector: InteractiveInputInjector;
   waitForTurn: (input?: WaitForTurnInput) => Promise<TurnDecision>;
   beginTurn?: () => void;
+  beforeInject?: () => void | Promise<void>;
   onEvent?: (event: AgentEvent) => void | Promise<void>;
   onDecision?: (decision: TurnDecision) => void | Promise<void>;
   onTurnDeadline?: () => TurnDecision | undefined | Promise<TurnDecision | undefined>;
@@ -97,6 +98,7 @@ export class InteractiveClaudeSession {
 
   private async sendNowUnchecked(userText: string, callbacks: InteractiveSessionCallbacks): Promise<TurnDecision> {
     this.options.beginTurn?.();
+    await this.options.beforeInject?.();
     const injected = await this.options.injector.send(userText);
     if (!injected.ok) {
       const decision: TurnDecision = {
