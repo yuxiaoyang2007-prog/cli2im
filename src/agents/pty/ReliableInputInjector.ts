@@ -25,9 +25,18 @@ export interface TranscriptAckPeek {
 }
 
 export function createReliableInputInjector(options: ReliableInputInjectorOptions): ReliableInputTarget {
-  const ackWindowMs = options.ackWindowMs ?? DEFAULT_ACK_WINDOW_MS;
-  const maxAttempts = Math.max(1, Math.floor(options.maxInjectRetries ?? DEFAULT_MAX_INJECT_RETRIES));
-  const pollIntervalMs = Math.max(1, Math.floor(options.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS));
+  const ackWindowMs = normalizePositiveFiniteInteger(
+    options.ackWindowMs ?? DEFAULT_ACK_WINDOW_MS,
+    'ackWindowMs',
+  );
+  const maxAttempts = normalizePositiveFiniteInteger(
+    options.maxInjectRetries ?? DEFAULT_MAX_INJECT_RETRIES,
+    'maxInjectRetries',
+  );
+  const pollIntervalMs = normalizePositiveFiniteInteger(
+    options.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS,
+    'pollIntervalMs',
+  );
 
   return {
     clearInput: () => options.injector.clearInput(),
@@ -59,6 +68,13 @@ export function createReliableInputInjector(options: ReliableInputInjectorOption
       };
     },
   };
+}
+
+function normalizePositiveFiniteInteger(value: number, name: string): number {
+  if (!Number.isFinite(value)) {
+    throw new Error(`${name} must be finite`);
+  }
+  return Math.max(1, Math.floor(value));
 }
 
 export async function peekTranscriptForPromptAck(

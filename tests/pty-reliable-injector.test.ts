@@ -87,6 +87,31 @@ describe('ReliableInputInjector', () => {
     expect(clearInput).not.toHaveBeenCalled();
   });
 
+  it('rejects non-finite ACK tuning values', async () => {
+    const transcript = await tempTranscript('');
+    const baseOptions = {
+      transcriptPath: transcript,
+      inputReady: async () => {},
+      injector: {
+        send: async (): Promise<InputResult> => ({ ok: true, bytes: 1 }),
+        clearInput: async () => {},
+      },
+    };
+
+    expect(() => createReliableInputInjector({
+      ...baseOptions,
+      ackWindowMs: Number.POSITIVE_INFINITY,
+    })).toThrow('ackWindowMs must be finite');
+    expect(() => createReliableInputInjector({
+      ...baseOptions,
+      maxInjectRetries: Number.NaN,
+    })).toThrow('maxInjectRetries must be finite');
+    expect(() => createReliableInputInjector({
+      ...baseOptions,
+      pollIntervalMs: Number.NEGATIVE_INFINITY,
+    })).toThrow('pollIntervalMs must be finite');
+  });
+
   it('rejects tool_result, empty content, empty strings, and nonmatching user text as prompt acks', async () => {
     const transcript = await tempTranscript('');
     await appendJsonl(transcript, { type: 'user', message: { role: 'user', content: [{ type: 'tool_result', content: 'ok' }] } });

@@ -1,7 +1,9 @@
-import { realpath } from 'node:fs/promises';
+import { mkdtemp, realpath, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
+import { loadConfig } from '../src/config/loader.js';
 import { resolveBotSpawnOpts } from '../src/index.js';
 import type { BotConfig } from '../src/types.js';
 
@@ -47,6 +49,64 @@ describe('resolveBotSpawnOpts', () => {
 
     expect(opts.sandbox).toBe('off');
     expect(opts.sandboxBoxRoots).toBeUndefined();
+  });
+
+  it('passes valid ACK tuning into spawn opts and rejects invalid ACK tuning', async () => {
+    const configDir = await mkdtemp(join(tmpdir(), 'cli2im-spawn-resolver-'));
+    const configPath = join(configDir, 'config.yaml');
+    await writeFile(configPath, `
+bots:
+  ccbot:
+    agent: claude-code-pty
+    platform: feishu
+    feishu:
+      appId: cli_abc
+      appSecret: secret
+    workingDirectory: ${process.cwd()}
+    allowFrom: []
+    permissionMode: bypass
+    ackWindowMs: 1500
+    maxInjectRetries: 4
+agents:
+  claude-code-pty:
+    binary: /usr/local/bin/claude
+session:
+  maxActive: 64
+  idleResetMinutes: 120
+  dbPath: ~/.cli2im/cli2im.db
+dangerousPatterns: []
+streaming:
+  intervalMs: 200
+  minDeltaChars: 30
+  highWaterMark: 1048576
+server:
+  port: 3900
+  host: 127.0.0.1
+  token: tok_xyz
+newMessageBehavior: queue
+`);
+    const config = loadConfig(configPath);
+    const opts = await resolveBotSpawnOpts({
+      botConfig: config.bots.ccbot,
+      workingDirectory: config.bots.ccbot.workingDirectory,
+    });
+
+    expect(opts.ackWindowMs).toBe(1_500);
+    expect(opts.maxInjectRetries).toBe(4);
+
+    for (const [field, value] of [
+      ['ackWindowMs', 0],
+      ['ackWindowMs', 1.5],
+      ['ackWindowMs', Number.POSITIVE_INFINITY],
+      ['maxInjectRetries', -1],
+      ['maxInjectRetries', 2.5],
+      ['maxInjectRetries', '3'],
+    ] as const) {
+      await expect(resolveBotSpawnOpts({
+        botConfig: botConfig({ [field]: value } as Partial<BotConfig>),
+        workingDirectory: process.cwd(),
+      })).rejects.toThrow(`Config error: bot ${field} must be a positive integer`);
+    }
   });
 
   it('fails closed when an add-dir resolves outside the sandbox box roots', async () => {

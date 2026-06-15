@@ -940,6 +940,9 @@ export interface ResolveBotSpawnOptsInput {
 export type BotSpawnOptsResolver = (params: ResolveBotSpawnOptsInput) => Promise<SpawnOpts>;
 
 export async function resolveBotSpawnOpts(params: ResolveBotSpawnOptsInput): Promise<SpawnOpts> {
+  const ackWindowMs = optionalPositiveInteger(params.botConfig.ackWindowMs, 'ackWindowMs');
+  const maxInjectRetries = optionalPositiveInteger(params.botConfig.maxInjectRetries, 'maxInjectRetries');
+
   // Sandbox only applies to the claude-code-pty agent (it confines THAT claude child).
   // Other agents (codex/agy) must never get a box root computed: their workdir may be
   // home (e.g. codexbot at /Users/<user>), which assertSafeBoxRoot rejects — that would
@@ -997,11 +1000,21 @@ export async function resolveBotSpawnOpts(params: ResolveBotSpawnOptsInput): Pro
     sandboxMode: params.sandboxMode,
     reasoningEffort: params.reasoningEffort,
     initialPrompt: params.initialPrompt,
+    ackWindowMs,
+    maxInjectRetries,
     addDirs,
     sandbox,
     ...(sandboxBoxRoots ? { sandboxBoxRoots } : {}),
     ...(sandboxOtherProtectedRoots?.length ? { sandboxOtherProtectedRoots } : {}),
   };
+}
+
+function optionalPositiveInteger(value: unknown, field: string): number | undefined {
+  if (value == null) return undefined;
+  if (typeof value !== 'number' || !Number.isFinite(value) || !Number.isInteger(value) || value <= 0) {
+    throw new Error(`Config error: bot ${field} must be a positive integer`);
+  }
+  return value;
 }
 
 async function resolveStrictDirectory(path: string): Promise<string> {
