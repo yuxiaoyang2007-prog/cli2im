@@ -10,6 +10,8 @@ export interface InputResult {
   ok: boolean;
   bytes: number;
   error?: string;
+  reason?: string;
+  taintedRuntime?: boolean;
 }
 
 export class InputInjector {
@@ -40,11 +42,11 @@ export class InputInjector {
     }
   }
 
-  private async clearInput(): Promise<void> {
+  async clearInput(): Promise<void> {
     try {
       await this.target.write(CTRL_U);
     } catch {
-      // The caller receives the original injection failure.
+      // Best-effort: callers use this only to clear stale TUI input.
     }
   }
 }

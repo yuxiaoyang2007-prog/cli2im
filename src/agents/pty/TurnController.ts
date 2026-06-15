@@ -11,6 +11,7 @@ export interface TurnDecision {
   transcriptPath?: string;
   elapsedMs?: number;
   reason?: string;
+  taintedRuntime?: boolean;
 }
 
 export interface TurnControllerOptions {

@@ -1,5 +1,7 @@
 import { EventEmitter } from 'node:events';
+import { appendFileSync, writeFileSync } from 'node:fs';
 import { describe, expect, it, vi } from 'vitest';
+import { BRACKETED_PASTE_END, BRACKETED_PASTE_START } from '../src/agents/pty/InputInjector.js';
 import { ClaudePtyVirtualProcess, type ClaudePtyRuntimeDeps } from '../src/agents/claude-pty.js';
 import type { AgentEvent, UserMessage } from '../src/types.js';
 import type { StopMarker } from '../src/agents/pty/SettingsInjector.js';
@@ -9,6 +11,8 @@ class FakeRunner {
   currentState: 'starting' | 'ready' | 'busy' | 'exited' = 'ready';
   writes: string[] = [];
   writeTimes: number[] = [];
+  ackWrites = true;
+  transcriptPath?: string;
   spawn = vi.fn(async () => {});
   kill = vi.fn((_signal?: string) => {
     this.currentState = 'exited';
@@ -20,6 +24,17 @@ class FakeRunner {
   write(data: string): void {
     this.writes.push(data);
     this.writeTimes.push(Date.now());
+    if (this.ackWrites && this.transcriptPath) {
+      const start = data.indexOf(BRACKETED_PASTE_START);
+      const end = data.indexOf(BRACKETED_PASTE_END);
+      if (start >= 0 && end > start) {
+        const text = data.slice(start + BRACKETED_PASTE_START.length, end);
+        appendFileSync(this.transcriptPath, `${JSON.stringify({
+          type: 'user',
+          message: { role: 'user', content: text },
+        })}\n`);
+      }
+    }
   }
 
   onData(cb: (chunk: string) => void): () => void {
@@ -104,6 +119,9 @@ function makeDeps(options: {
       if (options.statusError) throw options.statusError;
       const next = status.shift();
       if (!next) throw new Error('missing status fixture');
+      writeFileSync(next.transcriptPath, '');
+      const runner = runners[runners.length - 1];
+      if (runner) runner.transcriptPath = next.transcriptPath;
       return next;
     },
     buildSettings: async () => ({
@@ -399,6 +417,63 @@ describe('ClaudePtyVirtualProcess', () => {
 
     await vi.waitFor(() => expect(events.some((event) => event.type === 'text' && event.content === 'after rebuild')).toBe(true));
     expect(secondRunner.writes.join('')).toContain('next');
+  });
+
+  it('emits exactly one ack failure error before quarantining and clean-resuming the next turn', async () => {
+    const firstRunner = new FakeRunner();
+    firstRunner.ackWrites = false;
+    const firstTailer = new FakeTailer();
+    const secondRunner = new FakeRunner();
+    const secondTailer = new FakeTailer();
+    secondTailer.push([
+      {
+        type: 'assistant',
+        session_id: 'sess_1',
+        message: { content: [{ type: 'text', text: 'clean resume answer' }] },
+      },
+    ]);
+    const deps = makeDeps({
+      status: [
+        { sessionId: 'sess_1', transcriptPath: '/tmp/transcript-ack-failure-1.jsonl' },
+        { sessionId: 'sess_1', transcriptPath: '/tmp/transcript-ack-failure-2.jsonl' },
+      ],
+      runners: [firstRunner, secondRunner],
+      tailers: [firstTailer, secondTailer],
+    });
+    const proc = new ClaudePtyVirtualProcess('claude', {
+      workingDirectory: process.cwd(),
+      permissionMode: 'bypass',
+      ackWindowMs: 5,
+      maxInjectRetries: 1,
+    }, 'sess_1', deps, { turnTimeoutMs: 1_000, pollIntervalMs: 1 });
+    const events = collectEvents(proc);
+
+    proc.stdin.write(userPayload('lost prompt'));
+    await vi.waitFor(() => expect(events.filter((event) => event.type === 'error')).toHaveLength(1));
+    expect(events[0]).toEqual({ type: 'error', message: 'Claude PTY input was not acknowledged by transcript' });
+    expect(firstRunner.kill).toHaveBeenCalledWith('SIGTERM');
+
+    firstTailer.push([
+      {
+        type: 'assistant',
+        session_id: 'sess_1',
+        message: { content: [{ type: 'text', text: 'late stale answer' }] },
+      },
+    ]);
+
+    proc.stdin.write(userPayload('next prompt'));
+    await vi.waitFor(() => expect(deps.stopCallbacks.length).toBe(2));
+    deps.stopCallbacks[1]({
+      hook_event_name: 'Stop',
+      session_id: 'sess_1',
+      transcript_path: '/tmp/transcript-ack-failure-2.jsonl',
+      turnSeq: 1,
+    });
+
+    await vi.waitFor(() => expect(events.some((event) => event.type === 'text' && event.content === 'clean resume answer')).toBe(true));
+    expect(events.filter((event) => event.type === 'error')).toHaveLength(1);
+    expect(events).not.toContainEqual({ type: 'text', content: 'late stale answer' });
+    expect(secondRunner.writes.join('')).toContain('next prompt');
   });
 
   it('clears pre-injection Stop markers when a turn begins', async () => {

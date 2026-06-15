@@ -17,6 +17,7 @@ import { InputInjector, type InputWriteTarget } from './pty/InputInjector.js';
 import { InteractiveClaudeSession } from './pty/InteractiveClaudeSession.js';
 import { JsonlTailer } from './pty/JsonlTailer.js';
 import { PtyClaudeRunner, type PtySpawnInput, type PtyState } from './pty/PtyClaudeRunner.js';
+import { createReliableInputInjector } from './pty/ReliableInputInjector.js';
 import {
   buildSandboxProfile,
   defaultDenyReadPaths,
@@ -39,6 +40,8 @@ const DEFAULT_TURN_TIMEOUT_MS = 180_000;
 const STATUSLINE_TIMEOUT_MS = 30_000;
 const POLL_INTERVAL_MS = 50;
 const INPUT_READY_TIMEOUT_MS = 15_000;
+const DEFAULT_ACK_WINDOW_MS = 8_000;
+const DEFAULT_MAX_INJECT_RETRIES = 3;
 const BLACKLIST_DENY_TOOLS = ['Bash', 'Write', 'Edit', 'MultiEdit'];
 
 type ProcessState = 'starting' | 'ready' | 'rebuilding' | 'degradedNeedsResume' | 'failed' | 'terminated';
@@ -59,6 +62,7 @@ type RuntimeSettings = BuiltSettings;
 interface Runtime {
   settings: RuntimeSettings;
   runner: PtyRunnerLike;
+  transcriptPath: string;
   tailer: JsonlTailerLike;
   injector: InputInjector;
   session: InteractiveClaudeSession;
@@ -243,6 +247,9 @@ export class ClaudePtyVirtualProcess implements AgentProcess {
     if (decision?.sessionId && !this.sessionId) {
       this.sessionId = decision.sessionId;
     }
+    if (decision?.taintedRuntime) {
+      this.quarantineRuntimeForResume(runtime);
+    }
     if (this.activeCancel === cancel) this.activeCancel = undefined;
 
   }
@@ -372,8 +379,16 @@ export class ClaudePtyVirtualProcess implements AgentProcess {
         (marker) => this.stopQueue.push(marker),
       );
       const injector = new InputInjector(runner as InputWriteTarget);
-      const session = new InteractiveClaudeSession({
+      const reliableInjector = createReliableInputInjector({
+        transcriptPath: payload.transcriptPath,
+        inputReady: () => this.waitForInputReady(runner),
         injector,
+        ackWindowMs: this.opts.ackWindowMs ?? DEFAULT_ACK_WINDOW_MS,
+        maxInjectRetries: this.opts.maxInjectRetries ?? DEFAULT_MAX_INJECT_RETRIES,
+        pollIntervalMs: this.pollIntervalMs,
+      });
+      const session = new InteractiveClaudeSession({
+        injector: reliableInjector,
         turnTimeoutMs: this.turnTimeoutMs,
         beginTurn: () => {
           // Drop stale/ghost Stop markers queued before this turn's message is injected
@@ -382,7 +397,6 @@ export class ClaudePtyVirtualProcess implements AgentProcess {
           this.stopQueue.clear();
           this.currentController?.beginTurn();
         },
-        beforeInject: () => this.waitForInputReady(runner),
         waitForTurn: (input) => this.waitForPtyTurn(input?.onEvents),
         onTurnDeadline: () => this.handleTurnDeadline(),
         onDispose: async () => {
@@ -398,6 +412,7 @@ export class ClaudePtyVirtualProcess implements AgentProcess {
       return {
         settings,
         runner,
+        transcriptPath: payload.transcriptPath,
         tailer,
         injector,
         session,
@@ -526,10 +541,14 @@ export class ClaudePtyVirtualProcess implements AgentProcess {
       this.writeEvent(event);
     }
     if (cancel) cancel.cancelled = true;
-    this.disposeRuntime('SIGTERM', false);
+    this.quarantineRuntimeForResume();
+    return { ...decision, events: [] };
+  }
+
+  private quarantineRuntimeForResume(runtime = this.runtime): void {
+    this.disposeRuntime('SIGTERM', false, runtime);
     this.state = this.terminated ? 'terminated' : 'degradedNeedsResume';
     this.currentController = undefined;
-    return { ...decision, events: [] };
   }
 
   private disposeRuntime(signal: 'SIGTERM' | 'SIGKILL' = 'SIGTERM', emitExit = false, runtime = this.runtime): void {
@@ -572,7 +591,7 @@ export class ClaudePtyVirtualProcess implements AgentProcess {
   }
 
   private currentTranscriptPath(): string | undefined {
-    return undefined;
+    return this.runtime?.transcriptPath;
   }
 
   private watchInitMenus(screen: PtyScreenRenderer, runner: PtyRunnerLike): () => void {

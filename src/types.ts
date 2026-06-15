@@ -27,6 +27,8 @@ export interface SpawnOpts {
   sandbox?: 'workdir' | 'off';
   sandboxBoxRoots?: string[];
   sandboxOtherProtectedRoots?: string[];
+  ackWindowMs?: number;
+  maxInjectRetries?: number;
 }
 
 export interface AgentProcess {
@@ -251,6 +253,8 @@ export interface BotConfig {
   autoApprove?: boolean;
   turnTimeoutMs?: number;
   idleTimeoutMs?: number;
+  ackWindowMs?: number;
+  maxInjectRetries?: number;
   requireMention?: boolean;
   groupPolicy?: 'all' | 'allowlist';
   groupAllowFrom?: string[];
