@@ -62,6 +62,19 @@ bots:
   #     - "123456789"
   #   permissionMode: bypass            # Gemini CLI has no tool approval flow
 
+  # --- Example: ZCode (GLM-5.2) on Feishu ---
+  # zcodebot:
+  #   agent: zcode
+  #   platform: feishu
+  #   feishu:
+  #     appId: ${ZCODE_FEISHU_APP_ID}
+  #     appSecret: ${ZCODE_FEISHU_APP_SECRET}
+  #   workingDirectory: ~/projects
+  #   allowFrom:
+  #     - ou_xxxxxxxxxxxx
+  #   permissionMode: blacklist         # blacklist → build mode → tools ask approval via card buttons
+                                        # bypass → yolo mode → no approval prompts at all
+
 # ----------------------------------------------------------
 # Agents — CLI binaries that bots can spawn.
 # Only define the agents you have installed.
@@ -78,6 +91,18 @@ agents:
 
   # gemini:
   #   binary: /opt/homebrew/bin/gemini   # or: /usr/local/bin/gemini
+
+  # zcode (GLM-5.2 coding agent). The binary is a .cjs bundle shipped with
+  # the ZCode desktop app; it's launched via `node <binary> app-server`,
+  # which speaks a JSON-RPC streaming protocol.
+  zcode:
+    binary: /Applications/ZCode.app/Contents/Resources/glm/zcode.cjs
+    # No defaultModel: zcode uses the provider/model in ~/.zcode/cli/config.json
+    # (the Z.AI OAuth login). Set it only if you want to override per-bot.
+    env:
+      # zcode reads its own config; usually nothing extra is needed.
+      # Keep PATH so it can find tools it spawns (git, ripgrep, ...).
+      PATH: ${PATH}
 
 # ----------------------------------------------------------
 # Session management

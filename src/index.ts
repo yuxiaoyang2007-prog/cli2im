@@ -11,6 +11,7 @@ import { ClaudeCodePlugin } from './agents/claude-code.js';
 import { CodexPlugin } from './agents/codex.js';
 import { GeminiPlugin } from './agents/gemini.js';
 import { AgyPlugin } from './agents/agy.js';
+import { ZcodePlugin } from './agents/zcode.js';
 import { FeishuAdapter } from './platforms/feishu/adapter.js';
 import { TelegramAdapter } from './platforms/telegram/adapter.js';
 import { TelegramStreamController } from './platforms/telegram/stream.js';
@@ -139,6 +140,8 @@ async function main(): Promise<void> {
       agentManager.registerPlugin(new GeminiPlugin(agentConfig.binary));
     } else if (name === 'agy') {
       agentManager.registerPlugin(new AgyPlugin(agentConfig.binary));
+    } else if (name === 'zcode') {
+      agentManager.registerPlugin(new ZcodePlugin(agentConfig.binary));
     }
   }
 
