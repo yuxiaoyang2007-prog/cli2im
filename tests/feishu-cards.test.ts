@@ -57,6 +57,62 @@ describe('StreamingCardController', () => {
     ));
   });
 
+  it('reopens the card for a drained turn so its output is not dropped after finalize', async () => {
+    const adapter = {
+      sendCard: vi.fn().mockResolvedValue('msg_1'),
+      updateCard: vi.fn().mockResolvedValue(undefined),
+    } as unknown as FeishuAdapter;
+    const controller = new StreamingCardController(adapter);
+    const sessionKey = 'feishu:chat_1:ccbot';
+
+    await controller.startCard('chat_1', sessionKey, 'Claude Code');
+
+    // Turn A: streams, then finalizes.
+    controller.handleEvent(sessionKey, { type: 'text', content: 'answer A' });
+    controller.handleEvent(sessionKey, { type: 'result', sessionId: 'ses_1' });
+    await vi.waitFor(() => expect(adapter.updateCard).toHaveBeenCalledWith(
+      'msg_1',
+      expect.stringContaining('answer A'),
+      expect.any(Number),
+    ));
+
+    // Turn B drained from the plugin's internal queue — no new startCard.
+    // Its events must reopen the same card instead of being dropped.
+    controller.handleEvent(sessionKey, { type: 'text', content: 'answer B' });
+    controller.handleEvent(sessionKey, { type: 'result', sessionId: 'ses_1' });
+
+    await vi.waitFor(() => expect(adapter.updateCard).toHaveBeenCalledWith(
+      'msg_1',
+      expect.stringContaining('answer B'),
+      expect.any(Number),
+    ));
+    // The same Feishu message is reused — no second card was sent.
+    expect(adapter.sendCard).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not reopen a finalized card on a non-content event', async () => {
+    const adapter = {
+      sendCard: vi.fn().mockResolvedValue('msg_1'),
+      updateCard: vi.fn().mockResolvedValue(undefined),
+    } as unknown as FeishuAdapter;
+    const controller = new StreamingCardController(adapter);
+    const sessionKey = 'feishu:chat_1:ccbot';
+
+    await controller.startCard('chat_1', sessionKey, 'Claude Code');
+    controller.handleEvent(sessionKey, { type: 'text', content: 'answer A' });
+    controller.handleEvent(sessionKey, { type: 'result', sessionId: 'ses_1' });
+    await vi.waitFor(() => expect(adapter.updateCard).toHaveBeenCalled());
+    const callsAfterFinalize = (adapter.updateCard as unknown as ReturnType<typeof vi.fn>).mock.calls.length;
+
+    // Stray non-content events after finalize must not reopen / re-render.
+    controller.handleEvent(sessionKey, { type: 'status', sessionId: 'ses_1', message: 'late' });
+    controller.handleEvent(sessionKey, { type: 'result', sessionId: 'ses_1' });
+    await Promise.resolve();
+
+    expect((adapter.updateCard as unknown as ReturnType<typeof vi.fn>).mock.calls.length).toBe(callsAfterFinalize);
+    expect(adapter.sendCard).toHaveBeenCalledTimes(1);
+  });
+
   it('does not finalize a card when the event signal is already aborted', async () => {
     const adapter = {
       sendCard: vi.fn().mockResolvedValue('msg_1'),

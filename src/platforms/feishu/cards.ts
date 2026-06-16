@@ -60,7 +60,18 @@ export class StreamingCardController {
   handleEvent(sessionKey: string, event: AgentEvent, options: AbortableOptions = {}): void {
     if (options.signal?.aborted) return;
     const card = this.cards.get(sessionKey);
-    if (!card || card.finalized) return;
+    if (!card) return;
+
+    if (card.finalized) {
+      // The previous turn finalized this card. A fresh content event means a
+      // new turn began without the pipeline opening a card — e.g. a prompt the
+      // plugin drained from its internal queue after the previous turn ended.
+      // Reopen the same card so the new turn's output isn't dropped. Non-content
+      // events (status / result / error, or a stray late delta) are ignored.
+      if (!this.isContentEvent(event)) return;
+      this.reopenCard(card);
+      // fall through to render this event on the reopened card
+    }
 
     switch (event.type) {
       case 'text':
@@ -97,6 +108,32 @@ export class StreamingCardController {
         void this.finalizeCard(sessionKey, 'error', card, options);
         break;
     }
+  }
+
+  // Content events carry a turn's visible output; their arrival on a finalized
+  // card signals a new turn. status/result/error are control/terminal events
+  // and must not, on their own, reopen a card.
+  private isContentEvent(event: AgentEvent): boolean {
+    return (
+      event.type === 'text' ||
+      event.type === 'thinking' ||
+      event.type === 'tool_use' ||
+      event.type === 'tool_result'
+    );
+  }
+
+  // Reuse the same Feishu card message for a new turn, separating it from the
+  // previous (finalized) turn's output. The previous content is kept so the
+  // earlier reply isn't erased; messageId/updateSeq are preserved so the same
+  // message is edited in place (avoids the async race of sending a new card).
+  private reopenCard(card: StreamingCardState): void {
+    card.content = card.content ? `${card.content}\n\n---\n\n` : '';
+    card.toolStatus = '';
+    card.thinking = '';
+    card.finalized = false;
+    card.startedAt = Date.now();
+    card.lastUpdateAt = 0;
+    card.lastUpdateLength = card.content.length;
   }
 
   interruptCard(sessionKey: string, options: AbortableOptions = {}): void {
@@ -196,9 +233,10 @@ export class StreamingCardController {
       }
     }
 
-    if (this.isCurrentCard(sessionKey, card)) {
-      this.cards.delete(sessionKey);
-    }
+    // Intentionally keep the finalized card in the map (don't delete): a prompt
+    // the plugin later drains from its internal queue produces events with no
+    // pipeline-opened card, and handleEvent reopens this one to render them.
+    // A normal next message overwrites it via startCard.
   }
 
   private isCurrentCard(sessionKey: string, card: StreamingCardState): boolean {
