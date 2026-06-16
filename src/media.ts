@@ -53,14 +53,6 @@ export async function buildUserMessageForAgent(
     return { role: 'user', content: text, attachments };
   }
 
-  if (agentName === 'claude-code-pty') {
-    return {
-      role: 'user',
-      content: appendAttachmentPaths(text, attachments, true),
-      attachments,
-    };
-  }
-
   const contentText = appendAttachmentPaths(text, attachments, false);
   if (agentName !== 'claude-code') {
     return { role: 'user', content: contentText };

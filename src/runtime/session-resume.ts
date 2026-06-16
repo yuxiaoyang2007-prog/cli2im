@@ -42,18 +42,7 @@ export async function handleCLISessionResume(params: {
 
   try {
     let workDir = resume.cwd;
-    if (botConfig.agent === 'claude-code-pty') {
-      const scanner = new CLISessionScanner(join(homedir(), '.claude'));
-      const sessions = await scanner.scan({ cwdFilter: botConfig.workingDirectory });
-      const match = sessions.find((s) => s.sessionId === resume.sessionId);
-      if (!match?.cwd) {
-        await adapter.send(callback.chatId, {
-          text: `Resume failed: could not resolve cwd for session \`${resume.sessionId}\``,
-        });
-        return;
-      }
-      workDir = match.cwd;
-    } else if (botConfig.agent === 'agy') {
+    if (botConfig.agent === 'agy') {
       // Antigravity does not persist a per-conversation cwd; it always runs in
       // the bot's working directory, so resume there rather than scanning the
       // Gemini CLI store (which holds unrelated sessions).
@@ -67,16 +56,6 @@ export async function handleCLISessionResume(params: {
       const sessions = await scanner.scan();
       const match = sessions.find((s) => s.sessionId === resume.sessionId);
       workDir = match?.cwd || homedir();
-    }
-
-    if (botConfig.agent === 'claude-code-pty') {
-      const allowed = await cwdMatchesBotWorkingDirectory(workDir, botConfig.workingDirectory);
-      if (!allowed) {
-        await adapter.send(callback.chatId, {
-          text: `Resume failed: session cwd is outside this bot working directory \`${botConfig.workingDirectory}\``,
-        });
-        return;
-      }
     }
 
     if (!(await validateWorkingDirectory(workDir))) {

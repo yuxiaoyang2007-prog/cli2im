@@ -44,21 +44,6 @@ describe('/sessions command scanner selection', () => {
     scannerMocks.antigravityScan.mockResolvedValue([session('antigravity-session')]);
   });
 
-  it('passes cwdFilter only for the claude-code-pty bot default /sessions path', async () => {
-    const deps = commandDeps({
-      botConfig: botConfig({
-        agent: 'claude-code-pty',
-        workingDirectory: '/Users/test/project',
-      }),
-    });
-
-    await runCommand('sessions', [], deps);
-
-    expect(scannerMocks.cliScan).toHaveBeenCalledWith({ cwdFilter: '/Users/test/project' });
-    expect(scannerMocks.codexScan).not.toHaveBeenCalled();
-    expect(scannerMocks.geminiScan).not.toHaveBeenCalled();
-  });
-
   it('keeps SDK Claude and Codex /sessions scanner calls unfiltered', async () => {
     const sdkDeps = commandDeps({
       botConfig: botConfig({

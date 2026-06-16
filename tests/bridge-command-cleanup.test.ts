@@ -92,7 +92,7 @@ describe('handleBridgeCommand lifecycle cleanup', () => {
   it('resumes with the bot configured agent and working directory', async () => {
     const deps = commandDeps({
       botConfig: {
-        agent: 'claude-code-pty',
+        agent: 'claude-code',
         workingDirectory: '/Users/test/project',
       },
     });
@@ -103,14 +103,14 @@ describe('handleBridgeCommand lifecycle cleanup', () => {
       botName: 'ccbot',
       sessionId: 'session_123',
       workDir: '/Users/test/project',
-      agentName: 'claude-code-pty',
+      agentName: 'claude-code',
       chatId: 'chat_1',
     });
     expect(deps.adapter.send).toHaveBeenCalledWith('chat_1', {
       text: expect.stringContaining('- 项目: `/Users/test/project`'),
     });
     expect(deps.adapter.send).toHaveBeenCalledWith('chat_1', {
-      text: expect.stringContaining('- Agent: claude-code-pty'),
+      text: expect.stringContaining('- Agent: claude-code'),
     });
   });
 

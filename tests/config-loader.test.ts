@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { loadConfig, substituteEnvVars } from '../src/config/loader.js';
 import { writeFileSync, mkdirSync, rmSync, realpathSync } from 'node:fs';
 import { join } from 'node:path';
-import { homedir, tmpdir } from 'node:os';
+import { tmpdir } from 'node:os';
 
 describe('substituteEnvVars', () => {
   it('replaces ${VAR} with env value', () => {
@@ -145,7 +145,7 @@ contentGuard:
     const yaml = `
 bots:
   ccbot:
-    agent: claude-code-pty
+    agent: claude-code
     platform: feishu
     feishu:
       appId: cli_abc
@@ -156,7 +156,7 @@ bots:
 sandboxExtraRoots:
   - ${extraRoot}
 agents:
-  claude-code-pty:
+  claude-code:
     binary: /usr/local/bin/claude
 session:
   maxActive: 64
@@ -186,7 +186,7 @@ newMessageBehavior: queue
     const invalidSandbox = `
 bots:
   ccbot:
-    agent: claude-code-pty
+    agent: claude-code
     platform: feishu
     feishu:
       appId: cli_abc
@@ -196,7 +196,7 @@ bots:
     permissionMode: bypass
     sandbox: loose
 agents:
-  claude-code-pty:
+  claude-code:
     binary: /usr/local/bin/claude
 session:
   maxActive: 64
@@ -236,13 +236,6 @@ newMessageBehavior: queue
         `Config error: sandboxExtraRoots must not include ${root}`,
       );
     }
-
-    const claudeExtra = invalidSandbox.replace('    sandbox: loose\n', 'sandboxExtraRoots:\n  - ~/.claude\n');
-    const claudeExtraPath = join(tmpDir, 'claude-extra.yaml');
-    writeFileSync(claudeExtraPath, claudeExtra);
-    expect(() => loadConfig(claudeExtraPath)).toThrow(
-      `Config error: sandboxExtraRoots must not include ${join(homedir(), '.claude')}`,
-    );
   });
 
   it('validates new phase 2 config fields', () => {

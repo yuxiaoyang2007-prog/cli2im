@@ -2,7 +2,6 @@ import { readFileSync, realpathSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { relative } from 'node:path';
 import { parse as parseYaml } from 'yaml';
-import { protectedSandboxSubtrees } from '../agents/pty/SandboxProfile.js';
 import type { AppConfig } from '../types.js';
 
 export function substituteEnvVars(
@@ -165,9 +164,6 @@ function assertSafeExtraRoot(path: string): void {
     '/Volumes',
   ]);
   if (denied.has(path)) {
-    throw new Error(`Config error: sandboxExtraRoots must not include ${path}`);
-  }
-  if (isPathWithinAnyRoot(path, protectedSandboxSubtrees(home))) {
     throw new Error(`Config error: sandboxExtraRoots must not include ${path}`);
   }
 }

@@ -159,7 +159,7 @@ describe('HttpServer handoff validation', () => {
     const acceptHandoff = vi.fn().mockResolvedValue({ success: true });
     const server = new HttpServer('secret-token', deps({ acceptHandoff }), {
       botNames: ['ccbot'],
-      agentNames: ['claude-code', 'claude-code-pty'],
+      agentNames: ['claude-code', 'codex'],
       botAgents: { ccbot: 'claude-code' },
     });
 
@@ -169,7 +169,7 @@ describe('HttpServer handoff validation', () => {
         botName: 'ccbot',
         sessionId: 'session_123',
         workDir: '/Users/test/project',
-        agentName: 'claude-code-pty',
+        agentName: 'codex',
       });
 
       expect(res.status).toBe(400);

@@ -8,7 +8,6 @@ import { ChatQueue } from './session/queue.js';
 import { AgentManager, type AgentManagerEvents } from './agents/manager.js';
 import { ToolGate } from './agents/tool-gate.js';
 import { ClaudeCodePlugin } from './agents/claude-code.js';
-import { ClaudePtyPlugin } from './agents/claude-pty.js';
 import { CodexPlugin } from './agents/codex.js';
 import { GeminiPlugin } from './agents/gemini.js';
 import { AgyPlugin } from './agents/agy.js';
@@ -65,7 +64,6 @@ import {
   clearSessionScopedBuffers,
 } from './runtime/session-scoped-cleanup.js';
 import { getCli2imDataDir } from './util/data-dir.js';
-import { protectedSandboxSubtrees } from './agents/pty/SandboxProfile.js';
 import { homedir } from 'node:os';
 import { join, relative } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -135,8 +133,6 @@ async function main(): Promise<void> {
   for (const [name, agentConfig] of Object.entries(config.agents)) {
     if (name === 'claude-code') {
       agentManager.registerPlugin(new ClaudeCodePlugin(agentConfig.binary));
-    } else if (name === 'claude-code-pty') {
-      agentManager.registerPlugin(new ClaudePtyPlugin(agentConfig.binary));
     } else if (name === 'codex') {
       agentManager.registerPlugin(new CodexPlugin(agentConfig.binary));
     } else if (name === 'gemini') {
@@ -433,24 +429,19 @@ async function main(): Promise<void> {
           : {};
         const spawnEnv = { ...config.agents[botConfig.agent]?.env, ...senderEnv, ...larkCliEnv };
 
-        const isPtyAgent = botConfig.agent === 'claude-code-pty';
         const spawnOpts = await resolveBotSpawnOpts({
           botConfig,
           workingDirectory: session.workingDirectory,
           env: spawnEnv,
           model: config.agents[botConfig.agent]?.defaultModel,
           autoApprove: botConfig.autoApprove,
-          turnTimeoutMs: isPtyAgent ? undefined : botConfig.turnTimeoutMs,
-          idleTimeoutMs: isPtyAgent
-            ? Math.max(botConfig.idleTimeoutMs ?? 600_000, 600_000)
-            : botConfig.idleTimeoutMs,
+          turnTimeoutMs: botConfig.turnTimeoutMs,
+          idleTimeoutMs: botConfig.idleTimeoutMs,
           sandboxMode: botConfig.sandboxMode,
           reasoningEffort: runtimeState.fastModeBySession.get(sessionKey)
             ? 'low'
             : config.agents[botConfig.agent]?.defaultEffort,
           initialPrompt: messageText,
-          sandboxExtraRoots: config.sandboxExtraRoots,
-          otherProtectedRoots: await collectOtherProtectedRoots(botName),
         });
 
         const plugin = agentManager.getPlugin(botConfig.agent);
@@ -787,11 +778,7 @@ export async function handleBridgeCommand(
           ? await new GeminiSessionScanner(join(homedir(), '.gemini')).scan()
           : useCodex
             ? await new CodexSessionScanner(join(homedir(), '.codex')).scan()
-            : botConfig.agent === 'claude-code-pty'
-              ? await new CLISessionScanner(join(homedir(), '.claude')).scan({
-                  cwdFilter: botConfig.workingDirectory,
-                })
-              : await new CLISessionScanner(join(homedir(), '.claude')).scan();
+            : await new CLISessionScanner(join(homedir(), '.claude')).scan();
 
       if (sessions.length === 0) {
         await adapter.send(chatId, { text: `没有找到 ${agentLabel} CLI 会话` });
@@ -939,51 +926,10 @@ export interface ResolveBotSpawnOptsInput {
 export type BotSpawnOptsResolver = (params: ResolveBotSpawnOptsInput) => Promise<SpawnOpts>;
 
 export async function resolveBotSpawnOpts(params: ResolveBotSpawnOptsInput): Promise<SpawnOpts> {
-  // Sandbox only applies to the claude-code-pty agent (it confines THAT claude child).
-  // Other agents (codex/agy) must never get a box root computed: their workdir may be
-  // home (e.g. codexbot at /Users/<user>), which assertSafeBoxRoot rejects — that would
-  // break those bots even though they were never meant to be sandboxed.
-  const sandbox = params.botConfig.agent === 'claude-code-pty'
-    ? (params.botConfig.sandbox ?? 'workdir')
-    : 'off';
-  // Only the sandbox path needs a strictly-validated (realpath'd, existing) box root.
-  // Non-sandbox bots keep the legacy lenient behavior (expandHome only) so a missing or
-  // non-realpath workdir does not break them — matches pre-sandbox behavior for codex/agy
-  // (and for claude-code-pty when sandbox is explicitly off).
-  const workingDirectory = sandbox === 'workdir'
-    ? await resolveStrictDirectory(params.workingDirectory)
-    : expandHome(params.workingDirectory);
+  const workingDirectory = expandHome(params.workingDirectory);
   const addDirs = params.addDirs?.length
-    ? await Promise.all(params.addDirs.map((dir) => resolveStrictDirectory(dir)))
+    ? params.addDirs.map((dir) => expandHome(dir))
     : undefined;
-
-  let sandboxBoxRoots: string[] | undefined;
-  let sandboxOtherProtectedRoots: string[] | undefined;
-  if (sandbox === 'workdir') {
-    const homeDir = await realpath(homedir());
-    sandboxBoxRoots = uniquePaths([
-      workingDirectory,
-      ...await Promise.all((params.sandboxExtraRoots ?? []).map((dir) => resolveStrictDirectory(dir))),
-    ]);
-    for (const root of sandboxBoxRoots) {
-      assertSafeBoxRoot(root, homeDir);
-    }
-    for (const addDir of addDirs ?? []) {
-      if (!isPathWithinAnyRoot(addDir, sandboxBoxRoots)) {
-        throw new Error(`Sandbox add-dir outside box roots: ${addDir}`);
-      }
-    }
-    // Cross-bot protected roots (other bots' workdirs). Drop any that would deny THIS bot's
-    // own workspace — an ancestor-or-equal of a box root — or that are overly broad
-    // (home/ancestors, or outside the user home trees). A sibling non-PTY bot can have a
-    // home/broad workdir (e.g. codex running in ~); denying that whole tree would break this
-    // PTY bot instead of isolating the sibling. Secrets stay covered by the deny-read list.
-    sandboxOtherProtectedRoots = (await resolveExistingDirectories(params.otherProtectedRoots ?? []))
-      .filter((root) =>
-        !sandboxBoxRoots!.some((box) => isPathWithinAnyRoot(box, [root]))
-        && !isPathWithinAnyRoot(homeDir, [root])
-        && (root.startsWith('/Users/') || root.startsWith('/home/')));
-  }
 
   return {
     workingDirectory,
@@ -997,9 +943,6 @@ export async function resolveBotSpawnOpts(params: ResolveBotSpawnOptsInput): Pro
     reasoningEffort: params.reasoningEffort,
     initialPrompt: params.initialPrompt,
     addDirs,
-    sandbox,
-    ...(sandboxBoxRoots ? { sandboxBoxRoots } : {}),
-    ...(sandboxOtherProtectedRoots?.length ? { sandboxOtherProtectedRoots } : {}),
   };
 }
 
@@ -1014,18 +957,6 @@ async function resolveStrictDirectory(path: string): Promise<string> {
 
 function uniquePaths(paths: string[]): string[] {
   return [...new Set(paths)];
-}
-
-function assertSafeBoxRoot(root: string, homeDir: string): void {
-  if (isPathWithinAnyRoot(homeDir, [root])) {
-    throw new Error(`Unsafe sandbox box root: ${root}`);
-  }
-  if (!root.startsWith('/Users/') && !root.startsWith('/home/')) {
-    throw new Error(`Unsafe sandbox box root: ${root}`);
-  }
-  if (isPathWithinAnyRoot(root, protectedSandboxSubtrees(homeDir))) {
-    throw new Error(`Unsafe sandbox box root: ${root}`);
-  }
 }
 
 async function resolveExistingDirectories(paths: string[]): Promise<string[]> {
@@ -1064,28 +995,10 @@ export function createHandoffSpawnResume(
 ) => Promise<{ pid: number; sessionId: string }> {
   return async (sessionKey, agentName, sessionId, workDir) => {
     const handlers = createEventHandlers(sessionKey);
-    const botName = getSessionBotName(sessionKey);
-    const botConfig = botName ? getBotConfig?.(botName) : undefined;
-    let spawnOpts: SpawnOpts;
-    if (agentName === 'claude-code-pty') {
-      if (botConfig?.agent !== 'claude-code-pty') {
-        throw new Error('claude-code-pty handoff requires a PTY bot configuration');
-      }
-      if (!resolveSpawnOpts) {
-        throw new Error('claude-code-pty handoff requires a strict spawn resolver');
-      }
-      spawnOpts = await resolveSpawnOpts({
-        botConfig,
-        workingDirectory: workDir,
-        turnTimeoutMs: undefined,
-        idleTimeoutMs: Math.max(botConfig.idleTimeoutMs ?? 600_000, 600_000),
-      });
-    } else {
-      spawnOpts = {
-        workingDirectory: workDir,
-        permissionMode: 'blacklist',
-      };
-    }
+    const spawnOpts: SpawnOpts = {
+      workingDirectory: workDir,
+      permissionMode: 'blacklist',
+    };
     const proc = await agentManager.resumeAgent(
       sessionKey,
       agentName,
