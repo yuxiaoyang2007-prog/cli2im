@@ -239,11 +239,16 @@ export class ZcodeVirtualProcess implements AgentProcess {
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
         this.emitError(`zcode session 启动失败：${message}`);
-        // This instance is dead (ensureBootstrap caches the error), so any
-        // prompts queued during bootstrap can't be served here. Drop them
-        // rather than leaving them dangling; cli2im cold-starts a fresh
-        // process on the next message.
-        this.queuedPrompts = [];
+        // ensureBootstrap caches the error, so this instance can never recover.
+        // emitError alone does NOT recycle it — the manager only cold-starts on
+        // an exit event — so without terminate() every later message would fail
+        // the same way and any prompts queued during bootstrap would be dropped
+        // silently. Surface those queued prompts, then terminate so the next
+        // message starts a fresh process.
+        if (this.queuedPrompts.length > 0) {
+          this.emitError(`zcode session 启动失败，已丢弃 ${this.queuedPrompts.length} 条排队消息，请重新发送`);
+        }
+        this.terminate(null);
         return;
       }
 

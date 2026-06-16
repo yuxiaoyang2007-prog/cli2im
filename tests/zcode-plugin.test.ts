@@ -17,12 +17,14 @@ vi.mock('../src/agents/zcode-protocol.js', async (importOriginal) => {
     sends: any[] = [];
     private sendErrors: any[] = [];
     private resolveCreate!: (v: any) => void;
+    private rejectCreate!: (e: any) => void;
     private createPromise: Promise<any>;
 
     constructor(_child: any, handlers: any) {
       this.handlers = handlers;
-      this.createPromise = new Promise((res) => {
+      this.createPromise = new Promise((res, rej) => {
         this.resolveCreate = res;
+        this.rejectCreate = rej;
       });
       reg.instances.push(this);
     }
@@ -55,6 +57,9 @@ vi.mock('../src/agents/zcode-protocol.js', async (importOriginal) => {
     }
     failNextSend(err: any): void {
       this.sendErrors.push(err);
+    }
+    failBootstrap(err: any): void {
+      this.rejectCreate(err);
     }
   }
 
@@ -174,5 +179,34 @@ describe('ZcodeVirtualProcess turn lifecycle', () => {
     // First send attempted (and failed); the queued second drained right after,
     // preserving order — not left dangling for a future message.
     expect(rpc.sends.map((s: any) => s.content)).toEqual(['first', 'second']);
+  });
+
+  // Codex review on #2 (round 2): a bootstrap failure with a message queued
+  // behind `driving` must not silently discard it. emitError does not recycle
+  // the process, so we surface the queued failure and terminate (exit) to force
+  // a cold start on the next message.
+  it('surfaces queued prompts and terminates when bootstrap fails', async () => {
+    const plugin = new ZcodePlugin('/path/to/zcode.cjs');
+    const proc = plugin.spawn(baseOpts());
+    const rpc = lastRpc();
+    const events: AgentEvent[] = [];
+    const exits: Array<number | null> = [];
+    proc.stdout.on('data', (e: AgentEvent) => events.push(e));
+    proc.on('exit', (code: number | null) => exits.push(code));
+
+    proc.stdin.write(plugin.formatStdinMessage({ role: 'user', content: 'first' }));
+    proc.stdin.write(plugin.formatStdinMessage({ role: 'user', content: 'second' }));
+    rpc.failBootstrap(new Error('create boom'));
+    await nextTick();
+    await nextTick();
+
+    // No turn ever started.
+    expect(rpc.sends).toHaveLength(0);
+    // Bootstrap failure surfaced, and the queued prompt was not dropped silently.
+    const errors = events.filter((e: any) => e.type === 'error') as Array<{ message: string }>;
+    expect(errors.some((e) => /启动失败/.test(e.message))).toBe(true);
+    expect(errors.some((e) => /排队消息/.test(e.message))).toBe(true);
+    // Process terminated so the manager cold-starts a fresh one next message.
+    expect(exits).toEqual([null]);
   });
 });
