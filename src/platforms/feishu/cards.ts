@@ -14,6 +14,11 @@ interface StreamingCardState {
   timer: ReturnType<typeof setTimeout> | null;
   finalized: boolean;
   startedAt: number;
+  // Serializes patch (updateCard) calls for this card in call order. The Feishu
+  // adapter's updateCard ignores its seq arg and just overwrites the message, so
+  // without this a slow in-flight patch (e.g. the previous turn's fire-and-forget
+  // finalize) could land after a reopened turn's update and revert the message.
+  patchChain: Promise<unknown>;
 }
 
 interface ThrottleConfig {
@@ -54,7 +59,26 @@ export class StreamingCardController {
       timer: null,
       finalized: false,
       startedAt: Date.now(),
+      patchChain: Promise.resolve(),
     });
+  }
+
+  // Serialize a patch behind any in-flight patches for this card so a slow
+  // earlier patch can't land after a later one (the adapter ignores seq).
+  private patchCard(
+    card: StreamingCardState,
+    messageId: string,
+    display: string,
+    seq: number,
+    options: AbortableOptions,
+  ): Promise<void> {
+    const run = () =>
+      options.signal
+        ? this.adapter.updateCard(messageId, display, seq, { signal: options.signal })
+        : this.adapter.updateCard(messageId, display, seq);
+    const result = card.patchChain.then(run);
+    card.patchChain = result.catch(() => {});
+    return result;
   }
 
   handleEvent(sessionKey: string, event: AgentEvent, options: AbortableOptions = {}): void {
@@ -63,12 +87,13 @@ export class StreamingCardController {
     if (!card) return;
 
     if (card.finalized) {
-      // The previous turn finalized this card. A fresh content event means a
-      // new turn began without the pipeline opening a card — e.g. a prompt the
-      // plugin drained from its internal queue after the previous turn ended.
-      // Reopen the same card so the new turn's output isn't dropped. Non-content
-      // events (status / result / error, or a stray late delta) are ignored.
-      if (!this.isContentEvent(event)) return;
+      // The previous turn finalized this card. A fresh content event — or a
+      // terminal error (a drained turn can fail before emitting any text) —
+      // means a new turn began without the pipeline opening a card, e.g. a
+      // prompt the plugin drained from its internal queue after the previous
+      // turn ended. Reopen the same card so the new turn's output isn't dropped.
+      // status / result / a stray late delta of the finished turn do not reopen.
+      if (!this.isContentEvent(event) && event.type !== 'error') return;
       this.reopenCard(card);
       // fall through to render this event on the reopened card
     }
@@ -186,13 +211,7 @@ export class StreamingCardController {
     card.lastUpdateLength = card.content.length;
 
     try {
-      if (options.signal) {
-        await this.adapter.updateCard(card.messageId, display, card.updateSeq, {
-          signal: options.signal,
-        });
-      } else {
-        await this.adapter.updateCard(card.messageId, display, card.updateSeq);
-      }
+      await this.patchCard(card, card.messageId, display, card.updateSeq, options);
     } catch {
       // Card update failures should not interrupt the agent stream.
     }
@@ -221,13 +240,7 @@ export class StreamingCardController {
 
     if (card.messageId && !options.signal?.aborted) {
       try {
-        if (options.signal) {
-          await this.adapter.updateCard(card.messageId, display, ++card.updateSeq, {
-            signal: options.signal,
-          });
-        } else {
-          await this.adapter.updateCard(card.messageId, display, ++card.updateSeq);
-        }
+        await this.patchCard(card, card.messageId, display, ++card.updateSeq, options);
       } catch {
         // Best effort final update.
       }

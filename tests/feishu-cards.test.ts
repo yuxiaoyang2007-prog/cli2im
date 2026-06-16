@@ -90,6 +90,72 @@ describe('StreamingCardController', () => {
     expect(adapter.sendCard).toHaveBeenCalledTimes(1);
   });
 
+  it('renders an error-only drained turn after the previous turn finalized', async () => {
+    const adapter = {
+      sendCard: vi.fn().mockResolvedValue('msg_1'),
+      updateCard: vi.fn().mockResolvedValue(undefined),
+    } as unknown as FeishuAdapter;
+    const controller = new StreamingCardController(adapter);
+    const sessionKey = 'feishu:chat_1:ccbot';
+
+    await controller.startCard('chat_1', sessionKey, 'Claude Code');
+    controller.handleEvent(sessionKey, { type: 'text', content: 'answer A' });
+    controller.handleEvent(sessionKey, { type: 'result', sessionId: 'ses_1' });
+    await vi.waitFor(() => expect(adapter.updateCard).toHaveBeenCalledWith(
+      'msg_1',
+      expect.stringContaining('answer A'),
+      expect.any(Number),
+    ));
+
+    // A drained turn that fails before any text — its only event is `error`,
+    // which must still reopen + render so the user gets the failure message.
+    controller.handleEvent(sessionKey, { type: 'error', message: 'turn B blew up' });
+
+    await vi.waitFor(() => expect(adapter.updateCard).toHaveBeenCalledWith(
+      'msg_1',
+      expect.stringContaining('turn B blew up'),
+      expect.any(Number),
+    ));
+    expect(adapter.sendCard).toHaveBeenCalledTimes(1);
+  });
+
+  it('serializes patches so a slow previous finalize cannot overwrite the reopened turn', async () => {
+    const aFinal = deferred<void>();
+    let calls = 0;
+    const adapter = {
+      sendCard: vi.fn().mockResolvedValue('msg_1'),
+      updateCard: vi.fn(() => {
+        calls++;
+        return calls === 1 ? aFinal.promise : Promise.resolve();
+      }),
+    } as unknown as FeishuAdapter;
+    const controller = new StreamingCardController(adapter);
+    const sessionKey = 'feishu:chat_1:ccbot';
+    const updateMock = adapter.updateCard as unknown as ReturnType<typeof vi.fn>;
+
+    await controller.startCard('chat_1', sessionKey, 'Claude Code');
+    controller.handleEvent(sessionKey, { type: 'text', content: 'answer A' });
+    controller.handleEvent(sessionKey, { type: 'result', sessionId: 'ses_1' }); // finalize A → patch #1 hangs
+    await Promise.resolve();
+    expect(updateMock.mock.calls.length).toBe(1);
+
+    // Drained turn B reopens + finalizes while A's finalize patch is in flight.
+    controller.handleEvent(sessionKey, { type: 'text', content: 'answer B' });
+    controller.handleEvent(sessionKey, { type: 'result', sessionId: 'ses_1' });
+    await Promise.resolve();
+    await Promise.resolve();
+
+    // B's patch is chained behind A's pending finalize — not issued yet.
+    expect(updateMock.mock.calls.length).toBe(1);
+
+    // Release A's finalize; B's patch now runs and the last write is B's.
+    aFinal.resolve();
+    await vi.waitFor(() => {
+      const last = updateMock.mock.calls[updateMock.mock.calls.length - 1];
+      expect(last[1]).toContain('answer B');
+    });
+  });
+
   it('does not reopen a finalized card on a non-content event', async () => {
     const adapter = {
       sendCard: vi.fn().mockResolvedValue('msg_1'),
