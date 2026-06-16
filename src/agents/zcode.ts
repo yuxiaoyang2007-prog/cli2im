@@ -122,6 +122,12 @@ export class ZcodeVirtualProcess implements AgentProcess {
   private bootstrapPromise: Promise<void> | undefined;
   private bootstrapError: Error | undefined;
   private activeTurn: PendingTurn | null = null;
+  // True while enqueue() is driving the bootstrap → runTurn path, before
+  // activeTurn is set. activeTurn alone is not enough: it's assigned inside
+  // runTurn *after* the async ensureBootstrap() await, so two messages that
+  // arrive before the first bootstrap resolves would both see activeTurn ===
+  // null and race into concurrent session/send ("turn already running").
+  private driving = false;
   private queuedPrompts: string[] = [];
   // True once we've streamed any assistant text for the active turn via
   // part.delta. zcode (in build mode) often delivers the whole answer only
@@ -217,24 +223,35 @@ export class ZcodeVirtualProcess implements AgentProcess {
   private async enqueue(prompt: string): Promise<void> {
     if (this.terminated) return;
 
-    // If a turn is already running, queue behind it. The runTurn loop drains
-    // queued prompts when the active turn resolves.
-    if (this.activeTurn) {
+    // If a turn is already running OR one is being set up (bootstrap in
+    // flight), queue behind it. The runTurn loop drains queued prompts when
+    // the active turn resolves.
+    if (this.activeTurn || this.driving) {
       this.queuedPrompts.push(prompt);
       return;
     }
 
     // First message (or after a turn finished) drives bootstrap + runTurn.
+    this.driving = true;
     try {
-      await this.ensureBootstrap();
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      this.emitError(`zcode session 启动失败：${message}`);
-      return;
-    }
+      try {
+        await this.ensureBootstrap();
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        this.emitError(`zcode session 启动失败：${message}`);
+        // This instance is dead (ensureBootstrap caches the error), so any
+        // prompts queued during bootstrap can't be served here. Drop them
+        // rather than leaving them dangling; cli2im cold-starts a fresh
+        // process on the next message.
+        this.queuedPrompts = [];
+        return;
+      }
 
-    if (this.terminated) return;
-    await this.runTurn(prompt);
+      if (this.terminated) return;
+      await this.runTurn(prompt);
+    } finally {
+      this.driving = false;
+    }
   }
 
   private async ensureBootstrap(): Promise<void> {
@@ -375,7 +392,17 @@ export class ZcodeVirtualProcess implements AgentProcess {
     }
 
     // Wait for the turn.completed / turn.failed event to resolve this.
-    await turn;
+    // failTurn() rejects this promise on turn.failed, transport exit, or
+    // terminate. The error is already surfaced via emitError at each reject
+    // site, so swallow it here: letting it escape would become an unhandled
+    // rejection (callers invoke enqueue as `void this.enqueue(...)`) and would
+    // skip the queue drain below.
+    try {
+      await turn;
+    } catch {
+      // Turn failed; error already emitted. Fall through to drain so any
+      // prompts queued during this turn still run (skipped if terminated).
+    }
 
     // Drain any prompts that queued while this turn was running.
     const next = this.queuedPrompts.shift();
