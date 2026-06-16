@@ -377,13 +377,18 @@ export class ZcodeVirtualProcess implements AgentProcess {
           this.activeTurn = null;
           const message = retryErr instanceof ZcodeRpcError ? `(${retryErr.code}) ${retryErr.message}` : String(retryErr);
           this.emitError(`zcode session/send 失败（重试后）：${message}`);
-          // resetToFreshSession() cleared sessionId and ensureBootstrap cached
-          // the error, so this instance can't recover. Falling through to the
-          // drain would shift the next queued prompt into runTurn, which returns
-          // immediately on the !sessionId guard — silently discarding it. Bail
-          // (surface queued prompts + terminate) instead.
-          this.bailUnrecoverable();
-          return;
+          if (!this.sessionId) {
+            // resetToFreshSession() failed: sessionId is cleared and the
+            // bootstrap error is cached, so this instance can't recover.
+            // Draining would shift the next queued prompt into runTurn, which
+            // returns immediately on the !sessionId guard — silently dropping
+            // it. Bail (surface queued prompts + terminate) instead.
+            this.bailUnrecoverable();
+            return;
+          }
+          // Reset succeeded but the retry send failed on the live session —
+          // fall through to the drain like any other send failure so queued
+          // prompts still run.
         }
       } else {
         // -32010 = a turn is already running (queueing should prevent this),

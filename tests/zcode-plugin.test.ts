@@ -241,4 +241,31 @@ describe('ZcodeVirtualProcess turn lifecycle', () => {
     expect(errors.some((e) => /排队消息/.test(e.message))).toBe(true);
     expect(exits).toEqual([null]);
   });
+
+  // Counterpart to the above: if the -32031 reset SUCCEEDS but the retry send
+  // fails on the now-live session, that's an ordinary send failure — queued
+  // prompts should drain on the live session, not trigger a terminate.
+  it('drains queued prompts when the -32031 retry send fails on a live reset session', async () => {
+    const plugin = new ZcodePlugin('/path/to/zcode.cjs');
+    const proc = plugin.spawn(baseOpts());
+    const rpc = lastRpc();
+    const exits: Array<number | null> = [];
+    proc.on('exit', (code: number | null) => exits.push(code));
+
+    rpc.failNextSend(new ZcodeRpcError(-32031, 'model gone')); // first send → -32031
+    rpc.failNextSend(new ZcodeRpcError(-32010, 'turn running')); // retry send fails (live session)
+
+    proc.stdin.write(plugin.formatStdinMessage({ role: 'user', content: 'first' }));
+    proc.stdin.write(plugin.formatStdinMessage({ role: 'user', content: 'second' }));
+    rpc.releaseBootstrap('ses_1'); // initial bootstrap
+    await nextTick(); // first send → -32031 → reset issues a 2nd create
+    rpc.releaseBootstrap('ses_2'); // reset succeeds → live session
+    await nextTick();
+    await nextTick();
+
+    // 'first' attempted twice (initial + retry); retry failed on the live
+    // session, so 'second' drained onto it. No terminate.
+    expect(rpc.sends.map((s: any) => s.content)).toEqual(['first', 'first', 'second']);
+    expect(exits).toEqual([]);
+  });
 });
