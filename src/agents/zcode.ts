@@ -1,8 +1,5 @@
 import { execFileSync } from 'node:child_process';
 import { EventEmitter } from 'node:events';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
-import { mkdirSync, writeFileSync } from 'node:fs';
 import { PassThrough, Writable } from 'node:stream';
 import type {
   AgentCapabilities,
@@ -77,34 +74,23 @@ function mapPermissionMode(mode: SpawnOpts['permissionMode']): ZcodeMode {
 }
 
 // Flatten a cli2im UserMessage to the plain string zcode's `content` wants.
-// Images are written to temp files and referenced in the prompt (zcode can
-// read them from disk), same technique the gemini/agy plugins use.
+//
+// In the standard pipeline, media.ts already collapses the message to a plain
+// string for zcode (including explicit Read-tool instructions for any images,
+// since GLM-5.2 has no native multimodal — it sees images by reading the file,
+// which inlines a vision block). So the array branch here is only a defensive
+// fallback for direct callers that hand us a structured content array: join
+// the text blocks and drop image blocks (they carry base64 that zcode's model
+// adapter would reject anyway — the path-based Read flow in media.ts is the
+// supported route).
 function messageToPrompt(message: UserMessage): string {
   if (typeof message.content === 'string') return message.content;
-
-  const textParts: string[] = [];
-  const imagePaths: string[] = [];
-
-  for (const block of message.content) {
-    if (block.type === 'text') {
-      textParts.push(block.text);
-    } else if (block.type === 'image') {
-      const ext = block.source.media_type.split('/')[1] ?? 'png';
-      const dir = join(tmpdir(), 'cli2im-zcode-images');
-      mkdirSync(dir, { recursive: true });
-      const filePath = join(dir, `img-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${ext}`);
-      writeFileSync(filePath, Buffer.from(block.source.data, 'base64'));
-      imagePaths.push(filePath);
-    }
-  }
-
-  if (imagePaths.length > 0) {
-    const fileList = imagePaths.map((p) => `- ${p}`).join('\n');
-    textParts.push(`\n[用户发送了 ${imagePaths.length} 张图片，已保存到以下路径，请用读取文件的能力查看后分析：\n${fileList}\n]`);
-  }
-
-  return textParts.join('\n');
+  return message.content
+    .filter((block) => block.type === 'text')
+    .map((block) => (block as { type: 'text'; text: string }).text)
+    .join('\n');
 }
+
 
 // =============================================================================
 // The virtual process.

@@ -55,6 +55,17 @@ export async function buildUserMessageForAgent(
 
   const contentText = appendAttachmentPaths(text, attachments, false);
   if (agentName !== 'claude-code') {
+    // zcode/GLM-5.2 has no native multimodal (no `attachment:true` in its
+    // catalog), but it CAN see images by reading the file via its Read tool
+    // (which inlines the image as a vision block) and then running the
+    // analyze_image tool. So images must reach the agent as explicit file
+    // PATHS with a clear Read instruction in the prompt — not as base64
+    // blocks (which the model adapter rejects) and not as a bare "Attached
+    // files" list (which the agent ignores). The download step above already
+    // wrote each image to `attachment.localPath`.
+    if (agentName === 'zcode') {
+      return { role: 'user', content: appendImageReadInstruction(text, attachments) };
+    }
     return { role: 'user', content: contentText };
   }
 
@@ -95,6 +106,30 @@ function appendAttachmentPaths(text: string, attachments: FileAttachment[], incl
 
   if (lines.length === 0) return text;
   return `${text}\n\nAttached files:\n${lines.join('\n')}`;
+}
+
+// Build a prompt for the zcode agent that makes it READ user-sent images.
+// GLM-5.2 has no native multimodal, but its Read tool inlines an image as a
+// vision block, after which the agent can analyze it (e.g. via analyze_image).
+// The key — verified by live experiment — is to name the Read tool explicitly
+// and give absolute paths; a generic "Attached files:" note is ignored.
+function appendImageReadInstruction(text: string, attachments: FileAttachment[]): string {
+  const images = attachments.filter((a) => a.type === 'image' && a.localPath);
+  if (images.length === 0) {
+    // No usable image (e.g. download failed) — fall back to the generic list
+    // so non-image attachments are still surfaced.
+    return appendAttachmentPaths(text, attachments, false);
+  }
+
+  const fileList = images.map((a) => `- ${a.localPath}`).join('\n');
+  const instruction =
+    images.length === 1
+      ? `用户发送了一张图片，保存在以下路径，请用 Read 工具读取它，然后结合图片内容回答用户的问题：\n${fileList}`
+      : `用户发送了 ${images.length} 张图片，保存在以下路径，请用 Read 工具逐一读取它们，然后结合图片内容回答用户的问题：\n${fileList}`;
+
+  // Non-image attachments (files, audio) still get the generic listing.
+  const others = appendAttachmentPaths('', attachments.filter((a) => a.type !== 'image'), false).trim();
+  return others ? `${text}\n\n${instruction}\n\n${others}` : `${text}\n\n${instruction}`;
 }
 
 function buildAttachmentFileName(attachment: FileAttachment): string {
