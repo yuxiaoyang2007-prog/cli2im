@@ -261,6 +261,12 @@ export class ZcodeVirtualProcess implements AgentProcess {
 
     this.bootstrapPromise = this.doBootstrap().catch((err) => {
       this.bootstrapError = err instanceof Error ? err : new Error(String(err));
+      // doBootstrap() assigns this.sessionId before awaiting session/subscribe,
+      // so a subscribe failure leaves a non-empty but unusable sessionId (no
+      // subscription = no events will ever arrive). Clear it on ANY bootstrap
+      // failure so the !sessionId checks downstream (e.g. the -32031 reset path)
+      // reliably treat this instance as unrecoverable.
+      this.sessionId = '';
       throw this.bootstrapError;
     });
     return this.bootstrapPromise;

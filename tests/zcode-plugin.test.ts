@@ -16,6 +16,7 @@ vi.mock('../src/agents/zcode-protocol.js', async (importOriginal) => {
     handlers: any;
     sends: any[] = [];
     private sendErrors: any[] = [];
+    private subscribeErrors: any[] = [];
     // Each session/create|resume pushes a waiter that releaseBootstrap() /
     // failBootstrap() settles in order. Supports the -32031 reset path, which
     // issues a second session/create.
@@ -38,7 +39,12 @@ vi.mock('../src/agents/zcode-protocol.js', async (importOriginal) => {
         if (err) return Promise.reject(err);
         return Promise.resolve({});
       }
-      // session/subscribe and anything else: resolve immediately.
+      if (method === 'session/subscribe') {
+        const err = this.subscribeErrors.shift();
+        if (err) return Promise.reject(err);
+        return Promise.resolve({});
+      }
+      // anything else: resolve immediately.
       return Promise.resolve({});
     }
 
@@ -59,6 +65,9 @@ vi.mock('../src/agents/zcode-protocol.js', async (importOriginal) => {
     }
     failNextSend(err: any): void {
       this.sendErrors.push(err);
+    }
+    failNextSubscribe(err: any): void {
+      this.subscribeErrors.push(err);
     }
   }
 
@@ -267,5 +276,38 @@ describe('ZcodeVirtualProcess turn lifecycle', () => {
     // session, so 'second' drained onto it. No terminate.
     expect(rpc.sends.map((s: any) => s.content)).toEqual(['first', 'first', 'second']);
     expect(exits).toEqual([]);
+  });
+
+  // Codex review on #2 (round 4): doBootstrap assigns sessionId before awaiting
+  // session/subscribe, so a subscribe failure during the -32031 reset leaves a
+  // non-empty but unusable sessionId. The retry catch must still treat this as
+  // unrecoverable (bail), not as a live-session retry failure (drain), or the
+  // queued prompt would be sent to a session that never delivers turn.completed.
+  it('bails when the -32031 reset creates a session but subscribe fails', async () => {
+    const plugin = new ZcodePlugin('/path/to/zcode.cjs');
+    const proc = plugin.spawn(baseOpts());
+    const rpc = lastRpc();
+    const events: AgentEvent[] = [];
+    const exits: Array<number | null> = [];
+    proc.stdout.on('data', (e: AgentEvent) => events.push(e));
+    proc.on('exit', (code: number | null) => exits.push(code));
+
+    rpc.failNextSend(new ZcodeRpcError(-32031, 'model gone')); // first send → -32031
+
+    proc.stdin.write(plugin.formatStdinMessage({ role: 'user', content: 'first' }));
+    proc.stdin.write(plugin.formatStdinMessage({ role: 'user', content: 'second' }));
+    rpc.releaseBootstrap('ses_1'); // initial bootstrap (subscribe ok)
+    await nextTick(); // send 'first' → -32031 → reset issues a 2nd create
+    rpc.failNextSubscribe(new Error('subscribe boom')); // reset's subscribe will reject
+    rpc.releaseBootstrap('ses_2'); // reset create ok → sessionId set → subscribe rejects
+    await nextTick();
+    await nextTick();
+
+    // Reset bootstrap failed at subscribe → unrecoverable → bail. 'second' is
+    // NOT drained onto the dead session; process terminates for a cold start.
+    expect(rpc.sends.map((s: any) => s.content)).toEqual(['first']);
+    const errors = events.filter((e: any) => e.type === 'error') as Array<{ message: string }>;
+    expect(errors.some((e) => /排队消息/.test(e.message))).toBe(true);
+    expect(exits).toEqual([null]);
   });
 });
