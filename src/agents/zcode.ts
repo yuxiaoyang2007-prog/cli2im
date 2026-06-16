@@ -239,16 +239,7 @@ export class ZcodeVirtualProcess implements AgentProcess {
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
         this.emitError(`zcode session 启动失败：${message}`);
-        // ensureBootstrap caches the error, so this instance can never recover.
-        // emitError alone does NOT recycle it — the manager only cold-starts on
-        // an exit event — so without terminate() every later message would fail
-        // the same way and any prompts queued during bootstrap would be dropped
-        // silently. Surface those queued prompts, then terminate so the next
-        // message starts a fresh process.
-        if (this.queuedPrompts.length > 0) {
-          this.emitError(`zcode session 启动失败，已丢弃 ${this.queuedPrompts.length} 条排队消息，请重新发送`);
-        }
-        this.terminate(null);
+        this.bailUnrecoverable();
         return;
       }
 
@@ -386,6 +377,13 @@ export class ZcodeVirtualProcess implements AgentProcess {
           this.activeTurn = null;
           const message = retryErr instanceof ZcodeRpcError ? `(${retryErr.code}) ${retryErr.message}` : String(retryErr);
           this.emitError(`zcode session/send 失败（重试后）：${message}`);
+          // resetToFreshSession() cleared sessionId and ensureBootstrap cached
+          // the error, so this instance can't recover. Falling through to the
+          // drain would shift the next queued prompt into runTurn, which returns
+          // immediately on the !sessionId guard — silently discarding it. Bail
+          // (surface queued prompts + terminate) instead.
+          this.bailUnrecoverable();
+          return;
         }
       } else {
         // -32010 = a turn is already running (queueing should prevent this),
@@ -600,6 +598,18 @@ export class ZcodeVirtualProcess implements AgentProcess {
   }
 
   // --- lifecycle / teardown -------------------------------------------------
+
+  // The instance can no longer serve turns (no session + cached bootstrap
+  // error). Surface any prompts queued during the failed bootstrap/reset
+  // instead of dropping them silently, then terminate so the manager
+  // cold-starts a fresh process on the next message. emitError alone does NOT
+  // recycle the process — the manager only recycles on an exit event.
+  private bailUnrecoverable(): void {
+    if (this.queuedPrompts.length > 0) {
+      this.emitError(`zcode session 启动失败，已丢弃 ${this.queuedPrompts.length} 条排队消息，请重新发送`);
+    }
+    this.terminate(null);
+  }
 
   private handleTransportExit(code: number | null, err?: Error): void {
     if (this.terminated) return;

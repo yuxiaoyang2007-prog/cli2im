@@ -16,22 +16,21 @@ vi.mock('../src/agents/zcode-protocol.js', async (importOriginal) => {
     handlers: any;
     sends: any[] = [];
     private sendErrors: any[] = [];
-    private resolveCreate!: (v: any) => void;
-    private rejectCreate!: (e: any) => void;
-    private createPromise: Promise<any>;
+    // Each session/create|resume pushes a waiter that releaseBootstrap() /
+    // failBootstrap() settles in order. Supports the -32031 reset path, which
+    // issues a second session/create.
+    private createWaiters: Array<{ resolve: (v: any) => void; reject: (e: any) => void }> = [];
 
     constructor(_child: any, handlers: any) {
       this.handlers = handlers;
-      this.createPromise = new Promise((res, rej) => {
-        this.resolveCreate = res;
-        this.rejectCreate = rej;
-      });
       reg.instances.push(this);
     }
 
     sendRequest(method: string, params?: any): Promise<any> {
       if (method === 'session/create' || method === 'session/resume') {
-        return this.createPromise;
+        return new Promise((resolve, reject) => {
+          this.createWaiters.push({ resolve, reject });
+        });
       }
       if (method === 'session/send') {
         this.sends.push(params);
@@ -50,16 +49,16 @@ vi.mock('../src/agents/zcode-protocol.js', async (importOriginal) => {
 
     // --- test helpers ---
     releaseBootstrap(sessionId = 'ses_test'): void {
-      this.resolveCreate({ session: { sessionId } });
+      this.createWaiters.shift()?.resolve({ session: { sessionId } });
+    }
+    failBootstrap(err: any): void {
+      this.createWaiters.shift()?.reject(err);
     }
     emitEvent(env: any): void {
       this.handlers.onSessionEvent?.(env);
     }
     failNextSend(err: any): void {
       this.sendErrors.push(err);
-    }
-    failBootstrap(err: any): void {
-      this.rejectCreate(err);
     }
   }
 
@@ -71,6 +70,7 @@ vi.mock('../src/agents/zcode-protocol.js', async (importOriginal) => {
 });
 
 import { ZcodePlugin } from '../src/agents/zcode.js';
+import { ZcodeRpcError } from '../src/agents/zcode-protocol.js';
 import type { SpawnOpts } from '../src/types.js';
 
 function baseOpts(overrides: Partial<SpawnOpts> = {}): SpawnOpts {
@@ -207,6 +207,38 @@ describe('ZcodeVirtualProcess turn lifecycle', () => {
     expect(errors.some((e) => /启动失败/.test(e.message))).toBe(true);
     expect(errors.some((e) => /排队消息/.test(e.message))).toBe(true);
     // Process terminated so the manager cold-starts a fresh one next message.
+    expect(exits).toEqual([null]);
+  });
+
+  // Codex review on #2 (round 3): on -32031, resetToFreshSession() clears
+  // sessionId; if its bootstrap then fails, the send-failure path must not fall
+  // through to the drain (runTurn would return on !sessionId and silently drop
+  // the queued prompt). It must surface the queue and terminate instead.
+  it('surfaces queued prompts and terminates when the -32031 reset bootstrap fails', async () => {
+    const plugin = new ZcodePlugin('/path/to/zcode.cjs');
+    const proc = plugin.spawn(baseOpts());
+    const rpc = lastRpc();
+    const events: AgentEvent[] = [];
+    const exits: Array<number | null> = [];
+    proc.stdout.on('data', (e: AgentEvent) => events.push(e));
+    proc.on('exit', (code: number | null) => exits.push(code));
+
+    rpc.failNextSend(new ZcodeRpcError(-32031, 'model gone')); // first send → -32031
+
+    proc.stdin.write(plugin.formatStdinMessage({ role: 'user', content: 'first' }));
+    proc.stdin.write(plugin.formatStdinMessage({ role: 'user', content: 'second' }));
+    rpc.releaseBootstrap('ses_1'); // initial bootstrap succeeds
+    await nextTick(); // send 'first' fires, -32031 → reset issues a 2nd create
+    rpc.failBootstrap(new Error('reset create boom')); // the reset bootstrap fails
+    await nextTick();
+    await nextTick();
+
+    // Only 'first' was ever sent; 'second' was NOT silently shifted onto an
+    // empty session.
+    expect(rpc.sends.map((s: any) => s.content)).toEqual(['first']);
+    const errors = events.filter((e: any) => e.type === 'error') as Array<{ message: string }>;
+    expect(errors.some((e) => /重试后/.test(e.message))).toBe(true);
+    expect(errors.some((e) => /排队消息/.test(e.message))).toBe(true);
     expect(exits).toEqual([null]);
   });
 });
