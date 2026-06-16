@@ -353,11 +353,13 @@ export class ZcodeVirtualProcess implements AgentProcess {
       this.activeTurn = { resolve, reject };
     });
 
+    let sent = false;
     try {
       await this.rpc.sendRequest('session/send', {
         sessionId: this.sessionId,
         content: prompt,
       });
+      sent = true;
     } catch (err) {
       // -32031 = the session's model is no longer available. The session may
       // have resumed fine but send refuses because the bound model is gone.
@@ -374,11 +376,11 @@ export class ZcodeVirtualProcess implements AgentProcess {
             sessionId: this.sessionId,
             content: prompt,
           });
+          sent = true;
         } catch (retryErr) {
           this.activeTurn = null;
           const message = retryErr instanceof ZcodeRpcError ? `(${retryErr.code}) ${retryErr.message}` : String(retryErr);
           this.emitError(`zcode session/send 失败（重试后）：${message}`);
-          return;
         }
       } else {
         // -32010 = a turn is already running (queueing should prevent this),
@@ -387,7 +389,6 @@ export class ZcodeVirtualProcess implements AgentProcess {
         this.activeTurn = null;
         const message = err instanceof ZcodeRpcError ? `(${err.code}) ${err.message}` : String(err);
         this.emitError(`zcode session/send 失败：${message}`);
-        return;
       }
     }
 
@@ -396,15 +397,20 @@ export class ZcodeVirtualProcess implements AgentProcess {
     // terminate. The error is already surfaced via emitError at each reject
     // site, so swallow it here: letting it escape would become an unhandled
     // rejection (callers invoke enqueue as `void this.enqueue(...)`) and would
-    // skip the queue drain below.
-    try {
-      await turn;
-    } catch {
-      // Turn failed; error already emitted. Fall through to drain so any
-      // prompts queued during this turn still run (skipped if terminated).
+    // skip the queue drain below. Only await if the send actually went out;
+    // on a send failure `turn` never resolves.
+    if (sent) {
+      try {
+        await turn;
+      } catch {
+        // Turn failed; error already emitted.
+      }
     }
 
-    // Drain any prompts that queued while this turn was running.
+    // Drain any prompts that queued while this turn was running OR while it
+    // failed to start — runs on the send-failure path too, so a message queued
+    // during bootstrap is never stranded behind a later one. Skipped when
+    // terminated (terminate() already clears the queue).
     const next = this.queuedPrompts.shift();
     if (next && !this.terminated) {
       await this.runTurn(next);

@@ -15,6 +15,7 @@ vi.mock('../src/agents/zcode-protocol.js', async (importOriginal) => {
   class FakeRpcClient {
     handlers: any;
     sends: any[] = [];
+    private sendErrors: any[] = [];
     private resolveCreate!: (v: any) => void;
     private createPromise: Promise<any>;
 
@@ -32,6 +33,8 @@ vi.mock('../src/agents/zcode-protocol.js', async (importOriginal) => {
       }
       if (method === 'session/send') {
         this.sends.push(params);
+        const err = this.sendErrors.shift();
+        if (err) return Promise.reject(err);
         return Promise.resolve({});
       }
       // session/subscribe and anything else: resolve immediately.
@@ -49,6 +52,9 @@ vi.mock('../src/agents/zcode-protocol.js', async (importOriginal) => {
     }
     emitEvent(env: any): void {
       this.handlers.onSessionEvent?.(env);
+    }
+    failNextSend(err: any): void {
+      this.sendErrors.push(err);
     }
   }
 
@@ -148,5 +154,25 @@ describe('ZcodeVirtualProcess turn lifecycle', () => {
     } finally {
       process.off('unhandledRejection', onRej);
     }
+  });
+
+  // Regression (Codex review on #2): when the first send fails, the prompt
+  // queued during bootstrap must still drain in order, not get stranded and
+  // later run behind a newer message.
+  it('drains a bootstrap-queued prompt in order when the first send fails', async () => {
+    const plugin = new ZcodePlugin('/path/to/zcode.cjs');
+    const proc = plugin.spawn(baseOpts());
+    const rpc = lastRpc();
+    rpc.failNextSend(new Error('send boom')); // first session/send rejects
+
+    proc.stdin.write(plugin.formatStdinMessage({ role: 'user', content: 'first' }));
+    proc.stdin.write(plugin.formatStdinMessage({ role: 'user', content: 'second' }));
+    rpc.releaseBootstrap('ses_1');
+    await nextTick();
+    await nextTick();
+
+    // First send attempted (and failed); the queued second drained right after,
+    // preserving order — not left dangling for a future message.
+    expect(rpc.sends.map((s: any) => s.content)).toEqual(['first', 'second']);
   });
 });
