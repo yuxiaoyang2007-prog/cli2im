@@ -122,6 +122,12 @@ export class ZcodeVirtualProcess implements AgentProcess {
   private bootstrapPromise: Promise<void> | undefined;
   private bootstrapError: Error | undefined;
   private activeTurn: PendingTurn | null = null;
+  // True while enqueue() is driving the bootstrap → runTurn path, before
+  // activeTurn is set. activeTurn alone is not enough: it's assigned inside
+  // runTurn *after* the async ensureBootstrap() await, so two messages that
+  // arrive before the first bootstrap resolves would both see activeTurn ===
+  // null and race into concurrent session/send ("turn already running").
+  private driving = false;
   private queuedPrompts: string[] = [];
   // True once we've streamed any assistant text for the active turn via
   // part.delta. zcode (in build mode) often delivers the whole answer only
@@ -217,24 +223,31 @@ export class ZcodeVirtualProcess implements AgentProcess {
   private async enqueue(prompt: string): Promise<void> {
     if (this.terminated) return;
 
-    // If a turn is already running, queue behind it. The runTurn loop drains
-    // queued prompts when the active turn resolves.
-    if (this.activeTurn) {
+    // If a turn is already running OR one is being set up (bootstrap in
+    // flight), queue behind it. The runTurn loop drains queued prompts when
+    // the active turn resolves.
+    if (this.activeTurn || this.driving) {
       this.queuedPrompts.push(prompt);
       return;
     }
 
     // First message (or after a turn finished) drives bootstrap + runTurn.
+    this.driving = true;
     try {
-      await this.ensureBootstrap();
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      this.emitError(`zcode session 启动失败：${message}`);
-      return;
-    }
+      try {
+        await this.ensureBootstrap();
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        this.emitError(`zcode session 启动失败：${message}`);
+        this.bailUnrecoverable();
+        return;
+      }
 
-    if (this.terminated) return;
-    await this.runTurn(prompt);
+      if (this.terminated) return;
+      await this.runTurn(prompt);
+    } finally {
+      this.driving = false;
+    }
   }
 
   private async ensureBootstrap(): Promise<void> {
@@ -248,6 +261,12 @@ export class ZcodeVirtualProcess implements AgentProcess {
 
     this.bootstrapPromise = this.doBootstrap().catch((err) => {
       this.bootstrapError = err instanceof Error ? err : new Error(String(err));
+      // doBootstrap() assigns this.sessionId before awaiting session/subscribe,
+      // so a subscribe failure leaves a non-empty but unusable sessionId (no
+      // subscription = no events will ever arrive). Clear it on ANY bootstrap
+      // failure so the !sessionId checks downstream (e.g. the -32031 reset path)
+      // reliably treat this instance as unrecoverable.
+      this.sessionId = '';
       throw this.bootstrapError;
     });
     return this.bootstrapPromise;
@@ -336,11 +355,13 @@ export class ZcodeVirtualProcess implements AgentProcess {
       this.activeTurn = { resolve, reject };
     });
 
+    let sent = false;
     try {
       await this.rpc.sendRequest('session/send', {
         sessionId: this.sessionId,
         content: prompt,
       });
+      sent = true;
     } catch (err) {
       // -32031 = the session's model is no longer available. The session may
       // have resumed fine but send refuses because the bound model is gone.
@@ -357,11 +378,23 @@ export class ZcodeVirtualProcess implements AgentProcess {
             sessionId: this.sessionId,
             content: prompt,
           });
+          sent = true;
         } catch (retryErr) {
           this.activeTurn = null;
           const message = retryErr instanceof ZcodeRpcError ? `(${retryErr.code}) ${retryErr.message}` : String(retryErr);
           this.emitError(`zcode session/send 失败（重试后）：${message}`);
-          return;
+          if (!this.sessionId) {
+            // resetToFreshSession() failed: sessionId is cleared and the
+            // bootstrap error is cached, so this instance can't recover.
+            // Draining would shift the next queued prompt into runTurn, which
+            // returns immediately on the !sessionId guard — silently dropping
+            // it. Bail (surface queued prompts + terminate) instead.
+            this.bailUnrecoverable();
+            return;
+          }
+          // Reset succeeded but the retry send failed on the live session —
+          // fall through to the drain like any other send failure so queued
+          // prompts still run.
         }
       } else {
         // -32010 = a turn is already running (queueing should prevent this),
@@ -370,14 +403,28 @@ export class ZcodeVirtualProcess implements AgentProcess {
         this.activeTurn = null;
         const message = err instanceof ZcodeRpcError ? `(${err.code}) ${err.message}` : String(err);
         this.emitError(`zcode session/send 失败：${message}`);
-        return;
       }
     }
 
     // Wait for the turn.completed / turn.failed event to resolve this.
-    await turn;
+    // failTurn() rejects this promise on turn.failed, transport exit, or
+    // terminate. The error is already surfaced via emitError at each reject
+    // site, so swallow it here: letting it escape would become an unhandled
+    // rejection (callers invoke enqueue as `void this.enqueue(...)`) and would
+    // skip the queue drain below. Only await if the send actually went out;
+    // on a send failure `turn` never resolves.
+    if (sent) {
+      try {
+        await turn;
+      } catch {
+        // Turn failed; error already emitted.
+      }
+    }
 
-    // Drain any prompts that queued while this turn was running.
+    // Drain any prompts that queued while this turn was running OR while it
+    // failed to start — runs on the send-failure path too, so a message queued
+    // during bootstrap is never stranded behind a later one. Skipped when
+    // terminated (terminate() already clears the queue).
     const next = this.queuedPrompts.shift();
     if (next && !this.terminated) {
       await this.runTurn(next);
@@ -562,6 +609,18 @@ export class ZcodeVirtualProcess implements AgentProcess {
   }
 
   // --- lifecycle / teardown -------------------------------------------------
+
+  // The instance can no longer serve turns (no session + cached bootstrap
+  // error). Surface any prompts queued during the failed bootstrap/reset
+  // instead of dropping them silently, then terminate so the manager
+  // cold-starts a fresh process on the next message. emitError alone does NOT
+  // recycle the process — the manager only recycles on an exit event.
+  private bailUnrecoverable(): void {
+    if (this.queuedPrompts.length > 0) {
+      this.emitError(`zcode session 启动失败，已丢弃 ${this.queuedPrompts.length} 条排队消息，请重新发送`);
+    }
+    this.terminate(null);
+  }
 
   private handleTransportExit(code: number | null, err?: Error): void {
     if (this.terminated) return;
