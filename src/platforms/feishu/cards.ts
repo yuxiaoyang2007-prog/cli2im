@@ -14,6 +14,11 @@ interface StreamingCardState {
   timer: ReturnType<typeof setTimeout> | null;
   finalized: boolean;
   startedAt: number;
+  // Serializes patch (updateCard) calls for this card in call order. The Feishu
+  // adapter's updateCard ignores its seq arg and just overwrites the message, so
+  // without this a slow in-flight patch (e.g. the previous turn's fire-and-forget
+  // finalize) could land after a reopened turn's update and revert the message.
+  patchChain: Promise<unknown>;
 }
 
 interface ThrottleConfig {
@@ -54,13 +59,44 @@ export class StreamingCardController {
       timer: null,
       finalized: false,
       startedAt: Date.now(),
+      patchChain: Promise.resolve(),
     });
+  }
+
+  // Serialize a patch behind any in-flight patches for this card so a slow
+  // earlier patch can't land after a later one (the adapter ignores seq).
+  private patchCard(
+    card: StreamingCardState,
+    messageId: string,
+    display: string,
+    seq: number,
+    options: AbortableOptions,
+  ): Promise<void> {
+    const run = () =>
+      options.signal
+        ? this.adapter.updateCard(messageId, display, seq, { signal: options.signal })
+        : this.adapter.updateCard(messageId, display, seq);
+    const result = card.patchChain.then(run);
+    card.patchChain = result.catch(() => {});
+    return result;
   }
 
   handleEvent(sessionKey: string, event: AgentEvent, options: AbortableOptions = {}): void {
     if (options.signal?.aborted) return;
     const card = this.cards.get(sessionKey);
-    if (!card || card.finalized) return;
+    if (!card) return;
+
+    if (card.finalized) {
+      // The previous turn finalized this card. A fresh content event — or a
+      // terminal error (a drained turn can fail before emitting any text) —
+      // means a new turn began without the pipeline opening a card, e.g. a
+      // prompt the plugin drained from its internal queue after the previous
+      // turn ended. Reopen the same card so the new turn's output isn't dropped.
+      // status / result / a stray late delta of the finished turn do not reopen.
+      if (!this.isContentEvent(event) && event.type !== 'error') return;
+      this.reopenCard(card);
+      // fall through to render this event on the reopened card
+    }
 
     switch (event.type) {
       case 'text':
@@ -97,6 +133,32 @@ export class StreamingCardController {
         void this.finalizeCard(sessionKey, 'error', card, options);
         break;
     }
+  }
+
+  // Content events carry a turn's visible output; their arrival on a finalized
+  // card signals a new turn. status/result/error are control/terminal events
+  // and must not, on their own, reopen a card.
+  private isContentEvent(event: AgentEvent): boolean {
+    return (
+      event.type === 'text' ||
+      event.type === 'thinking' ||
+      event.type === 'tool_use' ||
+      event.type === 'tool_result'
+    );
+  }
+
+  // Reuse the same Feishu card message for a new turn, separating it from the
+  // previous (finalized) turn's output. The previous content is kept so the
+  // earlier reply isn't erased; messageId/updateSeq are preserved so the same
+  // message is edited in place (avoids the async race of sending a new card).
+  private reopenCard(card: StreamingCardState): void {
+    card.content = card.content ? `${card.content}\n\n---\n\n` : '';
+    card.toolStatus = '';
+    card.thinking = '';
+    card.finalized = false;
+    card.startedAt = Date.now();
+    card.lastUpdateAt = 0;
+    card.lastUpdateLength = card.content.length;
   }
 
   interruptCard(sessionKey: string, options: AbortableOptions = {}): void {
@@ -149,13 +211,7 @@ export class StreamingCardController {
     card.lastUpdateLength = card.content.length;
 
     try {
-      if (options.signal) {
-        await this.adapter.updateCard(card.messageId, display, card.updateSeq, {
-          signal: options.signal,
-        });
-      } else {
-        await this.adapter.updateCard(card.messageId, display, card.updateSeq);
-      }
+      await this.patchCard(card, card.messageId, display, card.updateSeq, options);
     } catch {
       // Card update failures should not interrupt the agent stream.
     }
@@ -184,21 +240,16 @@ export class StreamingCardController {
 
     if (card.messageId && !options.signal?.aborted) {
       try {
-        if (options.signal) {
-          await this.adapter.updateCard(card.messageId, display, ++card.updateSeq, {
-            signal: options.signal,
-          });
-        } else {
-          await this.adapter.updateCard(card.messageId, display, ++card.updateSeq);
-        }
+        await this.patchCard(card, card.messageId, display, ++card.updateSeq, options);
       } catch {
         // Best effort final update.
       }
     }
 
-    if (this.isCurrentCard(sessionKey, card)) {
-      this.cards.delete(sessionKey);
-    }
+    // Intentionally keep the finalized card in the map (don't delete): a prompt
+    // the plugin later drains from its internal queue produces events with no
+    // pipeline-opened card, and handleEvent reopens this one to render them.
+    // A normal next message overwrites it via startCard.
   }
 
   private isCurrentCard(sessionKey: string, card: StreamingCardState): boolean {
