@@ -16,6 +16,7 @@ vi.mock('../src/agents/zcode-protocol.js', async (importOriginal) => {
     handlers: any;
     sends: any[] = [];
     private sendErrors: any[] = [];
+    private persistentSendError: any;
     private subscribeErrors: any[] = [];
     // Each session/create|resume pushes a waiter that releaseBootstrap() /
     // failBootstrap() settles in order. Supports the -32031 reset path, which
@@ -35,7 +36,7 @@ vi.mock('../src/agents/zcode-protocol.js', async (importOriginal) => {
       }
       if (method === 'session/send') {
         this.sends.push(params);
-        const err = this.sendErrors.shift();
+        const err = this.sendErrors.shift() ?? this.persistentSendError;
         if (err) return Promise.reject(err);
         return Promise.resolve({});
       }
@@ -66,6 +67,15 @@ vi.mock('../src/agents/zcode-protocol.js', async (importOriginal) => {
     failNextSend(err: any): void {
       this.sendErrors.push(err);
     }
+    // Make EVERY subsequent session/send fail with this error (until cleared).
+    // Used to exhaust the same-session retry loop so the rebuild path is hit.
+    failAllSends(err: any): void {
+      this.persistentSendError = err;
+    }
+    clearSendErrors(): void {
+      this.sendErrors = [];
+      this.persistentSendError = undefined;
+    }
     failNextSubscribe(err: any): void {
       this.subscribeErrors.push(err);
     }
@@ -82,6 +92,11 @@ import { ZcodePlugin } from '../src/agents/zcode.js';
 import { ZcodeRpcError } from '../src/agents/zcode-protocol.js';
 import type { SpawnOpts } from '../src/types.js';
 
+// Make the same-session retry loop instant in tests so the rebuild path is
+// exercised quickly and deterministically.
+process.env.ZCODE_SEND_RETRY_DELAY_MS = '0';
+process.env.ZCODE_SEND_RETRY_MAX = '2';
+
 function baseOpts(overrides: Partial<SpawnOpts> = {}): SpawnOpts {
   return {
     workingDirectory: '/Users/test/project',
@@ -92,6 +107,13 @@ function baseOpts(overrides: Partial<SpawnOpts> = {}): SpawnOpts {
 
 function nextTick(): Promise<void> {
   return new Promise((resolve) => setImmediate(resolve));
+}
+
+// Wait long enough for the same-session retry loop (sleep(0) between attempts)
+// plus the rebuild to settle. setImmediate (nextTick) runs before setTimeout,
+// so a single nextTick doesn't reach the retries.
+function settle(): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, 50));
 }
 
 function lastRpc(): any {
@@ -232,21 +254,23 @@ describe('ZcodeVirtualProcess turn lifecycle', () => {
     proc.stdout.on('data', (e: AgentEvent) => events.push(e));
     proc.on('exit', (code: number | null) => exits.push(code));
 
-    rpc.failNextSend(new ZcodeRpcError(-32031, 'model gone')); // first send → -32031
+    // Persistent -32031 exhausts the same-session retries, then the rebuild
+    // path fires a 2nd session/create which we fail.
+    rpc.failAllSends(new ZcodeRpcError(-32031, 'model gone'));
 
     proc.stdin.write(plugin.formatStdinMessage({ role: 'user', content: 'first' }));
     proc.stdin.write(plugin.formatStdinMessage({ role: 'user', content: 'second' }));
     rpc.releaseBootstrap('ses_1'); // initial bootstrap succeeds
-    await nextTick(); // send 'first' fires, -32031 → reset issues a 2nd create
+    await settle(); // send 'first' fires, -32031 persists across retries → reset issues a 2nd create
     rpc.failBootstrap(new Error('reset create boom')); // the reset bootstrap fails
-    await nextTick();
-    await nextTick();
+    await settle();
 
-    // Only 'first' was ever sent; 'second' was NOT silently shifted onto an
-    // empty session.
-    expect(rpc.sends.map((s: any) => s.content)).toEqual(['first']);
+    // 'first' retried twice on the same session (both -32031), then rebuild
+    // attempted but its bootstrap failed → 'second' NOT shifted onto an empty
+    // session.
+    expect(rpc.sends.map((s: any) => s.content)).toEqual(['first', 'first']);
     const errors = events.filter((e: any) => e.type === 'error') as Array<{ message: string }>;
-    expect(errors.some((e) => /重试后/.test(e.message))).toBe(true);
+    expect(errors.some((e) => /失败/.test(e.message))).toBe(true);
     expect(errors.some((e) => /排队消息/.test(e.message))).toBe(true);
     expect(exits).toEqual([null]);
   });
@@ -261,20 +285,24 @@ describe('ZcodeVirtualProcess turn lifecycle', () => {
     const exits: Array<number | null> = [];
     proc.on('exit', (code: number | null) => exits.push(code));
 
-    rpc.failNextSend(new ZcodeRpcError(-32031, 'model gone')); // first send → -32031
-    rpc.failNextSend(new ZcodeRpcError(-32010, 'turn running')); // retry send fails (live session)
+    // Two -32031s exhaust the same-session retries; the rebuild then fires,
+    // and its one retry send fails with -32010 (a non-recoverable error on the
+    // live rebuilt session → ordinary drain, not terminate).
+    rpc.failNextSend(new ZcodeRpcError(-32031, 'model gone')); // send #1 (same session)
+    rpc.failNextSend(new ZcodeRpcError(-32031, 'model gone')); // send #2 (same session retry)
+    rpc.failNextSend(new ZcodeRpcError(-32010, 'turn running')); // send #3 (rebuilt session)
 
     proc.stdin.write(plugin.formatStdinMessage({ role: 'user', content: 'first' }));
     proc.stdin.write(plugin.formatStdinMessage({ role: 'user', content: 'second' }));
     rpc.releaseBootstrap('ses_1'); // initial bootstrap
-    await nextTick(); // first send → -32031 → reset issues a 2nd create
+    await settle(); // first send → -32031 ×2 → reset issues a 2nd create
     rpc.releaseBootstrap('ses_2'); // reset succeeds → live session
-    await nextTick();
-    await nextTick();
+    await settle();
 
-    // 'first' attempted twice (initial + retry); retry failed on the live
-    // session, so 'second' drained onto it. No terminate.
-    expect(rpc.sends.map((s: any) => s.content)).toEqual(['first', 'first', 'second']);
+    // 'first' attempted 3× (2 same-session retries + 1 on rebuilt session);
+    // the rebuilt-session send failed (-32010) so 'second' drained onto the
+    // live session. No terminate.
+    expect(rpc.sends.map((s: any) => s.content)).toEqual(['first', 'first', 'first', 'second']);
     expect(exits).toEqual([]);
   });
 
@@ -292,20 +320,21 @@ describe('ZcodeVirtualProcess turn lifecycle', () => {
     proc.stdout.on('data', (e: AgentEvent) => events.push(e));
     proc.on('exit', (code: number | null) => exits.push(code));
 
-    rpc.failNextSend(new ZcodeRpcError(-32031, 'model gone')); // first send → -32031
+    // Two -32031s exhaust the same-session retries, triggering the rebuild.
+    rpc.failNextSend(new ZcodeRpcError(-32031, 'model gone'));
+    rpc.failNextSend(new ZcodeRpcError(-32031, 'model gone'));
 
     proc.stdin.write(plugin.formatStdinMessage({ role: 'user', content: 'first' }));
     proc.stdin.write(plugin.formatStdinMessage({ role: 'user', content: 'second' }));
     rpc.releaseBootstrap('ses_1'); // initial bootstrap (subscribe ok)
-    await nextTick(); // send 'first' → -32031 → reset issues a 2nd create
+    await settle(); // send 'first' → -32031 ×2 → reset issues a 2nd create
     rpc.failNextSubscribe(new Error('subscribe boom')); // reset's subscribe will reject
     rpc.releaseBootstrap('ses_2'); // reset create ok → sessionId set → subscribe rejects
-    await nextTick();
-    await nextTick();
+    await settle();
 
     // Reset bootstrap failed at subscribe → unrecoverable → bail. 'second' is
     // NOT drained onto the dead session; process terminates for a cold start.
-    expect(rpc.sends.map((s: any) => s.content)).toEqual(['first']);
+    expect(rpc.sends.map((s: any) => s.content)).toEqual(['first', 'first']);
     const errors = events.filter((e: any) => e.type === 'error') as Array<{ message: string }>;
     expect(errors.some((e) => /排队消息/.test(e.message))).toBe(true);
     expect(exits).toEqual([null]);

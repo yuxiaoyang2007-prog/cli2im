@@ -67,6 +67,24 @@ interface PendingPermission {
 
 const PROMPT_ARG_MAX_BYTES = 100 * 1024;
 
+// -32031 is returned both for permanent model retirement and transient provider
+// overload (e.g. GLM 1305). Retry the SAME session before giving up and
+// rebuilding (which drops history). Tuned to wait out short provider spikes.
+// Read lazily so tests can override via env at runtime (ESM top-level consts
+// would evaluate before the test sets process.env).
+function sendRetryMaxAttempts(): number {
+  const v = Number(process.env.ZCODE_SEND_RETRY_MAX);
+  return Number.isFinite(v) && v > 0 ? v : 3;
+}
+function sendRetryBaseDelayMs(): number {
+  const v = Number(process.env.ZCODE_SEND_RETRY_DELAY_MS);
+  return Number.isFinite(v) && v >= 0 ? v : 1500;
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 function mapPermissionMode(mode: SpawnOpts['permissionMode']): ZcodeMode {
   // bypass  → yolo (no permission prompts at all)
   // blacklist → build (prompts for non-allowlisted tools → our card flow)
@@ -120,7 +138,12 @@ export class ZcodeVirtualProcess implements AgentProcess {
   // in turn.completed.response with zero part.delta events; in that case we
   // must emit the response as a single text event so the IM IM card shows it.
   private streamedTextThisTurn = false;
-  // Guard so we retry the fresh-session recovery at most once per turn.
+  // Guard so we rebuild the session at most once per turn. -32031 ("model
+  // unavailable") is returned both for permanent model retirement AND for
+  // transient provider overload (e.g. GLM 1305 "访问量过大"); rebuilding drops
+  // conversation history. So we retry the SAME session a few times first (with
+  // backoff) — transient overload self-resolves and history is preserved — and
+  // only rebuild once if the retries exhaust.
   private retriedFreshThisTurn = false;
   // requestId (zcode's, used in the AgentEvent) → JSON-RPC id (to reply to).
   private pendingPermissions = new Map<string, PendingPermission>();
@@ -324,6 +347,52 @@ export class ZcodeVirtualProcess implements AgentProcess {
     await this.ensureBootstrap();
   }
 
+  // Send a prompt with recovery for -32031 ("model unavailable"). -32031 is
+  // returned both when a model is PERMANENTLY retired and during TRANSIENT
+  // provider overload (e.g. GLM 1305 "访问量过大"). Rebuilding the session drops
+  // conversation history, which is the wrong call for a transient spike. So:
+  //   1. Retry the SAME session a few times with backoff (transient overload
+  //      typically self-resolves within seconds; history preserved).
+  //   2. If the retries exhaust, rebuild the session ONCE and try again
+  //      (genuine model retirement — history lost, but the bot keeps working).
+  // Throws only if both stages fail, so the caller's catch is terminal.
+  private async sendWithRecovery(prompt: string): Promise<boolean> {
+    const sendOnce = () =>
+      this.rpc.sendRequest('session/send', { sessionId: this.sessionId, content: prompt });
+
+    // Stage 1 — retry the same session.
+    let lastErr: unknown;
+    const maxAttempts = sendRetryMaxAttempts();
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      if (this.terminated) return false;
+      try {
+        await sendOnce();
+        return true;
+      } catch (err) {
+        lastErr = err;
+        // Only -32031 is recoverable here; any other error is terminal.
+        if (!(err instanceof ZcodeRpcError) || err.code !== -32031) throw err;
+        if (attempt < maxAttempts) {
+          const delay = sendRetryBaseDelayMs() * attempt;
+          console.warn(`[zcode] session/send -32031 (attempt ${attempt}/${maxAttempts}); retrying same session in ${delay}ms`);
+          await sleep(delay);
+        }
+      }
+    }
+
+    // Stage 2 — same-session retries exhausted; rebuild once.
+    if (this.retriedFreshThisTurn) {
+      // Already rebuilt this turn and it STILL fails — give up.
+      throw lastErr;
+    }
+    this.retriedFreshThisTurn = true;
+    console.warn(`[zcode] session/send -32031 persisted after ${maxAttempts} retries; rebuilding fresh session (history will be lost)`);
+    await this.resetToFreshSession();
+    if (this.terminated) return false;
+    await sendOnce();
+    return true;
+  }
+
   private async runTurn(prompt: string): Promise<void> {
     if (this.terminated || !this.sessionId) return;
 
@@ -343,52 +412,21 @@ export class ZcodeVirtualProcess implements AgentProcess {
 
     let sent = false;
     try {
-      await this.rpc.sendRequest('session/send', {
-        sessionId: this.sessionId,
-        content: prompt,
-      });
-      sent = true;
+      sent = await this.sendWithRecovery(prompt);
     } catch (err) {
-      // -32031 = the session's model is no longer available. The session may
-      // have resumed fine but send refuses because the bound model is gone.
-      // Recover by creating a brand-new session with the current default
-      // model and retrying the send once. History is lost, but the bot keeps
-      // working instead of being permanently stuck.
-      if (err instanceof ZcodeRpcError && err.code === -32031 && !this.retriedFreshThisTurn) {
-        this.retriedFreshThisTurn = true;
-        console.warn(`[zcode] session/send model unavailable (-32031); resetting to fresh session and retrying`);
-        try {
-          await this.resetToFreshSession();
-          if (this.terminated) return;
-          await this.rpc.sendRequest('session/send', {
-            sessionId: this.sessionId,
-            content: prompt,
-          });
-          sent = true;
-        } catch (retryErr) {
-          this.activeTurn = null;
-          const message = retryErr instanceof ZcodeRpcError ? `(${retryErr.code}) ${retryErr.message}` : String(retryErr);
-          this.emitError(`zcode session/send 失败（重试后）：${message}`);
-          if (!this.sessionId) {
-            // resetToFreshSession() failed: sessionId is cleared and the
-            // bootstrap error is cached, so this instance can't recover.
-            // Draining would shift the next queued prompt into runTurn, which
-            // returns immediately on the !sessionId guard — silently dropping
-            // it. Bail (surface queued prompts + terminate) instead.
-            this.bailUnrecoverable();
-            return;
-          }
-          // Reset succeeded but the retry send failed on the live session —
-          // fall through to the drain like any other send failure so queued
-          // prompts still run.
-        }
-      } else {
-        // -32010 = a turn is already running (queueing should prevent this),
-        // or any other error — surface and clear the slot so the next turn
-        // can proceed.
-        this.activeTurn = null;
-        const message = err instanceof ZcodeRpcError ? `(${err.code}) ${err.message}` : String(err);
-        this.emitError(`zcode session/send 失败：${message}`);
+      // sendWithRecovery only throws after exhausting both same-session
+      // retries AND the one allowed fresh-session rebuild. Surface the final
+      // error and clear the turn slot so the next turn can proceed.
+      this.activeTurn = null;
+      const message = err instanceof ZcodeRpcError ? `(${err.code}) ${err.message}` : String(err);
+      this.emitError(`zcode session/send 失败：${message}`);
+      if (!this.sessionId) {
+        // resetToFreshSession() failed: sessionId is cleared and the bootstrap
+        // error is cached, so this instance can't recover. Draining would shift
+        // the next queued prompt into runTurn, which returns immediately on the
+        // !sessionId guard — silently dropping it. Bail instead.
+        this.bailUnrecoverable();
+        return;
       }
     }
 
