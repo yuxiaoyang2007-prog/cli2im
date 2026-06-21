@@ -1040,9 +1040,17 @@ export function createHandoffSpawnResume(
 ) => Promise<{ pid: number; sessionId: string }> {
   return async (sessionKey, agentName, sessionId, workDir) => {
     const handlers = createEventHandlers(sessionKey);
+    const botName = sessionKey.split(':')[2];
+    const botConfig = getBotConfig?.(botName);
+    // Handoff/manual resume keeps the minimal "legacy" opts on purpose (see the
+    // "keeps legacy opts" test) — it deliberately does NOT re-derive
+    // permission/sandbox/timeouts from bot config. But the per-bot AGENTS.md
+    // runtime instructions must survive resume, otherwise they silently vanish
+    // for handed-off / card-resumed sessions and stop applying mid-conversation.
     const spawnOpts: SpawnOpts = {
       workingDirectory: workDir,
       permissionMode: 'blacklist',
+      appendSystemPrompt: await readAgentsInstructions(botConfig?.agentsFile, expandHome(workDir)),
     };
     const proc = await agentManager.resumeAgent(
       sessionKey,
