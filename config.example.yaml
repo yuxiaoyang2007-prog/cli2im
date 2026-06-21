@@ -38,6 +38,7 @@ bots:
                                     #   Defaults to AGENTS.md in workingDirectory when present.
                                     #   claude-code: appended to the system prompt (every turn).
                                     #   codex/gemini: place AGENTS.md/GEMINI.md in workingDirectory (read natively).
+                                    #   Must be a regular file (symlinks/FIFOs are ignored) under 256 KB.
                                     #   Set to false to disable the default lookup.
     # userOverrides:                # per-user overrides
     #   ou_xxxxxxxxxxxx:

@@ -1,8 +1,8 @@
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { resolveBotSpawnOpts } from '../src/index.js';
+import { MAX_AGENTS_FILE_BYTES, resolveBotSpawnOpts } from '../src/index.js';
 import type { BotConfig } from '../src/types.js';
 
 describe('resolveBotSpawnOpts', () => {
@@ -107,6 +107,41 @@ describe('resolveBotSpawnOpts', () => {
 
       const opts = await resolveBotSpawnOpts({
         botConfig: botConfig({ agentsFile: false }),
+        workingDirectory: workDir,
+      });
+
+      expect(opts.appendSystemPrompt).toBeUndefined();
+    });
+
+    it('refuses to follow a symlinked AGENTS.md (no escaping the working dir)', async () => {
+      const secret = join(workDir, 'secret.txt');
+      writeFileSync(secret, 'PRETEND PRIVATE KEY');
+      symlinkSync(secret, join(workDir, 'AGENTS.md'));
+
+      const opts = await resolveBotSpawnOpts({
+        botConfig: botConfig(),
+        workingDirectory: workDir,
+      });
+
+      expect(opts.appendSystemPrompt).toBeUndefined();
+    });
+
+    it('ignores non-regular files (e.g. a directory named AGENTS.md)', async () => {
+      mkdirSync(join(workDir, 'AGENTS.md'));
+
+      const opts = await resolveBotSpawnOpts({
+        botConfig: botConfig(),
+        workingDirectory: workDir,
+      });
+
+      expect(opts.appendSystemPrompt).toBeUndefined();
+    });
+
+    it('skips oversized instructions files', async () => {
+      writeFileSync(join(workDir, 'AGENTS.md'), 'x'.repeat(MAX_AGENTS_FILE_BYTES + 1));
+
+      const opts = await resolveBotSpawnOpts({
+        botConfig: botConfig(),
         workingDirectory: workDir,
       });
 
