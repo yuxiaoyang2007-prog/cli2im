@@ -36,6 +36,55 @@ function waitFor(predicate: () => boolean, timeoutMs = 500): Promise<void> {
   });
 }
 
+describe('ClaudeCodePlugin runtime instructions (appendSystemPrompt)', () => {
+  it('appends to the claude_code preset rather than replacing the system prompt', async () => {
+    let captured: any;
+    const queryFn = vi.fn(({ options }) => (async function* () {
+      captured = options;
+      yield successResult('ses_append');
+    })());
+    const plugin = new ClaudeCodePlugin('/usr/local/bin/claude', queryFn as any);
+    const proc = plugin.spawn({ ...baseOpts(), appendSystemPrompt: 'Always answer in French.' });
+    const stdoutEvents: AgentEvent[] = [];
+    proc.stdout.on('data', (event: AgentEvent) => stdoutEvents.push(event));
+
+    proc.stdin.write(plugin.formatStdinMessage({ role: 'user', content: 'hi' }));
+    await waitFor(() => stdoutEvents.some((event) => event.type === 'result'));
+
+    expect(captured.systemPrompt).toEqual({
+      type: 'preset',
+      preset: 'claude_code',
+      append: 'Always answer in French.',
+    });
+  });
+
+  it('leaves systemPrompt untouched when no runtime instructions are set', async () => {
+    let captured: any;
+    const queryFn = vi.fn(({ options }) => (async function* () {
+      captured = options;
+      yield successResult('ses_plain');
+    })());
+    const plugin = new ClaudeCodePlugin('/usr/local/bin/claude', queryFn as any);
+    const proc = plugin.spawn(baseOpts());
+    const stdoutEvents: AgentEvent[] = [];
+    proc.stdout.on('data', (event: AgentEvent) => stdoutEvents.push(event));
+
+    proc.stdin.write(plugin.formatStdinMessage({ role: 'user', content: 'hi' }));
+    await waitFor(() => stdoutEvents.some((event) => event.type === 'result'));
+
+    expect(captured.systemPrompt).toBeUndefined();
+  });
+
+  it('maps appendSystemPrompt to --append-system-prompt in buildSpawnArgs', () => {
+    const plugin = new ClaudeCodePlugin('/usr/local/bin/claude');
+    const args = plugin.buildSpawnArgs({ ...baseOpts(), appendSystemPrompt: 'Be concise.' });
+
+    const flagIndex = args.indexOf('--append-system-prompt');
+    expect(flagIndex).toBeGreaterThanOrEqual(0);
+    expect(args[flagIndex + 1]).toBe('Be concise.');
+  });
+});
+
 describe('ClaudeCodePlugin stdout parser', () => {
   const plugin = new ClaudeCodePlugin('/usr/local/bin/claude');
 

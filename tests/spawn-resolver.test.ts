@@ -1,6 +1,7 @@
-import { homedir } from 'node:os';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { resolveBotSpawnOpts } from '../src/index.js';
 import type { BotConfig } from '../src/types.js';
 
@@ -46,6 +47,71 @@ describe('resolveBotSpawnOpts', () => {
 
     expect(opts.sandbox).toBeUndefined();
     expect(opts.sandboxBoxRoots).toBeUndefined();
+  });
+
+  describe('agentsFile (runtime instructions)', () => {
+    let workDir: string;
+
+    beforeEach(() => {
+      workDir = mkdtempSync(join(tmpdir(), 'cli2im-agents-'));
+    });
+
+    afterEach(() => {
+      rmSync(workDir, { recursive: true, force: true });
+    });
+
+    it('reads AGENTS.md from the working directory by default', async () => {
+      writeFileSync(join(workDir, 'AGENTS.md'), '  Always respond in French.\n');
+
+      const opts = await resolveBotSpawnOpts({
+        botConfig: botConfig(),
+        workingDirectory: workDir,
+      });
+
+      expect(opts.appendSystemPrompt).toBe('Always respond in French.');
+    });
+
+    it('leaves appendSystemPrompt undefined when no AGENTS.md exists', async () => {
+      const opts = await resolveBotSpawnOpts({
+        botConfig: botConfig(),
+        workingDirectory: workDir,
+      });
+
+      expect(opts.appendSystemPrompt).toBeUndefined();
+    });
+
+    it('treats an empty AGENTS.md as no instructions', async () => {
+      writeFileSync(join(workDir, 'AGENTS.md'), '   \n\n');
+
+      const opts = await resolveBotSpawnOpts({
+        botConfig: botConfig(),
+        workingDirectory: workDir,
+      });
+
+      expect(opts.appendSystemPrompt).toBeUndefined();
+    });
+
+    it('honors a custom relative agentsFile path', async () => {
+      writeFileSync(join(workDir, 'runtime.md'), 'Custom instructions.');
+
+      const opts = await resolveBotSpawnOpts({
+        botConfig: botConfig({ agentsFile: 'runtime.md' }),
+        workingDirectory: workDir,
+      });
+
+      expect(opts.appendSystemPrompt).toBe('Custom instructions.');
+    });
+
+    it('disables the lookup when agentsFile is false', async () => {
+      writeFileSync(join(workDir, 'AGENTS.md'), 'Should be ignored.');
+
+      const opts = await resolveBotSpawnOpts({
+        botConfig: botConfig({ agentsFile: false }),
+        workingDirectory: workDir,
+      });
+
+      expect(opts.appendSystemPrompt).toBeUndefined();
+    });
   });
 });
 

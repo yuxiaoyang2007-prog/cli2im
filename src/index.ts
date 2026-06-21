@@ -66,7 +66,7 @@ import {
 } from './runtime/session-scoped-cleanup.js';
 import { getCli2imDataDir } from './util/data-dir.js';
 import { homedir } from 'node:os';
-import { join, relative } from 'node:path';
+import { join, relative, isAbsolute } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { mkdirSync } from 'node:fs';
 import { readFile, realpath, stat } from 'node:fs/promises';
@@ -928,11 +928,40 @@ export interface ResolveBotSpawnOptsInput {
 
 export type BotSpawnOptsResolver = (params: ResolveBotSpawnOptsInput) => Promise<SpawnOpts>;
 
+/** Default per-bot runtime instructions file, read from the working directory. */
+export const DEFAULT_AGENTS_FILE = 'AGENTS.md';
+
+/**
+ * Resolve and read a bot's runtime instructions file (the "agent runtime"
+ * AGENTS.md). Returns the trimmed file contents, or `undefined` when the
+ * feature is disabled, the file is missing/empty, or it cannot be read — so a
+ * missing AGENTS.md never blocks a bot from spawning.
+ */
+export async function readAgentsInstructions(
+  agentsFile: string | false | undefined,
+  workingDirectory: string,
+): Promise<string | undefined> {
+  if (agentsFile === false || agentsFile === '') return undefined;
+  const candidate = expandHome(agentsFile ?? DEFAULT_AGENTS_FILE);
+  const filePath = isAbsolute(candidate) ? candidate : join(workingDirectory, candidate);
+  try {
+    const content = await readFile(filePath, 'utf-8');
+    const trimmed = content.trim();
+    return trimmed.length > 0 ? trimmed : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 export async function resolveBotSpawnOpts(params: ResolveBotSpawnOptsInput): Promise<SpawnOpts> {
   const workingDirectory = expandHome(params.workingDirectory);
   const addDirs = params.addDirs?.length
     ? params.addDirs.map((dir) => expandHome(dir))
     : undefined;
+  const appendSystemPrompt = await readAgentsInstructions(
+    params.botConfig.agentsFile,
+    workingDirectory,
+  );
 
   return {
     workingDirectory,
@@ -946,6 +975,7 @@ export async function resolveBotSpawnOpts(params: ResolveBotSpawnOptsInput): Pro
     reasoningEffort: params.reasoningEffort,
     initialPrompt: params.initialPrompt,
     addDirs,
+    appendSystemPrompt,
   };
 }
 

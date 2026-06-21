@@ -33,6 +33,12 @@ bots:
     # turnTimeoutMs: 600000         # hard cap N ms after process START (not per-turn, never reset — can kill healthy long sessions); unset = no cap
     # idleTimeoutMs: 300000         # kill + auto-recover a session after N ms of zero output (stall recovery); unset = disabled
     # larkCliConfigDir: ~/.lark-cli/  # path to lark-cli config (for lark-cli skills)
+    # agentsFile: AGENTS.md         # per-bot runtime instructions read every conversation.
+                                    #   Relative paths resolve against workingDirectory; ~ is expanded.
+                                    #   Defaults to AGENTS.md in workingDirectory when present.
+                                    #   claude-code: appended to the system prompt (every turn).
+                                    #   codex/gemini: place AGENTS.md/GEMINI.md in workingDirectory (read natively).
+                                    #   Set to false to disable the default lookup.
     # userOverrides:                # per-user overrides
     #   ou_xxxxxxxxxxxx:
     #     workingDirectory: ~/user-a-projects

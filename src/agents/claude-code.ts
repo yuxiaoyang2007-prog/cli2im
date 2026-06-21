@@ -567,7 +567,9 @@ export class ClaudeCodeVirtualProcess implements AgentProcess {
       allowDangerouslySkipPermissions: permissionMode === 'bypassPermissions' ? true : undefined,
       includePartialMessages: true,
       env: { ...process.env, ...this.opts.env },
-      systemPrompt: this.opts.systemPrompt,
+      systemPrompt: this.opts.appendSystemPrompt
+        ? { type: 'preset', preset: 'claude_code', append: this.opts.appendSystemPrompt }
+        : this.opts.systemPrompt,
       effort: this.opts.reasoningEffort,
       pathToClaudeCodeExecutable: this.binary,
       canUseTool: this.canUseTool,
@@ -690,6 +692,10 @@ export class ClaudeCodePlugin implements AgentPlugin {
 
     if (opts.systemPrompt) {
       args.push('--system-prompt', opts.systemPrompt);
+    }
+
+    if (opts.appendSystemPrompt) {
+      args.push('--append-system-prompt', opts.appendSystemPrompt);
     }
 
     return args;
