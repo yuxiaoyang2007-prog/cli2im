@@ -17,6 +17,14 @@ export interface SpawnOpts {
   permissionMode: 'bypass' | 'blacklist';
   env?: Record<string, string>;
   systemPrompt?: string;
+  /**
+   * Per-bot runtime instructions (e.g. the contents of an AGENTS.md file).
+   * Unlike `systemPrompt` (which replaces the agent's system prompt), this is
+   * *appended* to the agent's default system prompt so it augments — rather
+   * than clobbers — built-in behavior. Injected on every turn of every
+   * conversation by agents that support an append hook (claude-code).
+   */
+  appendSystemPrompt?: string;
   reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max';
   sandboxMode?: string;
   autoApprove?: boolean;
@@ -247,6 +255,13 @@ export interface BotConfig {
   workingDirectory: string;
   allowFrom: string[];
   permissionMode: 'bypass' | 'blacklist';
+  /**
+   * Path to a per-bot runtime instructions file read on every conversation.
+   * Relative paths resolve against `workingDirectory`; `~` is expanded.
+   * Defaults to `AGENTS.md` (read from the working directory when present).
+   * Set to `false` (or an empty string) to disable the default lookup.
+   */
+  agentsFile?: string | false;
   larkCliConfigDir?: string;
   autoApprove?: boolean;
   turnTimeoutMs?: number;

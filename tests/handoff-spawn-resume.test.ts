@@ -1,11 +1,20 @@
-import { homedir } from 'node:os';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createHandoffSpawnResume, startAgentProcessForSession } from '../src/index.js';
 import type { AgentManagerEvents } from '../src/agents/manager.js';
 import type { AgentPlugin, AgentProcess, BotConfig, Session, SessionKey } from '../src/types.js';
 
 describe('handoff spawnResume store sync', () => {
+  const tempDirs: string[] = [];
+
+  afterEach(() => {
+    while (tempDirs.length) {
+      rmSync(tempDirs.pop()!, { recursive: true, force: true });
+    }
+  });
+
   it('updates an existing row after resume succeeds', async () => {
     const sessionKey = 'telegram:chat_1:codexbot' as SessionKey;
     const existingSession = sessionRow('row_existing', sessionKey);
@@ -51,6 +60,32 @@ describe('handoff spawnResume store sync', () => {
     expect(store.updateAgentSessionId).toHaveBeenCalledWith('row_created', 'agent_session_2');
     expect(store.updateState).toHaveBeenCalledWith('row_created', 'active');
     expect(store.touch).toHaveBeenCalledWith('row_created');
+  });
+
+  it('applies per-bot AGENTS.md instructions on handoff resume', async () => {
+    const workDir = mkdtempSync(join(tmpdir(), 'cli2im-handoff-agents-'));
+    tempDirs.push(workDir);
+    writeFileSync(join(workDir, 'AGENTS.md'), 'Resumed sessions still follow this.');
+
+    const sessionKey = 'feishu:chat_1:ccbot' as SessionKey;
+    const existingSession = sessionRow('row_cc', sessionKey);
+    const getBotConfig = vi.fn(() => botConfig({ agent: 'claude-code' }));
+    const { spawnResume, agentManager } = createDeps(existingSession, getBotConfig);
+
+    await spawnResume(sessionKey, 'claude-code', 'agent_session_cc', workDir);
+
+    expect(getBotConfig).toHaveBeenCalledWith('ccbot');
+    expect(agentManager.resumeAgent).toHaveBeenCalledWith(
+      sessionKey,
+      'claude-code',
+      'agent_session_cc',
+      {
+        workingDirectory: workDir,
+        permissionMode: 'blacklist',
+        appendSystemPrompt: 'Resumed sessions still follow this.',
+      },
+      expect.any(Object),
+    );
   });
 
   it('keeps legacy opts for non-PTY handoff resumes', async () => {

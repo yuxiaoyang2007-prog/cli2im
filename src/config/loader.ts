@@ -47,6 +47,13 @@ function validateConfig(config: AppConfig): void {
     if (bot.requireMention != null && typeof bot.requireMention !== 'boolean') {
       throw new Error(`Config error: bot "${name}" requireMention must be a boolean`);
     }
+    if (
+      bot.agentsFile != null
+      && bot.agentsFile !== false
+      && typeof bot.agentsFile !== 'string'
+    ) {
+      throw new Error(`Config error: bot "${name}" agentsFile must be a string or false`);
+    }
     if (bot.groupPolicy != null && bot.groupPolicy !== 'all' && bot.groupPolicy !== 'allowlist') {
       throw new Error(`Config error: bot "${name}" groupPolicy must be "all" or "allowlist"`);
     }

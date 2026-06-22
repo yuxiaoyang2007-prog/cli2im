@@ -66,10 +66,10 @@ import {
 } from './runtime/session-scoped-cleanup.js';
 import { getCli2imDataDir } from './util/data-dir.js';
 import { homedir } from 'node:os';
-import { join, relative } from 'node:path';
+import { join, relative, isAbsolute } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { mkdirSync } from 'node:fs';
-import { readFile, realpath, stat } from 'node:fs/promises';
+import { readFile, realpath, stat, lstat } from 'node:fs/promises';
 
 const CONFIG_PATH = process.env.CLI2IM_CONFIG ?? join(homedir(), '.cli2im', 'config.yaml');
 const startedAt = Date.now();
@@ -928,11 +928,52 @@ export interface ResolveBotSpawnOptsInput {
 
 export type BotSpawnOptsResolver = (params: ResolveBotSpawnOptsInput) => Promise<SpawnOpts>;
 
+/** Default per-bot runtime instructions file, read from the working directory. */
+export const DEFAULT_AGENTS_FILE = 'AGENTS.md';
+
+/** Upper bound on the runtime instructions file size (bytes). */
+export const MAX_AGENTS_FILE_BYTES = 256 * 1024;
+
+/**
+ * Resolve and read a bot's runtime instructions file (the "agent runtime"
+ * AGENTS.md). Returns the trimmed file contents, or `undefined` when the
+ * feature is disabled, the file is missing/empty, or it cannot be read — so a
+ * missing AGENTS.md never blocks a bot from spawning.
+ *
+ * Hardening: the path is `lstat`-ed and must be a regular file. This rejects
+ * symlinks (so a file dropped into an untrusted workingDirectory — e.g. a
+ * cloned repo — cannot point AGENTS.md at a secret like `~/.ssh/id_rsa` and
+ * have it silently injected into the system prompt) and special files such as
+ * FIFOs/devices (which would hang the read and block the bot from spawning).
+ * Oversized files are skipped rather than blindly loaded into the prompt.
+ */
+export async function readAgentsInstructions(
+  agentsFile: string | false | undefined,
+  workingDirectory: string,
+): Promise<string | undefined> {
+  if (agentsFile === false || agentsFile === '') return undefined;
+  const candidate = expandHome(agentsFile ?? DEFAULT_AGENTS_FILE);
+  const filePath = isAbsolute(candidate) ? candidate : join(workingDirectory, candidate);
+  try {
+    const info = await lstat(filePath);
+    if (!info.isFile() || info.size > MAX_AGENTS_FILE_BYTES) return undefined;
+    const content = await readFile(filePath, 'utf-8');
+    const trimmed = content.trim();
+    return trimmed.length > 0 ? trimmed : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 export async function resolveBotSpawnOpts(params: ResolveBotSpawnOptsInput): Promise<SpawnOpts> {
   const workingDirectory = expandHome(params.workingDirectory);
   const addDirs = params.addDirs?.length
     ? params.addDirs.map((dir) => expandHome(dir))
     : undefined;
+  const appendSystemPrompt = await readAgentsInstructions(
+    params.botConfig.agentsFile,
+    workingDirectory,
+  );
 
   return {
     workingDirectory,
@@ -946,6 +987,7 @@ export async function resolveBotSpawnOpts(params: ResolveBotSpawnOptsInput): Pro
     reasoningEffort: params.reasoningEffort,
     initialPrompt: params.initialPrompt,
     addDirs,
+    appendSystemPrompt,
   };
 }
 
@@ -998,9 +1040,17 @@ export function createHandoffSpawnResume(
 ) => Promise<{ pid: number; sessionId: string }> {
   return async (sessionKey, agentName, sessionId, workDir) => {
     const handlers = createEventHandlers(sessionKey);
+    const botName = sessionKey.split(':')[2];
+    const botConfig = getBotConfig?.(botName);
+    // Handoff/manual resume keeps the minimal "legacy" opts on purpose (see the
+    // "keeps legacy opts" test) — it deliberately does NOT re-derive
+    // permission/sandbox/timeouts from bot config. But the per-bot AGENTS.md
+    // runtime instructions must survive resume, otherwise they silently vanish
+    // for handed-off / card-resumed sessions and stop applying mid-conversation.
     const spawnOpts: SpawnOpts = {
       workingDirectory: workDir,
       permissionMode: 'blacklist',
+      appendSystemPrompt: await readAgentsInstructions(botConfig?.agentsFile, expandHome(workDir)),
     };
     const proc = await agentManager.resumeAgent(
       sessionKey,
