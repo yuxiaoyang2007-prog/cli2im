@@ -2,7 +2,7 @@
 
 English | [中文](README.zh-CN.md)
 
-**Run Claude Code / Codex / Gemini CLI from any IM app you already have.** When you walk away from your desk, the project doesn't stop — pick it up on your phone in Feishu or Telegram, with full streaming output, tool use, slash commands, and one-tap session resume.
+**Run Claude Code / Codex / Gemini / GLM from any IM app you already have.** When you walk away from your desk, the project doesn't stop — pick it up on your phone in Feishu or Telegram, with full streaming output, tool use, slash commands, and one-tap session resume.
 
 This is not a chatbot. CLI2IM spawns the real CLI binaries you already use, preserves all their capabilities, and adds an IM control plane on top.
 
@@ -26,24 +26,14 @@ Bidirectional handoff also works the other way: hand a session running in IM **b
                              /handoff
 ```
 
-### 2. Claude Code, Codex, and Gemini in one place — and they can talk to each other
+### 2. Every coding agent in one place, each with its own persona
 
-CLI2IM treats CLI agents as plugins. One YAML config lets you register multiple bots, each tied to a different agent on a different platform. They run as siblings in one daemon.
+CLI2IM treats CLI agents as plugins. One YAML config registers as many bots as you want — each tied to a different agent on a different platform, all running as siblings in one daemon:
 
-What's special is **bot-to-bot relay** — when 2+ relay-enabled bots share a group chat, one bot's response automatically gets delivered to the others as a relay message:
+- **Claude Code** for reasoning-heavy work, **Codex** for coding, **Gemini** and **Antigravity** when you want speed, **GLM (ZCode)** as a China-friendly option. Pick the agent per bot.
+- Each bot reads an **`AGENTS.md`** in its working directory and carries those instructions into every conversation. That's how a bot gets a persona: one bot can be your energy-research assistant with its own routing rules; another can be a locked-down client bot that only touches its own folder. No code — just a file per bot.
 
-```
-You (in Feishu group):  @ccbot  Write a Fibonacci function and ask codexbot to review it.
-ccbot:                  [streams code]  Done. codexbot, please review.
-codexbot:                              ← receives ccbot's output as a relay message
-codexbot:               Reviewed. Suggest using iteration for n>30.
-ccbot:                                 ← receives codexbot's review
-ccbot:                  Updated to iterative version. Final code attached.
-```
-
-You orchestrate multi-agent workflows just by adding the right bots to a group. Each bot still runs its native CLI — Claude Code's strong reasoning, Codex's coding focus, Gemini's speed — without writing any orchestration code.
-
-Built-in safeguards: terminal-acknowledgment detection (single-word "done"/"lgtm"/"OK" doesn't trigger relay), per-chat round-cap to prevent infinite ping-pong, implicit `@mention` requirement for human messages when 2+ relay bots share a group.
+So a single daemon can host your personal Claude Code bot, a teammate's Codex bot, and a sandboxed client bot at the same time, each behaving differently, configured entirely through YAML plus `AGENTS.md`.
 
 ### 3. Your IM is already the control plane — no extra app to install
 
@@ -83,17 +73,13 @@ Feishu / Telegram
   └───────────┘     │  - auth gate     │     │  - spawn/resume  │
        ▲            │  - rate limit    │     │  - tool gate     │
        │            │  - cmd parse     │     │  - permission    │
-       │            │  - relay check   │     └────────┬─────────┘
-       │            └──────────────────┘              │ stdin/stdout
+       │            └──────────────────┘     └────────┬─────────┘
+       │                                              │ stdin/stdout
        │                                              ▼
        │            ┌──────────────────┐     ┌──────────────────┐
        │◄───────────┤  Session Store   │     │  CLI Agent       │
        │            │  (SQLite)        │     │  (subprocess)    │
        │            └──────────────────┘     └──────────────────┘
-       │
-       │            ┌──────────────────┐
-       │◄───────────┤  Relay Manager   │ (bot-to-bot delivery)
-       │            └──────────────────┘
        │
        └─── streaming cards / message edits
 ```
@@ -200,13 +186,13 @@ Alternatively, run with PowerShell scheduled task or `pm2` (cross-platform proce
 
 ## Full Feature List
 
-- **Multi-agent**: Claude Code (SDK), Codex (SDK), Gemini CLI — pluggable architecture, one config to manage all
+- **Multi-agent**: Claude Code (SDK), Codex (SDK), Gemini CLI, Antigravity, and GLM/ZCode — pluggable architecture, one config to manage all
 - **Multi-platform**: Feishu/Lark (WebSocket + interactive cards) and Telegram (long polling + inline keyboards)
 - **Streaming output**: Real-time card updates on Feishu, message edits on Telegram, with thinking block visibility toggle
 - **Permission gating**: Dangerous command detection (configurable regex patterns), interactive Allow/Deny buttons, session-level auto-approve
 - **Session resume**: Scan local CLI sessions (`~/.claude/`, `~/.codex/`), display interactive picker in IM, one tap to resume any conversation
 - **Bidirectional handoff**: Move a session from CLI terminal to IM bot and back — `cli2im handoff` CLI tool included
-- **Bot-to-bot relay**: Multi-agent collaboration in group chats with terminal-acknowledgment detection and round caps
+- **Per-bot runtime instructions**: Each bot reads an `AGENTS.md` from its working directory and injects it into every conversation — per-bot personas, routing rules, and guardrails without writing code
 - **Voice support**: Speech-to-text transcription for voice messages, text-to-speech for responses (DashScope)
 - **Security**: User allowlists, working directory validation, content filtering, rate limiting, dangerous pattern blocking
 - **Session persistence**: SQLite-backed session store with idle cleanup and state tracking
@@ -230,9 +216,8 @@ bots:
     allowFrom:                   # user IDs allowed to interact
       - ou_xxxx
     permissionMode: blacklist    # bypass | blacklist
-    relay:                       # opt-in to bot-to-bot relay
-      enabled: true
-      maxConsecutiveRounds: 10
+    agentsFile: AGENTS.md        # per-bot runtime instructions, read every conversation
+                                 #   (claude-code: appended to system prompt; set false to disable)
 
   codexbot:
     agent: codex
@@ -253,6 +238,8 @@ agents:
     binary: ~/.codex/bin/codex
   gemini:
     binary: /opt/homebrew/bin/gemini
+  zcode:                                 # GLM-5.2, launched via the ZCode app bundle
+    binary: /Applications/ZCode.app/Contents/Resources/glm/zcode.cjs
 
 session:
   maxActive: 64
@@ -317,6 +304,8 @@ cli2im status
 | Claude Code | @anthropic-ai/claude-agent-sdk | JSON streaming | Interactive approval | Full | Primary agent, SDK-native |
 | Codex | @openai/codex-sdk | Text | N/A | Full | Optional dependency |
 | Gemini | Binary spawn | JSON streaming | N/A | N/A | Spawns `gemini` CLI binary |
+| Antigravity (agy) | Binary spawn | JSON streaming | N/A | Full | Spawns the `agy` (Google Antigravity) CLI |
+| GLM / ZCode | JSON-RPC app-server | Streaming | Interactive approval | Full | GLM-5.2 via the ZCode app bundle |
 
 ## Platform Adapters
 
@@ -335,18 +324,6 @@ cli2im status
 - Inline keyboard buttons for permissions and session resume
 - Voice message transcription
 - Photo/document upload and download
-
-## Bot-to-Bot Relay (deep dive)
-
-When two or more relay-enabled bots share a group, ccbot's text output automatically gets delivered to codexbot and gemini_bot as if it were a human message — except marked `isRelay: true` so the pipeline can:
-
-- Relay messages bypass auth (allowFrom), mention requirement, and sanitization, but are STILL subject to per-chat rate-limiting as a defense-in-depth safety net against runaway multi-bot loops (in addition to the maxConsecutiveRounds cap).
-- Inject a `<cti-relay>` directive into the receiving agent's prompt: "skip brainstorming, no clarifying questions, stay under 200 words, say DONE when finished"
-- Suppress relay when the source output looks like a terminal acknowledgment ("done", "lgtm", "ok", "收到", "完成")
-- Cap consecutive auto-rounds per chat (`maxConsecutiveRounds`, default 10) to prevent infinite ping-pong
-- Implicitly require `@mention` for human messages in groups with 2+ relay bots, so a single human prompt fans out to exactly the bot you addressed
-
-This turns a normal group chat into a multi-agent orchestration surface, with humans dropping in via `@mention` whenever they want to redirect the conversation.
 
 ## Session Resume Flow
 
@@ -386,21 +363,21 @@ A host-agnostic bridge library extracted from [CodePilot](https://github.com/op7
 | | claude-to-im | CLI2IM |
 |---|---|---|
 | **Architecture** | Library with DI interfaces — host app must implement ~30 BridgeStore methods | Standalone daemon — single YAML config, zero integration code |
-| **Agent support** | Claude Code only (via LLMProvider interface) | Claude Code + Codex + Gemini CLI (plugin system) |
+| **Agent support** | Claude Code only (via LLMProvider interface) | Claude Code + Codex + Gemini + Antigravity + GLM (plugin system) |
 | **Agent binding** | SDK stream consumption | Spawns real CLI binaries, preserves full CLI capabilities |
 | **Platforms** | Telegram, Discord, Feishu | Feishu, Telegram (Discord planned) |
 | **Session resume** | Not supported | Scan local CLI sessions, interactive picker, one-tap resume |
 | **Handoff** | Not supported | Bidirectional CLI ↔ IM handoff with CLI tool |
-| **Bot-to-bot collaboration** | Not supported | Built-in relay with terminal detection and round caps |
+| **Per-bot personas** | Not supported | Each bot carries its own `AGENTS.md` runtime instructions |
 | **Streaming** | Message edit based | Feishu: interactive cards with throttled updates; Telegram: message edits |
 | **Persistence** | Delegated to host (BridgeStore) | Built-in SQLite |
 
 ### Key additions in CLI2IM beyond claude-to-im's scope
 
-- **Multi-agent plugin system**: Codex and Gemini CLI work through the same interface as Claude Code, with agent-specific capabilities declared per plugin
+- **Multi-agent plugin system**: Codex, Gemini CLI, Antigravity, and GLM/ZCode work through the same interface as Claude Code, with agent-specific capabilities declared per plugin
+- **Per-bot runtime instructions**: Each bot reads an `AGENTS.md` from its working directory and injects it into every conversation — personas, routing rules, and guardrails per bot, no code
 - **CLI session scanning**: Read `~/.claude/projects/` JSONL files and `~/.codex/session_index.jsonl`, extract titles from conversation data, display interactive session picker in IM
 - **Bidirectional handoff**: `cli2im handoff` CLI tool + HTTP API + IM `/handoff` command for seamless CLI ↔ IM session transfer
-- **Bot-to-bot relay**: Multi-agent collaboration with terminal-acknowledgment detection, round caps, and implicit mention requirements
 - **Feishu interactive cards**: Rich card UI with streaming updates, thinking block toggle, permission buttons, session list with Resume actions
 - **Telegram inline keyboards**: Session resume buttons, permission approval, all within Telegram's 64-byte callback_data constraint
 - **Voice support**: STT for voice messages, TTS for responses
@@ -421,6 +398,8 @@ cli2im/
 │   │   ├── claude-code.ts       # Claude Code SDK plugin
 │   │   ├── codex.ts             # Codex SDK plugin
 │   │   ├── gemini.ts            # Gemini CLI plugin
+│   │   ├── agy.ts               # Antigravity (agy) plugin
+│   │   ├── zcode.ts             # GLM-5.2 (ZCode) plugin
 │   │   └── tool-gate.ts         # Dangerous command detection
 │   ├── platforms/
 │   │   ├── feishu/              # Feishu adapter, cards, markdown
@@ -430,9 +409,6 @@ cli2im/
 │   │   ├── queue.ts             # Per-chat message queue
 │   │   ├── cli-scanner.ts       # Claude Code session scanner
 │   │   └── codex-scanner.ts     # Codex session scanner
-│   ├── relay/
-│   │   ├── manager.ts           # Bot registration, round counting
-│   │   └── deliver.ts           # Relay message delivery
 │   ├── services/
 │   │   ├── handoff.ts           # Session handoff service
 │   │   ├── server.ts            # HTTP API server
@@ -441,7 +417,7 @@ cli2im/
 │   └── runtime/                 # Button callback parsing
 ├── cli/
 │   └── cli2im.ts                # Handoff CLI tool
-├── tests/                       # 38 test files, 316 tests
+├── tests/                       # 46 test files, 458 tests
 ├── config.example.yaml
 ├── esbuild.config.mjs
 └── tsconfig.json
@@ -451,7 +427,7 @@ cli2im/
 
 ```bash
 npm run dev          # Run with tsx (hot reload)
-npm test             # Run all 316 tests
+npm test             # Run all 458 tests
 npm run typecheck    # TypeScript type check
 npm run build        # Bundle to dist/
 ```

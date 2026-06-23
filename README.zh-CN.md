@@ -2,7 +2,7 @@
 
 [English](README.md) | 中文
 
-**用你已经在用的 IM 驱动 Claude Code / Codex / Gemini CLI。** 离开电脑了，项目不用停——掏出手机在飞书或 Telegram 里继续推，流式输出、tool use、slash 指令、一键 resume 任意本地 CLI 对话，全都有。
+**用你已经在用的 IM 驱动 Claude Code / Codex / Gemini / GLM。** 离开电脑了，项目不用停——掏出手机在飞书或 Telegram 里继续推，流式输出、tool use、slash 指令、一键 resume 任意本地 CLI 对话，全都有。
 
 不是套壳聊天机器人。CLI2IM 跑的是你本来就在用的真实 CLI 二进制，保留全部能力，在上面加了一层 IM 控制面。
 
@@ -26,24 +26,14 @@
                               /handoff
 ```
 
-### 2. CC + Codex + Gemini 装在一起，还能互相对话
+### 2. 各路 agent 装在一起，每个 bot 有自己的人设
 
-CLI2IM 把 CLI agent 当作插件。一个 YAML 配置就能注册多个 bot，每个绑不同 agent、不同平台，全在同一个守护进程里跑。
+CLI2IM 把 CLI agent 当作插件。一个 YAML 配置就能注册任意多个 bot，每个绑不同 agent、不同平台，全在同一个守护进程里跑：
 
-最特别的是 **bot-to-bot relay**——群里 2+ 个开了 relay 的 bot 同时在场时，一个 bot 的回复会自动作为 relay 消息投递给其他 bot：
+- **Claude Code** 干推理重的活，**Codex** 写代码，**Gemini** 和 **Antigravity** 要速度时上，**GLM（ZCode）** 是国内友好的选择。每个 bot 单独挑 agent。
+- 每个 bot 会读自己工作目录里的 **`AGENTS.md`**，把里面的设定带进每一次对话。人设就是这么来的：一个 bot 可以是带专属分流规则的能源研究助手，另一个可以是只能碰自己目录的隔离客户 bot。不写代码，一个 bot 一个文件。
 
-```
-你（在飞书群里）：       @ccbot  写一个斐波那契函数，让 codexbot review 一下
-ccbot:                   [流式输出代码]  写好了。codexbot 来 review 一下。
-codexbot:                              ← 自动收到 ccbot 的输出作为 relay 消息
-codexbot:                Review 完了。建议 n>30 时改用迭代写法。
-ccbot:                                 ← 自动收到 codexbot 的 review
-ccbot:                   已改成迭代版本，最终代码附上。
-```
-
-往群里加几个 bot 就能编排多 agent 工作流——CC 的强推理、Codex 的代码风格、Gemini 的速度，各自跑原生 CLI，零编排代码。
-
-内置安全机制：终端确认词检测（单词回复 "done"/"lgtm"/"OK"/"收到" 不触发 relay）、每聊天 round 上限防无限互扔、群里 2+ relay bot 时人类消息隐式要求 `@mention`，确保 prompt 精准送到指定 bot。
+所以一个守护进程能同时托管你自己的 Claude Code bot、同事的 Codex bot、还有一个上锁的客户 bot——各自行为不同，全靠 YAML 加 `AGENTS.md` 配出来。
 
 ### 3. IM 本来就是你的控制台——不用额外装 app
 
@@ -83,17 +73,13 @@ CLI agent 自身（Claude Code / Codex / Gemini CLI）必须在你的平台上�
   └───────────┘     │  - 鉴权          │     │  - spawn/resume  │
        ▲            │  - 限流          │     │  - 工具拦截      │
        │            │  - 指令解析      │     │  - 权限流程      │
-       │            │  - relay 检测    │     └────────┬─────────┘
-       │            └──────────────────┘              │ stdin/stdout
+       │            └──────────────────┘     └────────┬─────────┘
+       │                                              │ stdin/stdout
        │                                              ▼
        │            ┌──────────────────┐     ┌──────────────────┐
        │◄───────────┤  Session Store   │     │  CLI Agent       │
        │            │  (SQLite)        │     │  (子进程)        │
        │            └──────────────────┘     └──────────────────┘
-       │
-       │            ┌──────────────────┐
-       │◄───────────┤  Relay Manager   │ (bot 之间投递)
-       │            └──────────────────┘
        │
        └─── 流式卡片 / 消息编辑
 ```
@@ -200,13 +186,13 @@ nssm start cli2im
 
 ## 完整功能列表
 
-- **多 Agent**：Claude Code (SDK)、Codex (SDK)、Gemini CLI——插件架构，一个配置管所有
+- **多 Agent**：Claude Code (SDK)、Codex (SDK)、Gemini CLI、Antigravity、GLM/ZCode——插件架构，一个配置管所有
 - **多平台**：飞书（WebSocket + 交互式卡片）和 Telegram（长轮询 + 内联键盘）
 - **流式输出**：飞书实时卡片更新，Telegram 消息编辑，支持 thinking 可见性切换
 - **权限审批**：危险命令检测（可配正则），交互式 Allow/Deny 按钮，会话级自动批准
 - **会话恢复**：扫描本地 CLI session（`~/.claude/`、`~/.codex/`），IM 里展示交互式列表，一键恢复任意对话
 - **双向交接**：CLI 终端 ↔ IM bot 无缝交接——附带 `cli2im handoff` 命令行工具
-- **Bot-to-bot relay**：群里多 agent 协作，带终端确认词检测和 round 上限
+- **每-bot 运行时设定**：每个 bot 读自己工作目录里的 `AGENTS.md`，注入到每一次对话——人设、分流规则、护栏，按 bot 区分，不写代码
 - **语音支持**：语音消息转文字，文字回复转语音（DashScope）
 - **安全**：用户白名单、工作目录校验、内容过滤、速率限制、危险命令拦截
 - **会话持久化**：SQLite 存储，空闲清理，状态追踪
@@ -230,9 +216,8 @@ bots:
     allowFrom:                   # 允许交互的用户 ID
       - ou_xxxx
     permissionMode: blacklist    # bypass | blacklist
-    relay:                       # 开启 bot-to-bot relay
-      enabled: true
-      maxConsecutiveRounds: 10
+    agentsFile: AGENTS.md        # 每-bot 运行时设定，每次对话都读
+                                 #   (claude-code: 追加到系统提示；设 false 关掉)
 
   codexbot:
     agent: codex
@@ -253,6 +238,8 @@ agents:
     binary: ~/.codex/bin/codex
   gemini:
     binary: /opt/homebrew/bin/gemini
+  zcode:                                 # GLM-5.2，经 ZCode app 包启动
+    binary: /Applications/ZCode.app/Contents/Resources/glm/zcode.cjs
 
 session:
   maxActive: 64
@@ -317,6 +304,8 @@ cli2im status
 | Claude Code | @anthropic-ai/claude-agent-sdk | JSON 流 | 交互式审批 | 支持 | 主力 agent，SDK 原生 |
 | Codex | @openai/codex-sdk | 文本 | 无 | 支持 | 可选依赖 |
 | Gemini | 二进制 spawn | JSON 流 | 无 | 不支持 | spawn gemini CLI |
+| Antigravity (agy) | 二进制 spawn | JSON 流 | 无 | 支持 | spawn `agy`（Google Antigravity）CLI |
+| GLM / ZCode | JSON-RPC app-server | 流式 | 交互式审批 | 支持 | GLM-5.2，经 ZCode app 包 |
 
 ## 平台适配器
 
@@ -335,18 +324,6 @@ cli2im status
 - 内联键盘按钮：权限审批、会话恢复
 - 语音消息转写
 - 图片/文档上传下载
-
-## Bot-to-Bot Relay 详解
-
-群里有 2+ 个开启 relay 的 bot 时，ccbot 的文字输出会被自动当成消息投递给 codexbot 和 gemini_bot——但带 `isRelay: true` 标记，让 pipeline 能：
-
-- Relay 消息会绕过鉴权（allowFrom）、mention 要求和 sanitization，但仍然会经过每 chat 限流；这是防御纵深安全网，用来防止多 bot 失控循环（作为 `maxConsecutiveRounds` 上限之外的额外保护）。
-- 给接收方注入 `<cti-relay>` 指令："跳过 brainstorming，不要问问题，200 字以内，做完说 DONE"
-- 源端输出像终端确认词时不触发 relay（"done"、"lgtm"、"ok"、"收到"、"完成"）
-- 每 chat 限制连续 round 数（`maxConsecutiveRounds`，默认 10），防止无限 ping-pong
-- 群里 2+ relay bot 时人类消息隐式要求 `@mention`，确保单条人类指令精准送到指定 bot
-
-普通群聊就这样变成了多 agent 编排面，人随时 `@mention` 进来调整方向。
 
 ## 会话恢复流程
 
@@ -386,21 +363,21 @@ CLI2IM 从零开始独立开发，但设计受到以下项目启发：
 | | claude-to-im | CLI2IM |
 |---|---|---|
 | **架构** | 库 + DI 接口——宿主需实现 ~30 个 BridgeStore 方法 | 独立守护进程——一个 YAML 配置，零集成代码 |
-| **Agent** | 仅 Claude Code（通过 LLMProvider 接口） | Claude Code + Codex + Gemini CLI（插件系统） |
+| **Agent** | 仅 Claude Code（通过 LLMProvider 接口） | Claude Code + Codex + Gemini + Antigravity + GLM（插件系统） |
 | **Agent 绑定** | SDK stream 消费 | spawn 真实 CLI 二进制，保留 CLI 全部能力 |
 | **平台** | Telegram、Discord、飞书 | 飞书、Telegram（Discord 计划中） |
 | **会话恢复** | 不支持 | 扫描本地 CLI session，交互式列表，一键恢复 |
 | **交接** | 不支持 | 双向 CLI ↔ IM 交接，含 CLI 工具 |
-| **Bot 间协作** | 不支持 | 内置 relay，带终端检测和 round 上限 |
+| **每-bot 人设** | 不支持 | 每个 bot 带自己的 `AGENTS.md` 运行时设定 |
 | **流式** | 基于消息编辑 | 飞书：交互式卡片节流更新；Telegram：消息编辑 |
 | **持久化** | 委托给宿主 (BridgeStore) | 内置 SQLite |
 
 ### CLI2IM 在 claude-to-im 范围之外的新增能力
 
-- **多 Agent 插件系统**：Codex 和 Gemini CLI 走和 Claude Code 同一接口，每个插件声明自己的能力
+- **多 Agent 插件系统**：Codex、Gemini CLI、Antigravity、GLM/ZCode 走和 Claude Code 同一接口，每个插件声明自己的能力
+- **每-bot 运行时设定**：每个 bot 读自己工作目录里的 `AGENTS.md`，注入到每一次对话——人设、分流规则、护栏，按 bot 区分，不写代码
 - **CLI Session 扫描**：读取 `~/.claude/projects/` JSONL 文件和 `~/.codex/session_index.jsonl`，从对话数据提取标题，IM 中展示交互式 session 列表
 - **双向交接**：`cli2im handoff` CLI 工具 + HTTP API + IM `/handoff` 指令，实现 CLI ↔ IM 无缝 session 转移
-- **Bot-to-bot relay**：多 agent 协作，带终端确认词检测、round 上限、隐式 mention 规则
 - **飞书交互式卡片**：丰富的卡片 UI，流式更新，thinking 开关，权限按钮，带 Resume 动作的 session 列表
 - **Telegram 内联键盘**：session 恢复按钮、权限审批，全部在 Telegram 64 字节 callback_data 限制内实现
 - **语音支持**：语音消息 STT，文字回复 TTS
@@ -421,6 +398,8 @@ cli2im/
 │   │   ├── claude-code.ts       # Claude Code SDK 插件
 │   │   ├── codex.ts             # Codex SDK 插件
 │   │   ├── gemini.ts            # Gemini CLI 插件
+│   │   ├── agy.ts               # Antigravity (agy) 插件
+│   │   ├── zcode.ts             # GLM-5.2 (ZCode) 插件
 │   │   └── tool-gate.ts         # 危险命令检测
 │   ├── platforms/
 │   │   ├── feishu/              # 飞书适配器、卡片、markdown
@@ -430,9 +409,6 @@ cli2im/
 │   │   ├── queue.ts             # 每聊天消息队列
 │   │   ├── cli-scanner.ts       # Claude Code session 扫描器
 │   │   └── codex-scanner.ts     # Codex session 扫描器
-│   ├── relay/
-│   │   ├── manager.ts           # Bot 注册、round 计数
-│   │   └── deliver.ts           # Relay 消息投递
 │   ├── services/
 │   │   ├── handoff.ts           # 会话交接服务
 │   │   ├── server.ts            # HTTP API 服务器
@@ -441,7 +417,7 @@ cli2im/
 │   └── runtime/                 # 按钮回调解析
 ├── cli/
 │   └── cli2im.ts                # 交接 CLI 工具
-├── tests/                       # 38 个测试文件，316 个测试
+├── tests/                       # 46 个测试文件，458 个测试
 ├── config.example.yaml
 ├── esbuild.config.mjs
 └── tsconfig.json
@@ -451,7 +427,7 @@ cli2im/
 
 ```bash
 npm run dev          # tsx 运行（热重载）
-npm test             # 跑全部 316 个测试
+npm test             # 跑全部 458 个测试
 npm run typecheck    # TypeScript 类型检查
 npm run build        # 打包到 dist/
 ```
