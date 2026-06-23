@@ -377,8 +377,16 @@ async function main(): Promise<void> {
             userId: msg.userId,
             botName: msg.userId.replace('relay:', ''),
             userName: msg.userName,
+            chatId: msg.chatId,
+            chatType: msg.chatType,
           }
-        : { channel: msg.platform, userId: msg.userId, userName: msg.userName };
+        : {
+            channel: msg.platform,
+            userId: msg.userId,
+            userName: msg.userName,
+            chatId: msg.chatId,
+            chatType: msg.chatType,
+          };
       const senderHeader = buildSenderHeader(sender);
       await downloadInboundAttachments(msg, adapter, join(expandHome(session.workingDirectory), 'inbox'));
 

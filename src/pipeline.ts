@@ -18,6 +18,8 @@ export function buildSenderHeader(sender: SenderInfo): string {
   if (sender.userId) parts.push(`user_id="${xmlAttr(sender.userId)}"`);
   if (sender.botName) parts.push(`bot="${xmlAttr(sender.botName)}"`);
   if (sender.userName) parts.push(`name="${xmlAttr(sender.userName)}"`);
+  if (sender.chatId) parts.push(`chat_id="${xmlAttr(sender.chatId)}"`);
+  if (sender.chatType) parts.push(`chat_type="${xmlAttr(sender.chatType)}"`);
   return `<cti-sender ${parts.join(' ')}/>\n\n`;
 }
 
@@ -26,6 +28,8 @@ export function buildSenderEnv(sender: SenderInfo): Record<string, string> {
   if (sender.channel) env.CTI_SENDER_CHANNEL = sender.channel;
   if (sender.userId) env.CTI_SENDER_USER_ID = sender.userId;
   if (sender.userName) env.CTI_SENDER_NAME = sender.userName;
+  if (sender.chatId) env.CTI_SENDER_CHAT_ID = sender.chatId;
+  if (sender.chatType) env.CTI_SENDER_CHAT_TYPE = sender.chatType;
   return env;
 }
 

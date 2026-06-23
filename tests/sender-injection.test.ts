@@ -27,4 +27,21 @@ describe('Sender Injection', () => {
     expect(env).toEqual({ CTI_SENDER_CHANNEL: 'feishu' });
     expect(env).not.toHaveProperty('CTI_SENDER_USER_ID');
   });
+
+  it('includes chat_id and chat_type in header when present', () => {
+    const header = buildSenderHeader({ channel: 'feishu', userId: 'ou_abc', chatId: 'oc_xyz', chatType: 'group' });
+    expect(header).toContain('chat_id="oc_xyz"');
+    expect(header).toContain('chat_type="group"');
+  });
+
+  it('includes chat fields in env when present', () => {
+    const env = buildSenderEnv({ channel: 'feishu', userId: 'ou_abc', chatId: 'oc_xyz', chatType: 'p2p' });
+    expect(env).toMatchObject({ CTI_SENDER_CHAT_ID: 'oc_xyz', CTI_SENDER_CHAT_TYPE: 'p2p' });
+  });
+
+  it('omits chat fields in env when absent', () => {
+    const env = buildSenderEnv({ channel: 'feishu', userId: 'ou_abc' });
+    expect(env).not.toHaveProperty('CTI_SENDER_CHAT_ID');
+    expect(env).not.toHaveProperty('CTI_SENDER_CHAT_TYPE');
+  });
 });
