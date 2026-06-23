@@ -94,6 +94,8 @@ export interface SenderInfo {
   userId?: string;
   userName?: string;
   botName?: string;
+  chatId?: string;
+  chatType?: string;
 }
 
 export interface InboundMessage {
