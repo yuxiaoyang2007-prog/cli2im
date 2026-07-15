@@ -41,6 +41,7 @@ const FIND_PATH_ARGUMENT = /(?:^|\s)\S*[\\/]\S*(?:\s|$)/;
 const MAKE_PROSE_DETERMINER = /^(?:the|a|an|this|that)\b/;
 const HTTP_URL_IN_TEXT = /\bhttps?:\/\/[^\s/]+(?:\/[^\s]*)?/gi;
 const CLAUSE_CONNECTOR = /^(?:and|then|but|or)\b/i;
+const LEADING_PROMPT_OR_LIST_PREFIX = /^(?:[$❯>*•-]\s+)+/u;
 const SHELL_SYNTAX = /&&|\|\||(?:^|\s)\|(?!\|)|(?:^|\s)(?:>>?|<<?)|;(?=\s|$)/;
 const SQL_LINE = /^(?:SELECT|INSERT|UPDATE|DELETE|CREATE|ALTER|DROP|WITH)\b.*(?:\bFROM\b|\bINTO\b|\bTABLE\b|\bSET\b|\*)/;
 const CONTROL_FLOW_LINE = /^(?:if|for|while|switch|try|catch)\s*\(/;
@@ -104,8 +105,11 @@ export function sanitizeTaskTitle(value: string): string {
     .split(/\r?\n/)
     .map((line) => line.trim())
     .find(Boolean) ?? '';
-  if (isHighConfidenceRawCommand(firstMeaningfulLine)) return '';
-  const pathSafe = sanitizeAbsolutePaths(firstMeaningfulLine);
+  const lexicalCandidate = firstMeaningfulLine
+    .replace(LEADING_PROMPT_OR_LIST_PREFIX, '')
+    .trimStart();
+  if (isHighConfidenceRawCommand(lexicalCandidate)) return '';
+  const pathSafe = sanitizeAbsolutePaths(lexicalCandidate);
   if (pathSafe === null) return '';
   const normalized = pathSafe.replace(/[ \t]+/g, ' ').trim();
 
@@ -261,7 +265,6 @@ function isUnsafeTechnicalTitle(value: string): boolean {
 }
 
 function isEligibleNaturalTitle(value: string): boolean {
-  if (CJK.test(value)) return true;
   const firstToken = /^(\S+)/.exec(value)?.[1];
   if (!firstToken || !/^[a-z]/.test(firstToken)) return true;
   if (!/^[a-z]+$/.test(firstToken)) return false;

@@ -174,6 +174,10 @@ const syntheticSecret = true;
     ['env command', 'env codex update'],
     ['Hermes command', 'hermes chat'],
     ['VS Code command', 'code .'],
+    ['shell-prompt-prefixed command', '$ codex update'],
+    ['alternate-prompt-prefixed command', '❯ openclaw gateway status'],
+    ['list-prefixed command', '- lark-cli auth scopes'],
+    ['command with trailing CJK', 'env codex update 中文'],
     ['non-allowlisted hyphenated head', 'review-tool run'],
     ['shell redirection', 'deploy > /tmp/private/output.log'],
     ['shell operator expression', 'build && deploy'],
@@ -232,6 +236,19 @@ const syntheticSecret = true;
 
   it('accepts an allowlisted natural request head as a single-word title', () => {
     expect(sanitizeTaskTitle('review')).toBe('review');
+  });
+
+  it.each(['$', '❯', '>', '-', '*', '•'])(
+    'strips the %s prompt or list prefix from a safe natural request',
+    (prefix) => {
+      expect(sanitizeTaskTitle(`${prefix} implement notification handling`)).toBe(
+        'implement notification handling',
+      );
+    },
+  );
+
+  it('keeps a genuine CJK natural request without a command prefix', () => {
+    expect(sanitizeTaskTitle('请检查通知流程')).toBe('请检查通知流程');
   });
 
   it('truncates CJK-heavy and Latin-heavy titles by Unicode code points', () => {
