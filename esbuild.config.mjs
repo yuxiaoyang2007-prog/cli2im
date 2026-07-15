@@ -1,5 +1,5 @@
 import { build } from 'esbuild';
-import { cpSync, mkdirSync } from 'node:fs';
+import { chmodSync, cpSync, mkdirSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { createRequire } from 'node:module';
 
@@ -28,6 +28,17 @@ async function main() {
     sourcemap: true,
     banner: { js: "#!/usr/bin/env node" },
   });
+
+  await build({
+    entryPoints: ['src/notifications/hook-client.ts'],
+    bundle: true,
+    platform: 'node',
+    target: 'node22',
+    format: 'esm',
+    outfile: 'dist/codex-notify-hook.js',
+    banner: { js: '#!/usr/bin/env node' },
+  });
+  chmodSync('dist/codex-notify-hook.js', 0o755);
 
   const sqlJsDir = dirname(require.resolve('sql.js/dist/sql-wasm.wasm'));
   mkdirSync('dist', { recursive: true });
