@@ -875,6 +875,8 @@ git commit -m "feat(notifications): wire global Codex Feishu alerts"
 
 ### Task 7: Production safety check, configuration, deployment, and live acceptance
 
+**Execution gate:** Complete Tasks 1-6, pass the broad whole-branch code review, and merge the reviewed feature branch into local `main` before starting this production task. Run all build and service commands from `/Users/xiaoyangyu/projects/cli2im` so the LaunchAgent receives the reviewed `main` build.
+
 **Files:**
 - Read: `https://hc1flg077h.feishu.cn/base/A3jnbPlScaaqjfsgUu0ciZrLnBb?table=tblVtFvjUvQMviJ9&view=vewgRAk7oZ`
 - Modify after backup: `/Users/xiaoyangyu/.cli2im/config.yaml`
