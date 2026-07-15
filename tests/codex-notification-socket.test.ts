@@ -118,13 +118,41 @@ describe('CodexNotificationSocket', () => {
     expect(onApproval).toHaveBeenCalledTimes(1);
   });
 
-  it('rejects a second frame delivered with the first line', async () => {
+  it('uses first-frame-wins semantics for co-delivered frames', async () => {
+    const { onApproval, socket, socketPath } = setup();
+    await socket.start();
+    const secondApproval = { ...approvalEvent, requestId: 'approval_second' };
+
+    await send(socketPath, Buffer.from(
+      `${JSON.stringify(approvalEvent)}\n${JSON.stringify(secondApproval)}\n`,
+    ));
+
+    expect(onApproval).toHaveBeenCalledTimes(1);
+    expect(onApproval).toHaveBeenCalledWith(approvalEvent);
+  });
+
+  it('ignores a delayed second frame after dispatching the first', async () => {
+    const { onApproval, socket, socketPath } = setup();
+    await socket.start();
+    const client = createConnection(socketPath);
+    client.on('error', () => undefined);
+    await new Promise<void>((resolve) => client.once('connect', resolve));
+
+    client.write(`${JSON.stringify(approvalEvent)}\n`);
+    expect(await waitFor(() => onApproval.mock.calls.length === 1, 250)).toBe(true);
+    client.write(`${JSON.stringify({ ...approvalEvent, requestId: 'approval_delayed' })}\n`);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    client.destroy();
+
+    expect(onApproval).toHaveBeenCalledTimes(1);
+    expect(onApproval).toHaveBeenCalledWith(approvalEvent);
+  });
+
+  it('does not recover from a malformed first frame using a later valid frame', async () => {
     const { onApproval, socket, socketPath } = setup();
     await socket.start();
 
-    await send(socketPath, Buffer.from(
-      `${JSON.stringify(approvalEvent)}\n${JSON.stringify(approvalEvent)}\n`,
-    ));
+    await send(socketPath, Buffer.from(`{malformed}\n${JSON.stringify(approvalEvent)}\n`));
 
     expect(onApproval).not.toHaveBeenCalled();
   });

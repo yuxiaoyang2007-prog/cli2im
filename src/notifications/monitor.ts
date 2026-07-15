@@ -190,19 +190,17 @@ export class CodexEventMonitor {
       return;
     }
 
-    const continuityHash = await hashPrecedingBytes(handle, cursor.byteOffset);
-    if (cursor.continuityHash && cursor.continuityHash !== continuityHash) {
+    const precedingBytes = await readPrecedingBytes(handle, cursor.byteOffset);
+    const continuityHash = hashBytes(precedingBytes);
+    if (!cursor.continuityHash) {
+      await this.baseline(handle, filePath, fileId, fileSize);
+      return;
+    }
+    if (cursor.continuityHash !== continuityHash) {
       await this.baseline(handle, filePath, fileId, fileSize);
       return;
     }
     if (fileSize === cursor.byteOffset) {
-      if (!cursor.continuityHash) {
-        await this.store.upsertNotificationCursor({
-          ...cursor,
-          continuityHash,
-          updatedAt: Date.now(),
-        });
-      }
       return;
     }
 
@@ -226,7 +224,11 @@ export class CodexEventMonitor {
         filePath,
         fileId,
         byteOffset,
-        continuityHash: await hashPrecedingBytes(handle, byteOffset),
+        continuityHash: hashSnapshotPrecedingBytes(
+          precedingBytes,
+          bytes,
+          byteOffset - cursor.byteOffset,
+        ),
         updatedAt: Date.now(),
       });
       lineStart = newline + 1;
@@ -243,7 +245,7 @@ export class CodexEventMonitor {
       filePath,
       fileId,
       byteOffset,
-      continuityHash: await hashPrecedingBytes(handle, byteOffset),
+      continuityHash: hashBytes(await readPrecedingBytes(handle, byteOffset)),
       updatedAt: Date.now(),
     });
   }
@@ -267,14 +269,33 @@ async function openIfPresent(filePath: string): Promise<FileHandle | null> {
   }
 }
 
-async function hashPrecedingBytes(handle: FileHandle, byteOffset: number): Promise<string> {
+async function readPrecedingBytes(handle: FileHandle, byteOffset: number): Promise<Buffer> {
   const length = Math.min(CONTINUITY_WINDOW_BYTES, byteOffset);
   const bytes = Buffer.alloc(length);
   if (length > 0) {
     const { bytesRead } = await handle.read(bytes, 0, length, byteOffset - length);
-    if (bytesRead !== length) {
-      return createHash('sha256').update(bytes.subarray(0, bytesRead)).digest('hex').slice(0, 24);
-    }
+    return bytes.subarray(0, bytesRead);
   }
+  return bytes;
+}
+
+function hashSnapshotPrecedingBytes(
+  anchor: Buffer,
+  appended: Buffer,
+  consumedBytes: number,
+): string {
+  const appendedLength = Math.min(CONTINUITY_WINDOW_BYTES, consumedBytes);
+  const anchorLength = Math.min(
+    anchor.length,
+    CONTINUITY_WINDOW_BYTES - appendedLength,
+  );
+  const snapshot = Buffer.concat([
+    anchor.subarray(anchor.length - anchorLength),
+    appended.subarray(consumedBytes - appendedLength, consumedBytes),
+  ]);
+  return hashBytes(snapshot);
+}
+
+function hashBytes(bytes: Buffer): string {
   return createHash('sha256').update(bytes).digest('hex').slice(0, 24);
 }

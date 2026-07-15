@@ -145,14 +145,10 @@ export class CodexNotificationSocket {
 
       const newline = payload.indexOf(0x0a);
       if (newline === -1) return;
-      if (hasNonWhitespace(payload.subarray(newline + 1))) {
-        handled = true;
-        socket.destroy();
-        return;
-      }
 
       handled = true;
-      void this.handlePayload(payload.subarray(0, newline)).finally(() => socket.end());
+      socket.destroy();
+      void this.handlePayload(payload.subarray(0, newline));
     });
   }
 
@@ -275,10 +271,6 @@ function parsePermissionHookEvent(input: unknown): PermissionHookEvent | null {
     requestId: input.requestId,
     occurredAt: input.occurredAt,
   };
-}
-
-function hasNonWhitespace(bytes: Buffer): boolean {
-  return bytes.toString('utf8').trim().length > 0;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

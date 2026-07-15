@@ -1,11 +1,16 @@
+import { createRequire } from 'node:module';
 import { appendFile, mkdir, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { mkdtempSync } from 'node:fs';
+import initSqlJs from 'sql.js';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { CodexEventMonitor } from '../src/notifications/monitor.js';
 import type { ParsedRolloutLine } from '../src/notifications/codex-events.js';
 import { SessionStore } from '../src/session/store.js';
+
+const require = createRequire(import.meta.url);
+const sqlWasmDir = dirname(require.resolve('sql.js/dist/sql-wasm.wasm'));
 
 const historicalCompletion = JSON.stringify({
   type: 'event_msg',
@@ -16,16 +21,7 @@ const historicalCompletion = JSON.stringify({
   },
 });
 
-const questionLine = JSON.stringify({
-  type: 'response_item',
-  payload: {
-    type: 'function_call',
-    name: 'request_user_input',
-    call_id: 'call_synthetic',
-    arguments: '{"questions":[{"question":"synthetic question"}]}',
-    internal_chat_message_metadata_passthrough: { turn_id: 'turn_synthetic' },
-  },
-});
+const questionLine = makeQuestionLine('call_synthetic');
 
 describe('CodexEventMonitor', () => {
   const directories: string[] = [];
@@ -188,6 +184,94 @@ describe('CodexEventMonitor', () => {
     expect(onEvent).toHaveBeenCalledTimes(1);
   });
 
+  it('persists snapshot continuity when onEvent truncates and regrows the same inode', async () => {
+    const { file, sessionsDir, store } = await setup();
+    await monitors.pop()?.stop();
+    const historical = `${historicalCompletion}\n`;
+    const oldAppended = makeQuestionLine('old-appended');
+    const replacementHistory = makeQuestionLine('replacement-history');
+    const normalAppend = makeQuestionLine('normal-append');
+    await writeFile(file, historical);
+    let replacementContent = '';
+    const requestIds: string[] = [];
+    const onEvent = vi.fn(async (event: ParsedRolloutLine) => {
+      if (event.type !== 'question') return;
+      requestIds.push(event.requestId);
+      if (event.requestId === 'old-appended') await writeFile(file, replacementContent);
+    });
+    const monitor = new CodexEventMonitor({ sessionsDir, store, onEvent });
+    monitors.push(monitor);
+    await monitor.processFile(file);
+    const original = await stat(file);
+    const snapshottedOffset = Buffer.byteLength(`${historical}${oldAppended}\n`);
+    replacementContent = `${'x'.repeat(snapshottedOffset)}${replacementHistory}\n`;
+
+    await appendFile(file, `${oldAppended}\n`);
+    await monitor.processFile(file);
+    expect((await stat(file)).ino).toBe(original.ino);
+    expect(requestIds).toEqual(['old-appended']);
+
+    await monitor.processFile(file);
+    expect(requestIds).toEqual(['old-appended']);
+
+    await appendFile(file, `${normalAppend}\n`);
+    await monitor.processFile(file);
+    expect(requestIds).toEqual(['old-appended', 'normal-append']);
+  });
+
+  it('fail-closed baselines replacement history behind a migrated hashless cursor', async () => {
+    const sessionsDir = mkdtempSync(join(tmpdir(), 'cli2im-codex-monitor-'));
+    directories.push(sessionsDir);
+    const nestedDir = join(sessionsDir, '2026', '07');
+    await mkdir(nestedDir, { recursive: true });
+    const file = join(nestedDir, 'rollout-legacy.jsonl');
+    const historical = `${historicalCompletion}\n`;
+    const legacyReplacement = makeQuestionLine('legacy-replacement-history');
+    const normalAppend = makeQuestionLine('legacy-normal-append');
+    await writeFile(file, `${historical}${legacyReplacement}\n`);
+    const fileStat = await stat(file);
+    const dbPath = join(sessionsDir, 'legacy.db');
+    const SQL = await initSqlJs({
+      locateFile: (name: string) => join(sqlWasmDir, name),
+    });
+    const legacyDb = new SQL.Database();
+    legacyDb.run(`
+      CREATE TABLE notification_cursors (
+        file_path TEXT PRIMARY KEY,
+        file_id TEXT NOT NULL,
+        byte_offset INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      )
+    `);
+    legacyDb.run(
+      'INSERT INTO notification_cursors (file_path, file_id, byte_offset, updated_at) VALUES (?, ?, ?, ?)',
+      [file, `${fileStat.dev}:${fileStat.ino}`, Buffer.byteLength(historical), 10],
+    );
+    await writeFile(dbPath, Buffer.from(legacyDb.export()));
+    legacyDb.close();
+    const store = await SessionStore.create(dbPath);
+    stores.push(store);
+    const onEvent = vi.fn<(event: ParsedRolloutLine, filePath: string) => void>();
+    const monitor = new CodexEventMonitor({ sessionsDir, store, onEvent });
+    monitors.push(monitor);
+
+    await monitor.processFile(file);
+
+    expect(onEvent).not.toHaveBeenCalled();
+    expect(await store.getNotificationCursor(file)).toMatchObject({
+      byteOffset: fileStat.size,
+      continuityHash: expect.stringMatching(/^[a-f0-9]{24}$/),
+    });
+
+    await appendFile(file, `${normalAppend}\n`);
+    await monitor.processFile(file);
+    expect(onEvent).toHaveBeenCalledTimes(1);
+    expect(onEvent).toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'question', requestId: 'legacy-normal-append' }),
+      file,
+    );
+  });
+
   it('cleans up a failed discovery so a later start can discover files', async () => {
     const { file, onEvent, sessionsDir, store } = await setup();
     await monitors.pop()?.stop();
@@ -269,3 +353,16 @@ describe('CodexEventMonitor', () => {
     expect(await store.getNotificationCursor(laterFile)).toBeNull();
   });
 });
+
+function makeQuestionLine(requestId: string): string {
+  return JSON.stringify({
+    type: 'response_item',
+    payload: {
+      type: 'function_call',
+      name: 'request_user_input',
+      call_id: requestId,
+      arguments: '{"questions":[{"question":"synthetic question"}]}',
+      internal_chat_message_metadata_passthrough: { turn_id: `turn_${requestId}` },
+    },
+  });
+}
