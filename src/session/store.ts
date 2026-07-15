@@ -1,9 +1,22 @@
-import initSqlJs, { type Database } from 'sql.js';
+import initSqlJs, { type Database, type SqlJsStatic } from 'sql.js';
 import { randomUUID } from 'node:crypto';
-import { dirname, join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
-import { readFileSync, existsSync, writeFileSync, mkdirSync } from 'node:fs';
+import {
+  chmodSync,
+  closeSync,
+  existsSync,
+  fchmodSync,
+  fsyncSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  readdirSync,
+  renameSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
 import type { Session, SessionKey } from '../types.js';
 import type {
   CodexNotificationEvent,
@@ -34,11 +47,23 @@ export class SessionStore {
     if (dbPath === ':memory:') {
       db = new SQL.Database();
     } else {
-      if (existsSync(dbPath)) {
-        const buffer = readFileSync(dbPath);
-        db = new SQL.Database(buffer);
+      hardenDatabaseSnapshotModes(dbPath);
+      const mainExists = existsSync(dbPath);
+      const mainSnapshot = loadDatabaseSnapshot(SQL, dbPath);
+      if (mainSnapshot) {
+        db = mainSnapshot.database;
       } else {
-        db = new SQL.Database();
+        const backupPath = databaseBackupPath(dbPath);
+        const backupExists = existsSync(backupPath);
+        const backupSnapshot = loadDatabaseSnapshot(SQL, backupPath);
+        if (backupSnapshot) {
+          restoreDatabaseSnapshot(dbPath, backupSnapshot.bytes);
+          db = backupSnapshot.database;
+        } else if (mainExists || backupExists) {
+          throw new Error('Session database has no valid snapshot');
+        } else {
+          db = new SQL.Database();
+        }
       }
     }
 
@@ -276,23 +301,37 @@ export class SessionStore {
   }
 
   async upsertNotificationCursor(cursor: NotificationCursor): Promise<void> {
-    this.db.run(
-      `INSERT INTO notification_cursors
-         (file_path, file_id, byte_offset, continuity_hash, updated_at)
-       VALUES (?, ?, ?, ?, ?)
-       ON CONFLICT(file_path) DO UPDATE SET
-         file_id = excluded.file_id,
-         byte_offset = excluded.byte_offset,
-         continuity_hash = excluded.continuity_hash,
-         updated_at = excluded.updated_at`,
-      [
-        cursor.filePath,
-        cursor.fileId,
-        cursor.byteOffset,
-        cursor.continuityHash ?? null,
-        cursor.updatedAt,
-      ],
-    );
+    await this.upsertNotificationCursors([cursor]);
+  }
+
+  async upsertNotificationCursors(cursors: NotificationCursor[]): Promise<void> {
+    if (cursors.length === 0) return;
+    this.db.run('BEGIN');
+    try {
+      for (const cursor of cursors) {
+        this.db.run(
+          `INSERT INTO notification_cursors
+             (file_path, file_id, byte_offset, continuity_hash, updated_at)
+           VALUES (?, ?, ?, ?, ?)
+           ON CONFLICT(file_path) DO UPDATE SET
+             file_id = excluded.file_id,
+             byte_offset = excluded.byte_offset,
+             continuity_hash = excluded.continuity_hash,
+             updated_at = excluded.updated_at`,
+          [
+            cursor.filePath,
+            cursor.fileId,
+            cursor.byteOffset,
+            cursor.continuityHash ?? null,
+            cursor.updatedAt,
+          ],
+        );
+      }
+      this.db.run('COMMIT');
+    } catch (error) {
+      this.db.run('ROLLBACK');
+      throw error;
+    }
     this.save();
   }
 
@@ -421,7 +460,7 @@ export class SessionStore {
        WHERE event_key = ? AND status = 'pending'`,
       [deliveredAt, eventKey],
     );
-    this.save();
+    this.saveTerminalSnapshot();
   }
 
   async markNotificationFailed(
@@ -430,18 +469,33 @@ export class SessionStore {
   ): Promise<void> {
     this.db.run(
       `UPDATE notification_deliveries
-       SET status = ?, next_retry_at = NULL
+       SET event_json = '{}',
+           status = ?,
+           attempts = 0,
+           first_attempt_at = NULL,
+           last_attempt_at = NULL,
+           next_retry_at = NULL,
+           delivered_at = NULL,
+           delayed = NULL,
+           transport_message_id = NULL,
+           acknowledged_at = NULL,
+           delayed_patch_completed_at = NULL
        WHERE event_key = ? AND status = 'pending'`,
       [status, eventKey],
     );
-    this.save();
+    this.saveTerminalSnapshot();
   }
 
   save(): void {
     if (this.dbPath === ':memory:') return;
-    mkdirSync(dirname(this.dbPath), { recursive: true });
     const data = this.db.export();
-    writeFileSync(this.dbPath, Buffer.from(data));
+    saveDatabaseSnapshot(this.dbPath, Buffer.from(data));
+  }
+
+  private saveTerminalSnapshot(): void {
+    if (this.dbPath === ':memory:') return;
+    const data = this.db.export();
+    saveDatabaseSnapshot(this.dbPath, Buffer.from(data), true);
   }
 
   close(): void {
@@ -459,6 +513,107 @@ export class SessionStore {
       createdAt: row.created_at as number,
       lastActiveAt: row.last_active_at as number,
     };
+  }
+}
+
+function databaseBackupPath(dbPath: string): string {
+  return `${dbPath}.bak`;
+}
+
+function hardenDatabaseSnapshotModes(dbPath: string): void {
+  const directory = dirname(dbPath);
+  if (!existsSync(directory)) return;
+  const name = basename(dbPath);
+  const snapshotNames = new Set([name, `${name}.bak`]);
+  for (const entry of readdirSync(directory, { withFileTypes: true })) {
+    const isOwnedTemp = entry.name.startsWith(`.${name}.tmp-`)
+      || entry.name.startsWith(`.${name}.bak.tmp-`)
+      || entry.name.startsWith(`.${name}.restore.tmp-`);
+    if (entry.isFile() && (snapshotNames.has(entry.name) || isOwnedTemp)) {
+      chmodSync(join(directory, entry.name), 0o600);
+    }
+  }
+}
+
+function loadDatabaseSnapshot(
+  SQL: SqlJsStatic,
+  path: string,
+): { database: Database; bytes: Buffer } | null {
+  if (!existsSync(path)) return null;
+  chmodSync(path, 0o600);
+  const bytes = readFileSync(path);
+  let database: Database | undefined;
+  try {
+    database = new SQL.Database(bytes);
+    database.run('PRAGMA schema_version');
+    return { database, bytes };
+  } catch {
+    database?.close();
+    return null;
+  }
+}
+
+function saveDatabaseSnapshot(
+  dbPath: string,
+  data: Buffer,
+  mirrorCurrentToBackup = false,
+): void {
+  const directory = dirname(dbPath);
+  mkdirSync(directory, { recursive: true, mode: 0o700 });
+  const token = `${process.pid}-${randomUUID()}`;
+  const liveTemp = join(directory, `.${basename(dbPath)}.tmp-${token}`);
+  const backupTemp = join(directory, `.${basename(dbPath)}.bak.tmp-${token}`);
+
+  try {
+    writeDurableFile(liveTemp, data);
+    if (existsSync(dbPath) || mirrorCurrentToBackup) {
+      if (existsSync(dbPath)) chmodSync(dbPath, 0o600);
+      const backupData = mirrorCurrentToBackup ? data : readFileSync(dbPath);
+      writeDurableFile(backupTemp, backupData);
+      renameSync(backupTemp, databaseBackupPath(dbPath));
+      chmodSync(databaseBackupPath(dbPath), 0o600);
+      fsyncDirectory(directory);
+    }
+    renameSync(liveTemp, dbPath);
+    chmodSync(dbPath, 0o600);
+    fsyncDirectory(directory);
+  } finally {
+    rmSync(liveTemp, { force: true });
+    rmSync(backupTemp, { force: true });
+  }
+}
+
+function restoreDatabaseSnapshot(dbPath: string, data: Buffer): void {
+  const directory = dirname(dbPath);
+  mkdirSync(directory, { recursive: true, mode: 0o700 });
+  const temp = join(directory, `.${basename(dbPath)}.restore.tmp-${process.pid}-${randomUUID()}`);
+  try {
+    writeDurableFile(temp, data);
+    renameSync(temp, dbPath);
+    chmodSync(dbPath, 0o600);
+    fsyncDirectory(directory);
+  } finally {
+    rmSync(temp, { force: true });
+  }
+}
+
+function writeDurableFile(path: string, data: Buffer): void {
+  const descriptor = openSync(path, 'wx', 0o600);
+  try {
+    fchmodSync(descriptor, 0o600);
+    writeFileSync(descriptor, data);
+    fsyncSync(descriptor);
+  } finally {
+    closeSync(descriptor);
+  }
+}
+
+function fsyncDirectory(directory: string): void {
+  const descriptor = openSync(directory, 'r');
+  try {
+    fsyncSync(descriptor);
+  } finally {
+    closeSync(descriptor);
   }
 }
 

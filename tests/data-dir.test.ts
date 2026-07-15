@@ -1,9 +1,9 @@
-import { readFileSync } from 'node:fs';
+import { chmodSync, readFileSync, statSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { join, sep } from 'node:path';
-import { mkdtemp } from 'node:fs/promises';
+import { mkdtemp, rm } from 'node:fs/promises';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { getCli2imDataDir } from '../src/util/data-dir.js';
+import { ensurePrivateDirectorySync, getCli2imDataDir } from '../src/util/data-dir.js';
 import { downloadInboundAttachments } from '../src/media.js';
 import type { InboundMessage, PlatformAdapter } from '../src/types.js';
 
@@ -45,5 +45,21 @@ describe('cli2im data directory', () => {
     expect(msg.attachments?.[0].localPath?.startsWith(`${mediaDir}${sep}`)).toBe(true);
     expect(readFileSync(msg.attachments![0].localPath!, 'utf8')).toBe('file-data');
     expect(readFileSync(join(mediaDir, '.gitignore'), 'utf8')).toBe('*\n');
+  });
+
+  it('creates and repairs the cli2im data directory as owner-only', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'cli2im-private-parent-'));
+    try {
+      const dataDir = join(root, 'nested', 'data');
+
+      ensurePrivateDirectorySync(dataDir);
+      expect(statSync(dataDir).mode & 0o777).toBe(0o700);
+
+      chmodSync(dataDir, 0o755);
+      ensurePrivateDirectorySync(dataDir);
+      expect(statSync(dataDir).mode & 0o777).toBe(0o700);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   });
 });

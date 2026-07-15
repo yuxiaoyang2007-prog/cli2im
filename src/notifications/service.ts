@@ -138,9 +138,30 @@ export class CodexNotificationService {
   }
 
   async start(): Promise<void> {
-    await runLifecycleStep('router resume', () => this.router.resumePending());
-    await runLifecycleStep('socket start', () => this.socket.start());
-    await runLifecycleStep('monitor start', () => this.monitor.start());
+    let routerAttempted = false;
+    let socketAttempted = false;
+    let monitorAttempted = false;
+    try {
+      routerAttempted = true;
+      await this.router.resumePending();
+      socketAttempted = true;
+      await this.socket.start();
+      monitorAttempted = true;
+      await this.monitor.start();
+      console.log('[notifications] healthy router=ready socket=ready monitor=ready');
+    } catch {
+      console.error('[notifications] start failed');
+      if (monitorAttempted) {
+        await runLifecycleStep('monitor stop', () => this.monitor.stop());
+      }
+      if (socketAttempted) {
+        await runLifecycleStep('socket stop', () => this.socket.stop());
+      }
+      if (routerAttempted) {
+        await runLifecycleStep('router stop', () => this.router.stop());
+      }
+      throw new Error('Codex notification service failed to start');
+    }
   }
 
   async stop(): Promise<void> {

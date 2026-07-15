@@ -6,6 +6,8 @@ import {
   type Socket,
 } from 'node:net';
 import type { PermissionHookEvent } from './codex-events.js';
+import { dirname } from 'node:path';
+import { ensurePrivateDirectorySync } from '../util/data-dir.js';
 
 const MAX_PAYLOAD_BYTES = 8192;
 const IDLE_CONNECTION_TIMEOUT_MS = 1000;
@@ -72,6 +74,7 @@ export class CodexNotificationSocket {
     let server: Server | null = null;
     let ownsSocketPath = false;
     try {
+      ensurePrivateDirectorySync(dirname(this.socketPath));
       await removeStaleSocket(this.socketPath);
       if (this.stopRequested) {
         this.state = 'stopped';

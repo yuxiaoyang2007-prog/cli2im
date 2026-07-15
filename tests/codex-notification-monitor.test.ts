@@ -352,16 +352,125 @@ describe('CodexEventMonitor', () => {
 
     expect(await store.getNotificationCursor(laterFile)).toBeNull();
   });
+
+  it('discovers rollout files sequentially and durably baselines them with one save', async () => {
+    const { onEvent, sessionsDir, store } = await setup();
+    await monitors.pop()?.stop();
+    const nestedDir = join(sessionsDir, '2026', '07');
+    const files = Array.from({ length: 24 }, (_, index) => (
+      join(nestedDir, `rollout-batch-${index}.jsonl`)
+    ));
+    await Promise.all(files.map((file) => writeFile(file, `${historicalCompletion}\n`)));
+    let activeLookups = 0;
+    let maxActiveLookups = 0;
+    const save = vi.spyOn(store, 'save');
+    const boundedStore = {
+      getNotificationCursor: async (filePath: string) => {
+        activeLookups += 1;
+        maxActiveLookups = Math.max(maxActiveLookups, activeLookups);
+        await new Promise((resolve) => setTimeout(resolve, 1));
+        try {
+          return await store.getNotificationCursor(filePath);
+        } finally {
+          activeLookups -= 1;
+        }
+      },
+      upsertNotificationCursor: store.upsertNotificationCursor.bind(store),
+      upsertNotificationCursors: store.upsertNotificationCursors.bind(store),
+    };
+    const monitor = new CodexEventMonitor({ sessionsDir, store: boundedStore, onEvent });
+    monitors.push(monitor);
+
+    await monitor.start();
+
+    expect(maxActiveLookups).toBe(1);
+    expect(save).toHaveBeenCalledTimes(1);
+    expect(onEvent).not.toHaveBeenCalled();
+    expect(await Promise.all(files.map((file) => store.getNotificationCursor(file)))).not.toContain(null);
+  });
+
+  it('reads a large append in fixed chunks and persists at most once per processed chunk', async () => {
+    const { file, monitor, onEvent, store } = await setup();
+    await writeFile(file, '');
+    await monitor.processFile(file);
+    const ignoredLine = `${JSON.stringify({ synthetic: '界'.repeat(600) })}\n`;
+    const appended = `${ignoredLine.repeat(180)}${questionLine}\n`;
+    const save = vi.spyOn(store, 'save');
+    const allocate = vi.spyOn(Buffer, 'alloc');
+    await appendFile(file, appended);
+    let allocations: number[] = [];
+
+    try {
+      await monitor.processFile(file);
+      allocations = allocate.mock.calls
+        .map((call) => call[0])
+        .filter((size): size is number => typeof size === 'number');
+    } finally {
+      allocate.mockRestore();
+    }
+
+    expect(Math.max(...allocations)).toBeLessThanOrEqual(64 * 1024);
+    expect(save.mock.calls.length).toBeLessThanOrEqual(
+      Math.ceil(Buffer.byteLength(appended) / (64 * 1024)) + 1,
+    );
+    expect(onEvent).toHaveBeenCalledTimes(1);
+    expect((await store.getNotificationCursor(file))?.byteOffset).toBe((await stat(file)).size);
+  });
+
+  it('preserves a valid UTF-8 JSON line split across read and newline boundaries', async () => {
+    const { file, monitor, onEvent, store } = await setup();
+    await writeFile(file, '');
+    await monitor.processFile(file);
+    const splitLine = makeQuestionLine('utf8-split', '界'.repeat(30_000));
+
+    await appendFile(file, `${splitLine}\n`);
+    await monitor.processFile(file);
+
+    expect(onEvent).toHaveBeenCalledTimes(1);
+    expect(onEvent).toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'question', requestId: 'utf8-split' }),
+      file,
+    );
+    expect((await store.getNotificationCursor(file))?.byteOffset).toBe((await stat(file)).size);
+  });
+
+  it('bounds an oversized line and still processes the following valid lifecycle line', async () => {
+    const { file, monitor, onEvent, store } = await setup();
+    await writeFile(file, '');
+    await monitor.processFile(file);
+    const oversized = `${JSON.stringify({ synthetic: 'x'.repeat(1_100_000) })}\n`;
+    const appended = `${oversized}${makeQuestionLine('after-oversized')}\n`;
+    const allocate = vi.spyOn(Buffer, 'alloc');
+    await appendFile(file, appended);
+    let allocations: number[] = [];
+
+    try {
+      await monitor.processFile(file);
+      allocations = allocate.mock.calls
+        .map((call) => call[0])
+        .filter((size): size is number => typeof size === 'number');
+    } finally {
+      allocate.mockRestore();
+    }
+
+    expect(Math.max(...allocations)).toBeLessThanOrEqual(64 * 1024);
+    expect(onEvent).toHaveBeenCalledTimes(1);
+    expect(onEvent).toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'question', requestId: 'after-oversized' }),
+      file,
+    );
+    expect((await store.getNotificationCursor(file))?.byteOffset).toBe((await stat(file)).size);
+  });
 });
 
-function makeQuestionLine(requestId: string): string {
+function makeQuestionLine(requestId: string, question = 'synthetic question'): string {
   return JSON.stringify({
     type: 'response_item',
     payload: {
       type: 'function_call',
       name: 'request_user_input',
       call_id: requestId,
-      arguments: '{"questions":[{"question":"synthetic question"}]}',
+      arguments: JSON.stringify({ questions: [{ question }] }),
       internal_chat_message_metadata_passthrough: { turn_id: `turn_${requestId}` },
     },
   });

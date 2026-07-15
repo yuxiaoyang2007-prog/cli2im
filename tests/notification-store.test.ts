@@ -1,5 +1,16 @@
 import { createRequire } from 'node:module';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  statSync,
+  unlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import initSqlJs from 'sql.js';
@@ -310,10 +321,26 @@ describe('notification persistence', () => {
     const discarded = completionEvent({ eventKey: 'evt_discarded' });
     await store.enqueueNotification(failed);
     await store.enqueueNotification(discarded);
-
-    await store.markNotificationFailed(failed.eventKey);
-    await store.markNotificationFailed(discarded.eventKey, 'discarded');
+    for (const event of [failed, discarded]) {
+      await store.markNotificationAttemptStarted(event.eventKey, 1500);
+      await store.setNotificationNextRetry(event.eventKey, 2000);
+      await store.recordNotificationReceipt(event.eventKey, `om_${event.eventKey}`, 1800);
+      await store.markNotificationDelayedPatchCompleted(event.eventKey, 1900);
+    }
     store.close();
+
+    const SQL = await initSqlJs({
+      locateFile: (file: string) => join(sqlWasmDir, file),
+    });
+    const intermediate = new SQL.Database(readFileSync(dbPath));
+    intermediate.run('UPDATE notification_deliveries SET delayed = 1');
+    writeFileSync(dbPath, Buffer.from(intermediate.export()));
+    intermediate.close();
+
+    const terminalStore = await SessionStore.create(dbPath);
+    await terminalStore.markNotificationFailed(failed.eventKey);
+    await terminalStore.markNotificationFailed(discarded.eventKey, 'discarded');
+    terminalStore.close();
 
     const reloadedStore = await SessionStore.create(dbPath);
     expect(await reloadedStore.listPendingNotifications()).toEqual([]);
@@ -321,17 +348,129 @@ describe('notification persistence', () => {
     expect(await reloadedStore.enqueueNotification(discarded)).toBe(false);
     reloadedStore.close();
 
-    const SQL = await initSqlJs({
-      locateFile: (file: string) => join(sqlWasmDir, file),
-    });
     const db = new SQL.Database(readFileSync(dbPath)) as unknown as ReadOnlyTestDatabase;
     const [result] = db.exec(
-      'SELECT event_key, status, next_retry_at FROM notification_deliveries ORDER BY event_key',
+      `SELECT event_key, event_json, status, attempts, first_attempt_at,
+              last_attempt_at, next_retry_at, delivered_at, delayed,
+              transport_message_id, acknowledged_at, delayed_patch_completed_at
+       FROM notification_deliveries ORDER BY event_key`,
     );
     expect(result.values).toEqual([
-      ['evt_discarded', 'discarded', null],
-      ['evt_failed', 'failed', null],
+      ['evt_discarded', '{}', 'discarded', 0, null, null, null, null, null, null, null, null],
+      ['evt_failed', '{}', 'failed', 0, null, null, null, null, null, null, null, null],
     ]);
     db.close();
+
+    const backup = new SQL.Database(
+      readFileSync(`${dbPath}.bak`),
+    ) as unknown as ReadOnlyTestDatabase;
+    const [backupResult] = backup.exec(
+      `SELECT event_key, event_json, status, attempts, first_attempt_at,
+              last_attempt_at, next_retry_at, delivered_at, delayed,
+              transport_message_id, acknowledged_at, delayed_patch_completed_at
+       FROM notification_deliveries ORDER BY event_key`,
+    );
+    expect(backupResult.values).toEqual(result.values);
+    backup.close();
   });
+
+  it('keeps live, temporary, and backup database snapshots owner-only', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'cli2im-notification-store-'));
+    temporaryDirectories.push(directory);
+    const dbPath = join(directory, 'sessions.db');
+    const first = completionEvent({ eventKey: 'evt_mode_first' });
+    const second = completionEvent({ eventKey: 'evt_mode_second' });
+
+    const store = await SessionStore.create(dbPath);
+    await store.enqueueNotification(first);
+    chmodSync(dbPath, 0o644);
+    store.close();
+
+    const reopened = await SessionStore.create(dbPath);
+    expect(statSync(dbPath).mode & 0o777).toBe(0o600);
+    await reopened.enqueueNotification(second);
+    reopened.close();
+
+    expect(statSync(dbPath).mode & 0o777).toBe(0o600);
+    expect(statSync(`${dbPath}.bak`).mode & 0o777).toBe(0o600);
+    expect(readdirSync(directory).filter((name) => name.includes('.tmp-'))).toEqual([]);
+  });
+
+  it('leaves the live database intact when publishing the backup fails', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'cli2im-notification-store-'));
+    temporaryDirectories.push(directory);
+    const dbPath = join(directory, 'sessions.db');
+    const store = await SessionStore.create(dbPath);
+    await store.enqueueNotification(completionEvent({ eventKey: 'evt_before_failed_save' }));
+    const liveBefore = readFileSync(dbPath);
+    mkdirSync(`${dbPath}.bak`);
+    writeFileSync(join(`${dbPath}.bak`, 'blocker'), 'block replacement');
+
+    await expect(store.enqueueNotification(
+      completionEvent({ eventKey: 'evt_failed_save' }),
+    )).rejects.toThrow();
+
+    expect(readFileSync(dbPath)).toEqual(liveBefore);
+    expect(readdirSync(directory).filter((name) => name.includes('.tmp-'))).toEqual([]);
+    store.close();
+  });
+
+  it('leaves the live database intact when the temporary snapshot cannot be written', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'cli2im-notification-store-'));
+    temporaryDirectories.push(directory);
+    const dbPath = join(directory, 'sessions.db');
+    const store = await SessionStore.create(dbPath);
+    await store.enqueueNotification(completionEvent({ eventKey: 'evt_before_temp_failure' }));
+    const liveBefore = readFileSync(dbPath);
+
+    chmodSync(directory, 0o500);
+    try {
+      await expect(store.enqueueNotification(
+        completionEvent({ eventKey: 'evt_temp_failure' }),
+      )).rejects.toThrow();
+    } finally {
+      chmodSync(directory, 0o700);
+    }
+
+    expect(readFileSync(dbPath)).toEqual(liveBefore);
+    expect(readdirSync(directory).filter((name) => name.includes('.tmp-'))).toEqual([]);
+    store.close();
+  });
+
+  it.each(['corrupt', 'missing'] as const)(
+    'recovers a %s live database from the previous valid snapshot and ignores interrupted temps',
+    async (failure) => {
+      const directory = mkdtempSync(join(tmpdir(), 'cli2im-notification-store-'));
+      temporaryDirectories.push(directory);
+      const dbPath = join(directory, 'sessions.db');
+      const first = completionEvent({ eventKey: `evt_${failure}_recoverable` });
+      const second = completionEvent({ eventKey: `evt_${failure}_newer` });
+      const store = await SessionStore.create(dbPath);
+      await store.enqueueNotification(first);
+      await store.enqueueNotification(second);
+      store.close();
+      expect(existsSync(`${dbPath}.bak`)).toBe(true);
+
+      const interruptedTemp = join(directory, '.sessions.db.tmp-interrupted');
+      writeFileSync(interruptedTemp, 'partial snapshot', { mode: 0o644 });
+      if (failure === 'corrupt') {
+        writeFileSync(dbPath, 'not a sqlite database', { mode: 0o644 });
+      } else {
+        unlinkSync(dbPath);
+      }
+
+      const recovered = await SessionStore.create(dbPath);
+      expect((await recovered.listPendingNotifications()).map((row) => row.event.eventKey)).toEqual([
+        first.eventKey,
+      ]);
+      recovered.close();
+
+      expect(statSync(dbPath).mode & 0o777).toBe(0o600);
+      expect(statSync(interruptedTemp).mode & 0o777).toBe(0o600);
+      const SQL = await initSqlJs({ locateFile: (file: string) => join(sqlWasmDir, file) });
+      const verified = new SQL.Database(readFileSync(dbPath)) as unknown as ReadOnlyTestDatabase;
+      expect(verified.exec('SELECT COUNT(*) FROM notification_deliveries')[0]?.values[0]?.[0]).toBe(1);
+      verified.close();
+    },
+  );
 });

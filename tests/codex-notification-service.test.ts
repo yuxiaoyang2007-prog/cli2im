@@ -7,10 +7,12 @@ import { CodexNotificationService } from '../src/notifications/service.js';
 import type { NotificationMetadataResolver } from '../src/notifications/metadata.js';
 import type { NotificationRouter } from '../src/notifications/router.js';
 import type { SessionStore } from '../src/session/store.js';
+import { startNotificationServiceBeforeReady } from '../src/index.js';
 
 describe('CodexNotificationService', () => {
   it('starts and stops dependencies in order and routes stable question and completion events', async () => {
     const order: string[] = [];
+    const consoleLog = vi.spyOn(console, 'log').mockImplementation(() => undefined);
     let onRollout: ((event: ParsedRolloutLine, filePath: string) => void | Promise<void>) | undefined;
     let onApproval: ((event: PermissionHookEvent) => void | Promise<void>) | undefined;
     const router = {
@@ -63,6 +65,9 @@ describe('CodexNotificationService', () => {
 
     await service.start();
     expect(order).toEqual(['router.resume', 'socket.start', 'monitor.start']);
+    expect(consoleLog).toHaveBeenCalledWith(
+      '[notifications] healthy router=ready socket=ready monitor=ready',
+    );
 
     const filePath = '/tmp/codex/sessions/rollout-test.jsonl';
     await onRollout?.({
@@ -143,6 +148,7 @@ describe('CodexNotificationService', () => {
       'socket.stop',
       'router.stop',
     ]);
+    consoleLog.mockRestore();
   });
 
   it('preserves a queued question timestamp so delayed delivery uses event time', async () => {
@@ -410,9 +416,17 @@ describe('CodexNotificationService', () => {
     }));
   });
 
-  it('isolates lifecycle failures with safe summaries and continues remaining steps', async () => {
+  it.each([
+    ['router', ['router.resume', 'router.stop']],
+    ['socket', ['router.resume', 'socket.start', 'socket.stop', 'router.stop']],
+    ['monitor', [
+      'router.resume', 'socket.start', 'monitor.start',
+      'monitor.stop', 'socket.stop', 'router.stop',
+    ]],
+  ] as const)('fails closed and rolls back a %s startup failure', async (failure, expectedOrder) => {
     const order: string[] = [];
     const consoleError = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    const consoleLog = vi.spyOn(console, 'log').mockImplementation(() => undefined);
     const service = new CodexNotificationService({
       botName: 'codexbot',
       workingDirectory: '/tmp/project',
@@ -424,7 +438,10 @@ describe('CodexNotificationService', () => {
       timeZone: 'UTC',
       dependencies: {
         router: {
-          resumePending: vi.fn(async () => { order.push('router.resume'); }),
+          resumePending: vi.fn(async () => {
+            order.push('router.resume');
+            if (failure === 'router') throw new Error('private router detail');
+          }),
           handle: vi.fn(),
           stop: vi.fn(async () => { order.push('router.stop'); }),
         },
@@ -432,35 +449,41 @@ describe('CodexNotificationService', () => {
         createSocket: () => ({
           start: vi.fn(async () => {
             order.push('socket.start');
-            throw new Error('private socket detail');
+            if (failure === 'socket') throw new Error('private socket detail');
           }),
           stop: vi.fn(async () => { order.push('socket.stop'); }),
         }),
         createMonitor: () => ({
-          start: vi.fn(async () => { order.push('monitor.start'); }),
-          stop: vi.fn(async () => {
-            order.push('monitor.stop');
-            throw new Error('private monitor detail');
+          start: vi.fn(async () => {
+            order.push('monitor.start');
+            if (failure === 'monitor') throw new Error('private monitor detail');
           }),
+          stop: vi.fn(async () => { order.push('monitor.stop'); }),
         }),
       },
     });
 
-    await expect(service.start()).resolves.toBeUndefined();
-    await expect(service.stop()).resolves.toBeUndefined();
+    await expect(service.start()).rejects.toThrow('Codex notification service failed to start');
 
-    expect(order).toEqual([
-      'router.resume',
-      'socket.start',
-      'monitor.start',
-      'monitor.stop',
-      'socket.stop',
-      'router.stop',
-    ]);
-    expect(consoleError).toHaveBeenNthCalledWith(1, '[notifications] socket start failed');
-    expect(consoleError).toHaveBeenNthCalledWith(2, '[notifications] monitor stop failed');
+    expect(order).toEqual(expectedOrder);
+    expect(consoleError).toHaveBeenCalledWith('[notifications] start failed');
+    expect(consoleLog).not.toHaveBeenCalled();
     expect(JSON.stringify(consoleError.mock.calls)).not.toContain('private');
     consoleError.mockRestore();
+    consoleLog.mockRestore();
+  });
+
+  it('does not print generic Ready when enabled notification startup rejects', async () => {
+    const ready = vi.fn();
+    const service = {
+      start: vi.fn().mockRejectedValue(new Error('notification startup failed')),
+    };
+
+    await expect(startNotificationServiceBeforeReady(service, ready)).rejects.toThrow(
+      'notification startup failed',
+    );
+
+    expect(ready).not.toHaveBeenCalled();
   });
 
   it('awaits router shutdown before resolving service shutdown', async () => {
@@ -577,7 +600,9 @@ describe('CodexNotificationService', () => {
         },
       });
 
+      const consoleLog = vi.spyOn(console, 'log').mockImplementation(() => undefined);
       await service.start();
+      consoleLog.mockRestore();
       await onApproval?.({
         type: 'approval',
         sessionId,

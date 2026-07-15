@@ -52,6 +52,20 @@ describe('CodexNotificationSocket', () => {
     expect((await stat(socketPath)).mode & 0o777).toBe(0o600);
   });
 
+  it('protects a newly created socket parent before binding', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'cli2im-notify-parent-'));
+    directories.push(root);
+    const parent = join(root, 'private', 'nested');
+    const socketPath = join(parent, 'notify.sock');
+    const socket = new CodexNotificationSocket({ socketPath, onApproval: vi.fn() });
+    sockets.push(socket);
+
+    await socket.start();
+
+    expect((await stat(parent)).mode & 0o777).toBe(0o700);
+    expect((await stat(socketPath)).mode & 0o777).toBe(0o600);
+  });
+
   it('does not unlink a path that this instance never owned', async () => {
     const { socket, socketPath } = setup();
     await writeFile(socketPath, 'synthetic persistent file');

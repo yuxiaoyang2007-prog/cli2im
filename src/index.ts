@@ -64,11 +64,10 @@ import {
   commitVoiceSessionWhenContextReady,
   clearSessionScopedBuffers,
 } from './runtime/session-scoped-cleanup.js';
-import { getCli2imDataDir } from './util/data-dir.js';
+import { ensurePrivateDirectorySync, getCli2imDataDir } from './util/data-dir.js';
 import { homedir } from 'node:os';
 import { join, relative, isAbsolute } from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { mkdirSync } from 'node:fs';
 import { readFile, realpath, stat, lstat } from 'node:fs/promises';
 import { CodexNotificationService } from './notifications/service.js';
 
@@ -96,9 +95,9 @@ async function main(): Promise<void> {
 
   const dataDir = getCli2imDataDir();
   const mediaDir = join(dataDir, 'media');
-  mkdirSync(dataDir, { recursive: true });
-  mkdirSync(mediaDir, { recursive: true });
-  mkdirSync(join(dataDir, 'logs'), { recursive: true });
+  ensurePrivateDirectorySync(dataDir);
+  ensurePrivateDirectorySync(mediaDir);
+  ensurePrivateDirectorySync(join(dataDir, 'logs'));
 
   const store = await SessionStore.create(config.session.dbPath.replace('~', homedir()));
   const queue = new ChatQueue();
@@ -564,9 +563,7 @@ async function main(): Promise<void> {
     }
   }
 
-  await notificationService?.start();
-
-  console.log('[cli2im] Ready');
+  await startNotificationServiceBeforeReady(notificationService);
 
   const shutdown = async () => {
     console.log('[cli2im] Shutting down...');
@@ -581,6 +578,14 @@ async function main(): Promise<void> {
   };
   process.on('SIGTERM', () => void shutdown());
   process.on('SIGINT', () => void shutdown());
+}
+
+export async function startNotificationServiceBeforeReady(
+  service: Pick<CodexNotificationService, 'start'> | undefined,
+  reportReady: () => void = () => console.log('[cli2im] Ready'),
+): Promise<void> {
+  await service?.start();
+  reportReady();
 }
 
 export async function handleBridgeCommand(
