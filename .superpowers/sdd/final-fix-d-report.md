@@ -257,3 +257,63 @@ git diff --check
 
 Result: 60 files passed, 886 tests passed, 0 failed; typecheck and build exited 0; build reported
 `Build complete`; diff check exited 0.
+
+## Fix Review 3
+
+### Finding addressed
+
+During startup catchup, a historical completion or abort was correctly marked
+`notificationAllowed=false`, but the service still called the full turn release path. When that old
+turn was the only active turn, the release deleted the rollout's file/session context. A later current
+turn then attempted bounded head/tail hydration; if the original `session_meta` line was larger than the
+head window, session identity and project context could not be recovered, so both the current no-ID
+question and current completion were dropped.
+
+### RED evidence
+
+Command:
+
+```text
+npm test -- --run tests/codex-notification-service.test.ts
+```
+
+Observed before implementation:
+
+- 2 tests failed and 24 passed.
+- Both realistic cursorless startup fixtures used a `session_meta` line over 40 KB.
+- The historical-completion and historical-abort variants each routed zero of the expected two current
+  notifications.
+
+### Implementation
+
+- A context-only terminal event now removes only its historical turn metadata and active-turn entry.
+- It does not invoke `releaseTurnContext`, delete the file context, or delete the session mapping.
+- A notification-eligible current completion still routes first and then follows the normal full release
+  path. Normal live completion and abort behavior is unchanged.
+- The completed and aborted historical variants prove the current no-ID question and explicit current
+  completion both retain the original session, project, turn, and task metadata, while no historical
+  notification routes.
+- After the current completion, both context maps are empty, proving the temporary preservation does not
+  create an unbounded retained context. The cursor is also at EOF.
+
+### Verification evidence
+
+Focused startup/service regression:
+
+```text
+npm test -- --run tests/codex-notification-monitor-startup.test.ts tests/codex-notification-monitor-null-watcher.test.ts tests/codex-notification-service.test.ts
+```
+
+Result: 3 files passed, 34 tests passed, 0 failed.
+
+Full verification:
+
+```text
+npm test -- --run
+npm run typecheck
+npm run build
+git diff --check
+```
+
+Result: 60 files passed, 888 tests passed, 0 failed; typecheck and build exited 0; build reported
+`Build complete`; diff check exited 0.

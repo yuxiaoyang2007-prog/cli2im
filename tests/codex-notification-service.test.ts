@@ -477,6 +477,111 @@ describe('CodexNotificationService', () => {
   });
 
   it.each([
+    ['completed', 'task_complete'],
+    ['aborted', 'turn_aborted'],
+  ] as const)(
+    'preserves gap-free startup identity after a historical %s turn until the current terminal event',
+    async (historicalKind, historicalEventType) => {
+      vi.useRealTimers();
+      const directory = await mkdtemp(join(tmpdir(), `cli2im-catchup-${historicalKind}-`));
+      const sessionsDir = join(directory, 'sessions');
+      const filePath = join(sessionsDir, `rollout-${historicalKind}-terminal.jsonl`);
+      const sessionId = `session_${historicalKind}_terminal`;
+      const currentTurnId = `turn_current_${historicalKind}`;
+      const requestId = `question_current_${historicalKind}`;
+      const now = Date.now();
+      const oldTimestamp = now - 60_000;
+      const currentTimestamp = now + 60_000;
+      const rollout = startupTerminalCatchupRollout({
+        sessionId,
+        currentTurnId,
+        currentTask: 'Ship Feishu startup notifications',
+        historicalEventType,
+        oldTimestamp,
+        currentTimestamp,
+        requestId,
+      });
+      let service: CodexNotificationService | undefined;
+      let store: SessionStore | undefined;
+      const consoleLog = vi.spyOn(console, 'log').mockImplementation(() => undefined);
+
+      try {
+        expect(Buffer.byteLength(rollout.slice(0, rollout.indexOf('\n')))).toBeGreaterThan(22 * 1024);
+        await mkdir(sessionsDir, { recursive: true });
+        await writeFile(filePath, rollout);
+        const future = new Date(currentTimestamp);
+        await utimes(filePath, future, future);
+        store = await SessionStore.create(':memory:');
+        const router = {
+          resumePending: vi.fn().mockResolvedValue(undefined),
+          handle: vi.fn().mockResolvedValue('delivered'),
+          stop: vi.fn().mockResolvedValue(undefined),
+        } as unknown as NotificationRouter;
+        service = new CodexNotificationService({
+          botName: 'codexbot',
+          workingDirectory: directory,
+          sessionsDir,
+          sessionIndexPath: join(directory, 'session_index.jsonl'),
+          socketPath: join(directory, 'notify.sock'),
+          store,
+          resolveAdapter: () => undefined,
+          timeZone: 'UTC',
+          dependencies: {
+            router,
+            metadataResolver: {
+              resolve: vi.fn(async (input) => ({
+                projectName: input.cwd === '/tmp/startup-project'
+                  ? 'startup-project'
+                  : 'wrong-project',
+                taskName: input.userText || 'unnamed',
+                surface: 'CLI' as const,
+                shortTaskId: input.sessionId.slice(0, 8),
+              })),
+            },
+            createSocket: () => ({ start: vi.fn(), stop: vi.fn() }),
+          },
+        });
+
+        await service.start();
+
+        expect(router.handle).toHaveBeenCalledTimes(2);
+        expect(router.handle).toHaveBeenNthCalledWith(1, expect.objectContaining({
+          eventKey: eventKey([sessionId, currentTurnId, requestId, 'question']),
+          kind: 'needs_attention',
+          reason: 'question',
+          sessionId,
+          turnId: currentTurnId,
+          requestId,
+          projectName: 'startup-project',
+          taskName: 'Ship Feishu startup notifications',
+        }));
+        expect(router.handle).toHaveBeenNthCalledWith(2, expect.objectContaining({
+          eventKey: eventKey([sessionId, currentTurnId, 'completed']),
+          kind: 'completed',
+          sessionId,
+          turnId: currentTurnId,
+          projectName: 'startup-project',
+          taskName: 'Ship Feishu startup notifications',
+        }));
+        const routed = JSON.stringify(vi.mocked(router.handle).mock.calls);
+        expect(routed).not.toContain('historical_turn');
+        expect((await store.getNotificationCursor(filePath))?.byteOffset).toBe((await stat(filePath)).size);
+        const retained = service as unknown as {
+          contextsByFile: Map<string, unknown>;
+          contextsBySession: Map<string, unknown>;
+        };
+        expect(retained.contextsByFile.size).toBe(0);
+        expect(retained.contextsBySession.size).toBe(0);
+      } finally {
+        await service?.stop();
+        store?.close();
+        consoleLog.mockRestore();
+        await rm(directory, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it.each([
     ['no active context', []],
     ['ambiguous active contexts', [
       { type: 'turn_context', turnId: 'turn_first', cwd: '/tmp/project' },
@@ -1281,6 +1386,70 @@ function startupCatchupRollout(input: {
     },
   });
   return `${lines.map((line) => JSON.stringify(line)).join('\n')}\n`;
+}
+
+function startupTerminalCatchupRollout(input: {
+  sessionId: string;
+  currentTurnId: string;
+  currentTask: string;
+  historicalEventType: 'task_complete' | 'turn_aborted';
+  oldTimestamp: number;
+  currentTimestamp: number;
+  requestId: string;
+}): string {
+  const historicalTurnId = `${input.sessionId}_historical_turn`;
+  return `${[
+    {
+      type: 'session_meta',
+      payload: {
+        id: input.sessionId,
+        cwd: '/tmp/startup-project',
+        source: 'cli',
+        safe_filler: 'x'.repeat(40_000),
+      },
+    },
+    {
+      type: 'turn_context',
+      payload: { turn_id: historicalTurnId, cwd: '/tmp/startup-project' },
+    },
+    {
+      timestamp: new Date(input.oldTimestamp).toISOString(),
+      type: 'event_msg',
+      payload: { type: input.historicalEventType, turn_id: historicalTurnId },
+    },
+    {
+      type: 'turn_context',
+      payload: { turn_id: input.currentTurnId, cwd: '/tmp/startup-project' },
+    },
+    {
+      type: 'response_item',
+      payload: {
+        type: 'message',
+        role: 'user',
+        content: [{ type: 'input_text', text: input.currentTask }],
+        internal_chat_message_metadata_passthrough: { turn_id: input.currentTurnId },
+      },
+    },
+    {
+      timestamp: new Date(input.currentTimestamp).toISOString(),
+      type: 'response_item',
+      payload: {
+        type: 'function_call',
+        name: 'request_user_input',
+        call_id: input.requestId,
+        arguments: '{"questions":[{"question":"current private question"}]}',
+      },
+    },
+    {
+      timestamp: new Date(input.currentTimestamp + 1_000).toISOString(),
+      type: 'event_msg',
+      payload: {
+        type: 'task_complete',
+        turn_id: input.currentTurnId,
+        duration_ms: 5_000,
+      },
+    },
+  ].map((line) => JSON.stringify(line)).join('\n')}\n`;
 }
 
 function deferred<T>() {

@@ -246,10 +246,16 @@ export class CodexNotificationService {
           occurredAt: event.occurredAt,
           durationMs: event.durationMs,
         });
+        this.releaseTurnContext(filePath, context, event.turnId);
+      } else {
+        this.releaseCatchupTurn(context, event.turnId);
       }
-      this.releaseTurnContext(filePath, context, event.turnId);
     } else if (event.type === 'aborted') {
-      this.releaseTurnContext(filePath, context, event.turnId);
+      if (notificationAllowed) {
+        this.releaseTurnContext(filePath, context, event.turnId);
+      } else {
+        this.releaseCatchupTurn(context, event.turnId);
+      }
     }
   }
 
@@ -380,6 +386,11 @@ export class CodexNotificationService {
     context.turns.delete(turnId);
     context.activeTurnIds.delete(turnId);
     if (context.activeTurnIds.size === 0) this.releaseContext(filePath, context);
+  }
+
+  private releaseCatchupTurn(context: RolloutContext, turnId: string): void {
+    context.turns.delete(turnId);
+    context.activeTurnIds.delete(turnId);
   }
 
   private releaseContext(filePath: string, context: RolloutContext): void {
