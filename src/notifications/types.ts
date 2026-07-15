@@ -45,8 +45,11 @@ export interface StoredNotificationDelivery {
   event: CodexNotificationEvent;
   status: 'pending' | 'delivered' | 'failed' | 'discarded';
   attempts: number;
+  firstAttemptAt: number | null;
   lastAttemptAt: number | null;
   nextRetryAt: number | null;
   deliveredAt: number | null;
-  delayed: boolean | null;
+  transportMessageId: string | null;
+  acknowledgedAt: number | null;
+  delayedPatchCompletedAt: number | null;
 }

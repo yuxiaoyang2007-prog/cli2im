@@ -154,10 +154,13 @@ describe('notification persistence', () => {
         event,
         status: 'pending',
         attempts: 0,
+        firstAttemptAt: null,
         lastAttemptAt: null,
         nextRetryAt: null,
         deliveredAt: null,
-        delayed: null,
+        transportMessageId: null,
+        acknowledgedAt: null,
+        delayedPatchCompletedAt: null,
       },
     ]);
     store.close();
@@ -170,9 +173,13 @@ describe('notification persistence', () => {
     const event = completionEvent({ eventKey: 'evt_retry' });
 
     const firstStore = await SessionStore.create(dbPath);
-    await firstStore.enqueueNotification(event, true);
+    await firstStore.enqueueNotification(event);
     await firstStore.markNotificationAttemptStarted(event.eventKey, 1500);
+    await firstStore.markNotificationAttemptStarted(event.eventKey, 1750);
     await firstStore.setNotificationNextRetry(event.eventKey, 2000);
+    await firstStore.recordNotificationReceipt(event.eventKey, 'om_receipt', 1800);
+    await firstStore.recordNotificationReceipt(event.eventKey, 'om_ignored', 1900);
+    await firstStore.markNotificationDelayedPatchCompleted(event.eventKey, 1950);
     firstStore.close();
 
     const reloadedStore = await SessionStore.create(dbPath);
@@ -180,11 +187,14 @@ describe('notification persistence', () => {
       {
         event,
         status: 'pending',
-        attempts: 1,
-        lastAttemptAt: 1500,
-        nextRetryAt: 2000,
+        attempts: 2,
+        firstAttemptAt: 1500,
+        lastAttemptAt: 1750,
+        nextRetryAt: null,
         deliveredAt: null,
-        delayed: true,
+        transportMessageId: 'om_receipt',
+        acknowledgedAt: 1800,
+        delayedPatchCompletedAt: 1950,
       },
     ]);
     reloadedStore.close();
@@ -224,10 +234,13 @@ describe('notification persistence', () => {
         event,
         status: 'pending',
         attempts: 1,
+        firstAttemptAt: null,
         lastAttemptAt: null,
         nextRetryAt: 2000,
         deliveredAt: null,
-        delayed: null,
+        transportMessageId: null,
+        acknowledgedAt: null,
+        delayedPatchCompletedAt: null,
       },
     ]);
     store.close();
@@ -237,6 +250,10 @@ describe('notification persistence', () => {
     expect(columns.values.map((column) => column[1])).toEqual(expect.arrayContaining([
       'last_attempt_at',
       'delayed',
+      'first_attempt_at',
+      'transport_message_id',
+      'acknowledged_at',
+      'delayed_patch_completed_at',
     ]));
     migratedDb.close();
   });

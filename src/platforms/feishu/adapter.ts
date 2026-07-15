@@ -306,6 +306,21 @@ export class FeishuAdapter implements PlatformAdapter {
     throwIfAborted(options.signal);
   }
 
+  async replaceCard(
+    messageId: string,
+    card: CardPayload,
+    options: AbortableOptions = {},
+  ): Promise<void> {
+    throwIfAborted(options.signal);
+    const cardJson = this.buildCardJson(card);
+    throwIfAborted(options.signal);
+    await this.client.im.message.patch(withSignal({
+      path: { message_id: messageId },
+      data: { content: JSON.stringify(cardJson) },
+    }, options.signal));
+    throwIfAborted(options.signal);
+  }
+
   getClient(): lark.Client {
     return this.client;
   }

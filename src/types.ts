@@ -161,6 +161,7 @@ export interface PlatformAdapter {
   sendFile?(chatId: string, file: FilePayload, options?: AbortableOptions): Promise<void>;
   sendCard?(chatId: string, card: CardPayload, options?: AbortableOptions): Promise<string>;
   updateCard?(messageId: string, content: string, seq: number, options?: AbortableOptions): Promise<void>;
+  replaceCard?(messageId: string, card: CardPayload, options?: AbortableOptions): Promise<void>;
   downloadFile?(messageId: string, fileKey: string, type: string, options?: AbortableOptions): Promise<Buffer>;
   sendTypingIndicator?(chatId: string): Promise<void>;
 }

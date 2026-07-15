@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import initSqlJs from 'sql.js';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { buildNotificationCard } from '../src/notifications/card.js';
 import { NotificationRouter, type NotificationLogEntry } from '../src/notifications/router.js';
 import type { CodexNotificationEvent } from '../src/notifications/types.js';
 import { SessionStore } from '../src/session/store.js';
@@ -40,13 +41,18 @@ function timerDependencies() {
   };
 }
 
-function adapterWith(send: PlatformAdapter['send'], name = 'feishu'): PlatformAdapter {
+function adapterWith(
+  send: PlatformAdapter['send'],
+  name = 'feishu',
+  replaceCard: NonNullable<PlatformAdapter['replaceCard']> = vi.fn(),
+): PlatformAdapter {
   return {
     name,
     connect: vi.fn(),
     disconnect: vi.fn(),
     onMessage: vi.fn(),
     send,
+    replaceCard,
     editMessage: vi.fn(),
     deleteMessage: vi.fn(),
   };
@@ -145,6 +151,69 @@ describe('NotificationRouter', () => {
     expect(await store.listPendingNotifications()).toEqual([]);
   });
 
+  it('creates the base card then patches the same message when acknowledgement is delayed', async () => {
+    const store = await SessionStore.create(':memory:');
+    stores.push(store);
+    await bindTarget(store);
+    const event = attentionEvent();
+    const send = vi.fn<PlatformAdapter['send']>().mockImplementation(async () => {
+      vi.setSystemTime(STARTED_AT + 31_000);
+      return 'om_delayed_ack';
+    });
+    const replaceCard = vi.fn<NonNullable<PlatformAdapter['replaceCard']>>()
+      .mockResolvedValue(undefined);
+    const router = new NotificationRouter({
+      store,
+      botName: 'codexbot',
+      adapters: new Map([['codexbot', adapterWith(send, 'feishu', replaceCard)]]),
+      timeZone: 'America/New_York',
+      ...timerDependencies(),
+    });
+
+    await expect(router.handle(event)).resolves.toBe('delivered');
+
+    expect(send).toHaveBeenCalledWith('oc_notification_target', {
+      card: buildNotificationCard(event, {
+        delayed: false,
+        timeZone: 'America/New_York',
+      }),
+    }, { idempotencyKey: event.eventKey });
+    expect(replaceCard).toHaveBeenCalledOnce();
+    expect(replaceCard).toHaveBeenCalledWith(
+      'om_delayed_ack',
+      buildNotificationCard(event, {
+        delayed: true,
+        timeZone: 'America/New_York',
+      }),
+    );
+    const patchedCard = replaceCard.mock.calls[0]?.[1];
+    expect(patchedCard?.content.split('\n').at(-1)).toBe('⚠️ 延迟送达');
+  });
+
+  it('does not patch a message acknowledged within 30 seconds', async () => {
+    const store = await SessionStore.create(':memory:');
+    stores.push(store);
+    await bindTarget(store);
+    const send = vi.fn<PlatformAdapter['send']>().mockImplementation(async () => {
+      vi.setSystemTime(STARTED_AT + 29_500);
+      return 'om_on_time';
+    });
+    const replaceCard = vi.fn<NonNullable<PlatformAdapter['replaceCard']>>();
+    const router = new NotificationRouter({
+      store,
+      botName: 'codexbot',
+      adapters: new Map([['codexbot', adapterWith(send, 'feishu', replaceCard)]]),
+      timeZone: 'America/New_York',
+      ...timerDependencies(),
+    });
+
+    await expect(router.handle(attentionEvent())).resolves.toBe('delivered');
+
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(JSON.stringify(send.mock.calls[0]?.[1])).not.toContain('⚠️ 延迟送达');
+    expect(replaceCard).not.toHaveBeenCalled();
+  });
+
   it('persists and schedules retry delays of 1, 5, and 20 seconds before succeeding', async () => {
     const store = await SessionStore.create(':memory:');
     stores.push(store);
@@ -222,6 +291,13 @@ describe('NotificationRouter', () => {
       event.eventKey,
       event.eventKey,
     ]);
+    expect(send.mock.calls.map(([, content]) => content)).toEqual([
+      send.mock.calls[0]?.[1],
+      send.mock.calls[0]?.[1],
+      send.mock.calls[0]?.[1],
+      send.mock.calls[0]?.[1],
+    ]);
+    expect(JSON.stringify(send.mock.calls[0]?.[1])).not.toContain('⚠️ 延迟送达');
     expect(await store.listPendingNotifications()).toEqual([]);
     expect(logs).toEqual([
       expect.objectContaining({ attempt: 1, errorClass: 'TypeError' }),
@@ -309,6 +385,64 @@ describe('NotificationRouter', () => {
     expect(await store.listPendingNotifications()).toEqual([]);
   });
 
+  it('retries receipt persistence locally without creating a second message', async () => {
+    const store = await SessionStore.create(':memory:');
+    stores.push(store);
+    await bindTarget(store);
+    const send = vi.fn<PlatformAdapter['send']>().mockResolvedValue('om_receipt_retry');
+    const originalRecordReceipt = store.recordNotificationReceipt.bind(store);
+    const recordReceipt = vi.spyOn(store, 'recordNotificationReceipt')
+      .mockRejectedValueOnce(new Error('local receipt write failed'))
+      .mockImplementation(originalRecordReceipt);
+    const router = new NotificationRouter({
+      store,
+      botName: 'codexbot',
+      adapters: new Map([['codexbot', adapterWith(send)]]),
+      timeZone: 'America/New_York',
+      log: vi.fn(),
+      ...timerDependencies(),
+    });
+
+    await expect(router.handle(attentionEvent())).resolves.toBe('pending');
+    await vi.advanceTimersByTimeAsync(1_000);
+
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(recordReceipt).toHaveBeenCalledTimes(2);
+    expect(await store.listPendingNotifications()).toEqual([]);
+  });
+
+  it('retries a delayed-card patch without creating another message', async () => {
+    const store = await SessionStore.create(':memory:');
+    stores.push(store);
+    await bindTarget(store);
+    const send = vi.fn<PlatformAdapter['send']>().mockImplementation(async () => {
+      vi.setSystemTime(STARTED_AT + 31_000);
+      return 'om_patch_retry';
+    });
+    const replaceCard = vi.fn<NonNullable<PlatformAdapter['replaceCard']>>()
+      .mockRejectedValueOnce(new Error('patch unavailable'))
+      .mockResolvedValue(undefined);
+    const router = new NotificationRouter({
+      store,
+      botName: 'codexbot',
+      adapters: new Map([['codexbot', adapterWith(send, 'feishu', replaceCard)]]),
+      timeZone: 'America/New_York',
+      log: vi.fn(),
+      ...timerDependencies(),
+    });
+
+    await expect(router.handle(attentionEvent())).resolves.toBe('pending');
+    await vi.advanceTimersByTimeAsync(1_000);
+
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(replaceCard).toHaveBeenCalledTimes(2);
+    expect(replaceCard.mock.calls.map(([messageId]) => messageId)).toEqual([
+      'om_patch_retry',
+      'om_patch_retry',
+    ]);
+    expect(await store.listPendingNotifications()).toEqual([]);
+  });
+
   it('never re-enters the adapter in-process after external acceptance', async () => {
     const store = await SessionStore.create(':memory:');
     stores.push(store);
@@ -363,10 +497,13 @@ describe('NotificationRouter', () => {
         event: attentionEvent(),
         status: 'pending',
         attempts: 1,
+        firstAttemptAt: STARTED_AT,
         lastAttemptAt: STARTED_AT,
         nextRetryAt: null,
         deliveredAt: null,
-        delayed: false,
+        transportMessageId: null,
+        acknowledgedAt: null,
+        delayedPatchCompletedAt: null,
       },
     ]);
 
@@ -379,7 +516,7 @@ describe('NotificationRouter', () => {
     expect(await store.listPendingNotifications()).toEqual([]);
   });
 
-  it('restarts within 55 minutes with the same uuid and frozen card variant', async () => {
+  it('restarts within 55 minutes with the same uuid and base card, then patches for delayed ack', async () => {
     const directory = mkdtempSync(join(tmpdir(), 'cli2im-router-restart-'));
     temporaryDirectories.push(directory);
     const dbPath = join(directory, 'sessions.db');
@@ -404,10 +541,12 @@ describe('NotificationRouter', () => {
     const reloadedStore = await SessionStore.create(dbPath);
     stores.push(reloadedStore);
     const resumedSend = vi.fn<PlatformAdapter['send']>().mockResolvedValue('om_resumed');
+    const replaceCard = vi.fn<NonNullable<PlatformAdapter['replaceCard']>>()
+      .mockResolvedValue(undefined);
     const resumedRouter = new NotificationRouter({
       store: reloadedStore,
       botName: 'codexbot',
-      adapters: new Map([['codexbot', adapterWith(resumedSend)]]),
+      adapters: new Map([['codexbot', adapterWith(resumedSend, 'feishu', replaceCard)]]),
       timeZone: 'America/New_York',
       ...timerDependencies(),
     });
@@ -419,7 +558,121 @@ describe('NotificationRouter', () => {
     expect(resumedSend.mock.calls[0]?.[2]?.idempotencyKey).toBe(event.eventKey);
     expect(resumedSend.mock.calls[0]?.[1]).toEqual(firstSend.mock.calls[0]?.[1]);
     expect(JSON.stringify(resumedSend.mock.calls[0]?.[1])).not.toContain('⚠️ 延迟送达');
+    expect(replaceCard).toHaveBeenCalledWith(
+      'om_resumed',
+      buildNotificationCard(event, {
+        delayed: true,
+        timeZone: 'America/New_York',
+      }),
+    );
     expect(await reloadedStore.listPendingNotifications()).toEqual([]);
+  });
+
+  it('resumes a persisted receipt with delayed patch and finalization but no create', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'cli2im-router-receipt-'));
+    temporaryDirectories.push(directory);
+    const dbPath = join(directory, 'sessions.db');
+    const firstStore = await SessionStore.create(dbPath);
+    await bindTarget(firstStore);
+    const event = attentionEvent({ eventKey: '555555555555555555555555' });
+    await firstStore.enqueueNotification(event);
+    await firstStore.markNotificationAttemptStarted(event.eventKey, STARTED_AT);
+    await firstStore.recordNotificationReceipt(
+      event.eventKey,
+      'om_persisted_receipt',
+      STARTED_AT + 31_000,
+    );
+    firstStore.close();
+
+    vi.setSystemTime(STARTED_AT + 32_000);
+    const reloadedStore = await SessionStore.create(dbPath);
+    stores.push(reloadedStore);
+    const send = vi.fn<PlatformAdapter['send']>().mockResolvedValue('must_not_create');
+    const replaceCard = vi.fn<NonNullable<PlatformAdapter['replaceCard']>>()
+      .mockResolvedValue(undefined);
+    const markDelivered = vi.spyOn(reloadedStore, 'markNotificationDelivered');
+    const router = new NotificationRouter({
+      store: reloadedStore,
+      botName: 'codexbot',
+      adapters: new Map([['codexbot', adapterWith(send, 'feishu', replaceCard)]]),
+      timeZone: 'America/New_York',
+      ...timerDependencies(),
+    });
+
+    await router.resumePending();
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(send).not.toHaveBeenCalled();
+    expect(replaceCard).toHaveBeenCalledWith(
+      'om_persisted_receipt',
+      buildNotificationCard(event, {
+        delayed: true,
+        timeZone: 'America/New_York',
+      }),
+    );
+    expect(markDelivered).toHaveBeenCalledTimes(1);
+    expect(await reloadedStore.listPendingNotifications()).toEqual([]);
+  });
+
+  it('expires from immutable first uuid use across repeated near-boundary restarts', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'cli2im-router-first-attempt-expiry-'));
+    temporaryDirectories.push(directory);
+    const dbPath = join(directory, 'sessions.db');
+    const event = attentionEvent({ eventKey: '666666666666666666666666' });
+
+    const firstStore = await SessionStore.create(dbPath);
+    await bindTarget(firstStore);
+    const firstSend = vi.fn<PlatformAdapter['send']>().mockRejectedValue(new Error('offline'));
+    const firstRouter = new NotificationRouter({
+      store: firstStore,
+      botName: 'codexbot',
+      adapters: new Map([['codexbot', adapterWith(firstSend)]]),
+      timeZone: 'America/New_York',
+      log: vi.fn(),
+      ...timerDependencies(),
+    });
+    await expect(firstRouter.handle(event)).resolves.toBe('pending');
+    firstRouter.stop();
+    firstStore.close();
+
+    vi.setSystemTime(STARTED_AT + 54 * 60_000);
+    const secondStore = await SessionStore.create(dbPath);
+    const secondSend = vi.fn<PlatformAdapter['send']>().mockRejectedValue(new Error('offline'));
+    const secondRouter = new NotificationRouter({
+      store: secondStore,
+      botName: 'codexbot',
+      adapters: new Map([['codexbot', adapterWith(secondSend)]]),
+      timeZone: 'America/New_York',
+      log: vi.fn(),
+      ...timerDependencies(),
+    });
+    await secondRouter.resumePending();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(secondSend).toHaveBeenCalledTimes(1);
+    secondRouter.stop();
+    secondStore.close();
+
+    vi.setSystemTime(STARTED_AT + 108 * 60_000);
+    const finalStore = await SessionStore.create(dbPath);
+    stores.push(finalStore);
+    const finalSend = vi.fn<PlatformAdapter['send']>().mockResolvedValue('must_not_create');
+    const markFailed = vi.spyOn(finalStore, 'markNotificationFailed');
+    const finalRouter = new NotificationRouter({
+      store: finalStore,
+      botName: 'codexbot',
+      adapters: new Map([['codexbot', adapterWith(finalSend)]]),
+      timeZone: 'America/New_York',
+      log: vi.fn(),
+      ...timerDependencies(),
+    });
+
+    await finalRouter.resumePending();
+    await vi.runAllTimersAsync();
+
+    expect(firstSend).toHaveBeenCalledTimes(1);
+    expect(finalSend).not.toHaveBeenCalled();
+    expect(markFailed).toHaveBeenCalledWith(event.eventKey);
+    expect(await finalStore.listPendingNotifications()).toEqual([]);
   });
 
   it('expires a persisted attempted delivery after the 55-minute uuid safety window', async () => {
@@ -491,7 +744,7 @@ describe('NotificationRouter', () => {
     expect(await store.listPendingNotifications()).toEqual([]);
   });
 
-  it('fails a migrated attempted row whose last attempt time is unverifiable', async () => {
+  it('fails a migrated attempted row whose first uuid use is unverifiable', async () => {
     const directory = mkdtempSync(join(tmpdir(), 'cli2im-router-legacy-expiry-'));
     temporaryDirectories.push(directory);
     const dbPath = join(directory, 'sessions.db');
@@ -519,7 +772,7 @@ describe('NotificationRouter', () => {
     expect(await store.listPendingNotifications()).toEqual([]);
   });
 
-  it('safely sends an old attempts-zero row and freezes it as delayed', async () => {
+  it('safely creates the base card for an old attempts-zero row then patches it as delayed', async () => {
     const store = await SessionStore.create(':memory:');
     stores.push(store);
     await bindTarget(store);
@@ -529,10 +782,12 @@ describe('NotificationRouter', () => {
     });
     await store.enqueueNotification(event);
     const send = vi.fn<PlatformAdapter['send']>().mockResolvedValue('om_old_first_attempt');
+    const replaceCard = vi.fn<NonNullable<PlatformAdapter['replaceCard']>>()
+      .mockResolvedValue(undefined);
     const router = new NotificationRouter({
       store,
       botName: 'codexbot',
-      adapters: new Map([['codexbot', adapterWith(send)]]),
+      adapters: new Map([['codexbot', adapterWith(send, 'feishu', replaceCard)]]),
       timeZone: 'America/New_York',
       ...timerDependencies(),
     });
@@ -542,7 +797,14 @@ describe('NotificationRouter', () => {
 
     expect(send).toHaveBeenCalledTimes(1);
     expect(send.mock.calls[0]?.[2]?.idempotencyKey).toBe(event.eventKey);
-    expect(JSON.stringify(send.mock.calls[0]?.[1])).toContain('⚠️ 延迟送达');
+    expect(JSON.stringify(send.mock.calls[0]?.[1])).not.toContain('⚠️ 延迟送达');
+    expect(replaceCard).toHaveBeenCalledWith(
+      'om_old_first_attempt',
+      buildNotificationCard(event, {
+        delayed: true,
+        timeZone: 'America/New_York',
+      }),
+    );
     expect(await store.listPendingNotifications()).toEqual([]);
   });
 

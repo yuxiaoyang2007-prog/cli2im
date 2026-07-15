@@ -127,6 +127,35 @@ describe('FeishuAdapter file handling', () => {
     ]);
   });
 
+  it('serializes a full replacement card through Feishu message patch', async () => {
+    const adapter = new FeishuAdapter({ appId: 'app', appSecret: 'secret', botName: 'bot' });
+    const client = larkMocks.clients[0];
+
+    await adapter.replaceCard('om_delayed', {
+      type: 'final',
+      title: '🟢 任务完成',
+      headerTemplate: 'green',
+      content: '**项目：** cli2im\n⚠️ 延迟送达',
+    });
+
+    expect(client.im.message.patch).toHaveBeenCalledWith({
+      path: { message_id: 'om_delayed' },
+      data: {
+        content: JSON.stringify({
+          config: { wide_screen_mode: true },
+          elements: [{
+            tag: 'markdown',
+            content: '**项目：** cli2im\n⚠️ 延迟送达',
+          }],
+          header: {
+            title: { tag: 'plain_text', content: '🟢 任务完成' },
+            template: 'green',
+          },
+        }),
+      },
+    });
+  });
+
   it('parses image and file receive events into inbound attachments', () => {
     const adapter = new FeishuAdapter({ appId: 'app', appSecret: 'secret', botName: 'bot' });
     const received: InboundMessage[] = [];
