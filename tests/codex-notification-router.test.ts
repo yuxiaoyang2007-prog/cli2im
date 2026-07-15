@@ -6,6 +6,7 @@ import initSqlJs from 'sql.js';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { buildNotificationCard } from '../src/notifications/card.js';
 import { NotificationRouter, type NotificationLogEntry } from '../src/notifications/router.js';
+import { FeishuResponseError } from '../src/platforms/feishu/adapter.js';
 import type { CodexNotificationEvent } from '../src/notifications/types.js';
 import { SessionStore } from '../src/session/store.js';
 import type { PlatformAdapter } from '../src/types.js';
@@ -146,7 +147,10 @@ describe('NotificationRouter', () => {
         title: '🟠 待你处理',
         headerTemplate: 'orange',
       }),
-    }, { idempotencyKey: 'evt_attention_0123456789abcdef' });
+    }, {
+      idempotencyKey: 'evt_attention_0123456789abcdef',
+      signal: expect.any(AbortSignal),
+    });
     expect(unrelatedSend).not.toHaveBeenCalled();
     expect(await store.listPendingNotifications()).toEqual([]);
   });
@@ -177,7 +181,10 @@ describe('NotificationRouter', () => {
         delayed: false,
         timeZone: 'America/New_York',
       }),
-    }, { idempotencyKey: event.eventKey });
+    }, {
+      idempotencyKey: event.eventKey,
+      signal: expect.any(AbortSignal),
+    });
     expect(replaceCard).toHaveBeenCalledOnce();
     expect(replaceCard).toHaveBeenCalledWith(
       'om_delayed_ack',
@@ -185,6 +192,7 @@ describe('NotificationRouter', () => {
         delayed: true,
         timeZone: 'America/New_York',
       }),
+      { signal: expect.any(AbortSignal) },
     );
     const patchedCard = replaceCard.mock.calls[0]?.[1];
     expect(patchedCard?.content.split('\n').at(-1)).toBe('⚠️ 延迟送达');
@@ -307,6 +315,42 @@ describe('NotificationRouter', () => {
     expect(JSON.stringify(logs)).not.toContain('sensitive remote response');
   });
 
+  it.each([
+    ['HTTP-200 business error', new FeishuResponseError(
+      'feishu_business_error',
+      'Feishu card create failed',
+    )],
+    ['missing message id', new FeishuResponseError(
+      'feishu_invalid_response',
+      'Feishu card create returned an invalid response',
+    )],
+  ])('retries a card create %s and does not mark it delivered', async (_label, failure) => {
+    const store = await SessionStore.create(':memory:');
+    stores.push(store);
+    await bindTarget(store);
+    const send = vi.fn<PlatformAdapter['send']>()
+      .mockRejectedValueOnce(failure)
+      .mockResolvedValue('om_retried');
+    const markDelivered = vi.spyOn(store, 'markNotificationDelivered');
+    const logs: NotificationLogEntry[] = [];
+    const router = new NotificationRouter({
+      store,
+      botName: 'codexbot',
+      adapters: new Map([['codexbot', adapterWith(send)]]),
+      timeZone: 'America/New_York',
+      log: (entry) => logs.push(entry),
+      ...timerDependencies(),
+    });
+
+    await expect(router.handle(attentionEvent())).resolves.toBe('pending');
+    expect(markDelivered).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1_000);
+
+    expect(send).toHaveBeenCalledTimes(2);
+    expect(markDelivered).toHaveBeenCalledTimes(1);
+    expect(logs[0]?.errorClass).toBe(failure.category);
+  });
+
   it('marks the delivery failed after four total attempts and schedules no fifth send', async () => {
     const store = await SessionStore.create(':memory:');
     stores.push(store);
@@ -420,14 +464,18 @@ describe('NotificationRouter', () => {
       return 'om_patch_retry';
     });
     const replaceCard = vi.fn<NonNullable<PlatformAdapter['replaceCard']>>()
-      .mockRejectedValueOnce(new Error('patch unavailable'))
+      .mockRejectedValueOnce(new FeishuResponseError(
+        'feishu_business_error',
+        'Feishu card patch failed',
+      ))
       .mockResolvedValue(undefined);
+    const logs: NotificationLogEntry[] = [];
     const router = new NotificationRouter({
       store,
       botName: 'codexbot',
       adapters: new Map([['codexbot', adapterWith(send, 'feishu', replaceCard)]]),
       timeZone: 'America/New_York',
-      log: vi.fn(),
+      log: (entry) => logs.push(entry),
       ...timerDependencies(),
     });
 
@@ -439,6 +487,9 @@ describe('NotificationRouter', () => {
     expect(replaceCard.mock.calls.map(([messageId]) => messageId)).toEqual([
       'om_patch_retry',
       'om_patch_retry',
+    ]);
+    expect(logs).toEqual([
+      expect.objectContaining({ errorClass: 'feishu_business_error' }),
     ]);
     expect(await store.listPendingNotifications()).toEqual([]);
   });
@@ -474,7 +525,7 @@ describe('NotificationRouter', () => {
     await expect(firstRouter.handle(event)).resolves.toBe('pending');
     expect(firstSend).toHaveBeenCalledTimes(1);
     expect(firstReplaceCard).toHaveBeenCalledTimes(1);
-    firstRouter.stop();
+    await firstRouter.stop();
     firstStore.close();
 
     vi.setSystemTime(STARTED_AT + 32_000);
@@ -500,13 +551,15 @@ describe('NotificationRouter', () => {
 
     expect(resumedSend).not.toHaveBeenCalled();
     expect(resumedReplaceCard).toHaveBeenCalledTimes(1);
-    expect(resumedReplaceCard.mock.calls[0]).toEqual(firstReplaceCard.mock.calls[0]);
+    expect(resumedReplaceCard.mock.calls[0]?.slice(0, 2))
+      .toEqual(firstReplaceCard.mock.calls[0]?.slice(0, 2));
     expect(resumedReplaceCard).toHaveBeenCalledWith(
       'om_patch_recovery',
       buildNotificationCard(event, {
         delayed: true,
         timeZone: 'America/New_York',
       }),
+      { signal: expect.any(AbortSignal) },
     );
     expect(firstLogs).toEqual([{
       kind: 'needs_attention',
@@ -541,6 +594,135 @@ describe('NotificationRouter', () => {
     await router.resumePending();
     await vi.advanceTimersByTimeAsync(0);
     expect(send).toHaveBeenCalledTimes(1);
+  });
+
+  it('aborts an outbound send, drains it, and rejects new work during shutdown', async () => {
+    const store = await SessionStore.create(':memory:');
+    stores.push(store);
+    await bindTarget(store);
+    const sendGate = deferred<string>();
+    let outboundSignal: AbortSignal | undefined;
+    const send = vi.fn<PlatformAdapter['send']>().mockImplementation((_chatId, _content, options) => {
+      outboundSignal = options?.signal;
+      return sendGate.promise;
+    });
+    const router = new NotificationRouter({
+      store,
+      botName: 'codexbot',
+      adapters: new Map([['codexbot', adapterWith(send)]]),
+      timeZone: 'America/New_York',
+      shutdownTimeoutMs: 50,
+      ...timerDependencies(),
+    });
+
+    const handling = router.handle(attentionEvent());
+    await vi.advanceTimersByTimeAsync(0);
+    const stopping = router.stop();
+    const wasAborted = outboundSignal?.aborted === true;
+    sendGate.resolve('om_late_after_abort');
+    await vi.runAllTimersAsync();
+
+    await expect(stopping).resolves.toBeUndefined();
+    await expect(handling).resolves.toBe('pending');
+    await expect(router.handle(attentionEvent({
+      eventKey: 'evt_after_stop_0123456789abcdef',
+    }))).resolves.toBe('failed');
+    expect(wasAborted).toBe(true);
+    expect(send).toHaveBeenCalledTimes(1);
+  });
+
+  it('allows a timed-out send to settle without touching a closed store or re-entering the adapter', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'cli2im-router-stop-send-'));
+    temporaryDirectories.push(directory);
+    const dbPath = join(directory, 'sessions.db');
+    const store = await SessionStore.create(dbPath);
+    await bindTarget(store);
+    const sendGate = deferred<string>();
+    let outboundSignal: AbortSignal | undefined;
+    const send = vi.fn<PlatformAdapter['send']>().mockImplementation((_chatId, _content, options) => {
+      outboundSignal = options?.signal;
+      return sendGate.promise;
+    });
+    const recordReceipt = vi.spyOn(store, 'recordNotificationReceipt');
+    const markDelivered = vi.spyOn(store, 'markNotificationDelivered');
+    const router = new NotificationRouter({
+      store,
+      botName: 'codexbot',
+      adapters: new Map([['codexbot', adapterWith(send)]]),
+      timeZone: 'America/New_York',
+      shutdownTimeoutMs: 10,
+      ...timerDependencies(),
+    });
+
+    const handling = router.handle(attentionEvent());
+    await vi.advanceTimersByTimeAsync(0);
+    const stopping = router.stop();
+    await vi.advanceTimersByTimeAsync(10);
+    await stopping;
+    store.close();
+
+    sendGate.resolve('om_accepted_after_timeout');
+    await expect(handling).resolves.toBe('pending');
+    expect(outboundSignal?.aborted).toBe(true);
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(recordReceipt).not.toHaveBeenCalled();
+    expect(markDelivered).not.toHaveBeenCalled();
+
+    const reloaded = await SessionStore.create(dbPath);
+    stores.push(reloaded);
+    expect(await reloaded.listPendingNotifications()).toEqual([
+      expect.objectContaining({
+        event: attentionEvent(),
+        status: 'pending',
+        attempts: 1,
+        transportMessageId: null,
+      }),
+    ]);
+  });
+
+  it('does not schedule persistence or adapter work when finalization settles after shutdown timeout', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'cli2im-router-stop-finalize-'));
+    temporaryDirectories.push(directory);
+    const dbPath = join(directory, 'sessions.db');
+    const store = await SessionStore.create(dbPath);
+    await bindTarget(store);
+    const finalizeGate = deferred<void>();
+    const send = vi.fn<PlatformAdapter['send']>().mockResolvedValue('om_before_shutdown');
+    const replaceCard = vi.fn<NonNullable<PlatformAdapter['replaceCard']>>();
+    const markDelivered = vi.spyOn(store, 'markNotificationDelivered')
+      .mockImplementation(() => finalizeGate.promise);
+    const setNextRetry = vi.spyOn(store, 'setNotificationNextRetry');
+    const router = new NotificationRouter({
+      store,
+      botName: 'codexbot',
+      adapters: new Map([['codexbot', adapterWith(send, 'feishu', replaceCard)]]),
+      timeZone: 'America/New_York',
+      shutdownTimeoutMs: 10,
+      ...timerDependencies(),
+    });
+
+    const handling = router.handle(attentionEvent());
+    await vi.advanceTimersByTimeAsync(0);
+    expect(markDelivered).toHaveBeenCalledTimes(1);
+    const stopping = router.stop();
+    await vi.advanceTimersByTimeAsync(10);
+    await stopping;
+    store.close();
+
+    finalizeGate.reject(new Error('late local close'));
+    await expect(handling).resolves.toBe('pending');
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(replaceCard).not.toHaveBeenCalled();
+    expect(setNextRetry).not.toHaveBeenCalled();
+
+    const reloaded = await SessionStore.create(dbPath);
+    stores.push(reloaded);
+    expect(await reloaded.listPendingNotifications()).toEqual([
+      expect.objectContaining({
+        status: 'pending',
+        transportMessageId: 'om_before_shutdown',
+      }),
+    ]);
   });
 
   it('does not overlap resumePending with an in-flight immediate delivery', async () => {
@@ -609,7 +791,7 @@ describe('NotificationRouter', () => {
     });
 
     await expect(firstRouter.handle(event)).resolves.toBe('pending');
-    firstRouter.stop();
+    await firstRouter.stop();
     firstStore.close();
 
     vi.setSystemTime(STARTED_AT + 2_000);
@@ -639,6 +821,7 @@ describe('NotificationRouter', () => {
         delayed: true,
         timeZone: 'America/New_York',
       }),
+      { signal: expect.any(AbortSignal) },
     );
     expect(await reloadedStore.listPendingNotifications()).toEqual([]);
   });
@@ -684,6 +867,7 @@ describe('NotificationRouter', () => {
         delayed: true,
         timeZone: 'America/New_York',
       }),
+      { signal: expect.any(AbortSignal) },
     );
     expect(markDelivered).toHaveBeenCalledTimes(1);
     expect(await reloadedStore.listPendingNotifications()).toEqual([]);
@@ -707,7 +891,7 @@ describe('NotificationRouter', () => {
       ...timerDependencies(),
     });
     await expect(firstRouter.handle(event)).resolves.toBe('pending');
-    firstRouter.stop();
+    await firstRouter.stop();
     firstStore.close();
 
     vi.setSystemTime(STARTED_AT + 54 * 60_000);
@@ -724,7 +908,7 @@ describe('NotificationRouter', () => {
     await secondRouter.resumePending();
     await vi.advanceTimersByTimeAsync(0);
     expect(secondSend).toHaveBeenCalledTimes(1);
-    secondRouter.stop();
+    await secondRouter.stop();
     secondStore.close();
 
     vi.setSystemTime(STARTED_AT + 108 * 60_000);
@@ -769,7 +953,7 @@ describe('NotificationRouter', () => {
       ...timerDependencies(),
     });
     await expect(firstRouter.handle(event)).resolves.toBe('pending');
-    firstRouter.stop();
+    await firstRouter.stop();
     firstStore.close();
 
     vi.setSystemTime(STARTED_AT + 55 * 60_000);
@@ -879,6 +1063,7 @@ describe('NotificationRouter', () => {
         delayed: true,
         timeZone: 'America/New_York',
       }),
+      { signal: expect.any(AbortSignal) },
     );
     expect(await store.listPendingNotifications()).toEqual([]);
   });
@@ -904,10 +1089,10 @@ describe('NotificationRouter', () => {
       ...timerDependencies(),
     });
 
-    await expect(router.handle(attentionEvent())).resolves.toBe('pending');
+    await expect(router.handle(attentionEvent())).resolves.toBe('failed');
     adapters.delete('codexbot');
     await expect(router.handle(attentionEvent({ eventKey: 'evt_missing_0123456789abcdef' })))
-      .resolves.toBe('pending');
+      .resolves.toBe('failed');
     expect(markFailed).toHaveBeenNthCalledWith(1, 'evt_attention_0123456789abcdef');
     expect(markFailed).toHaveBeenNthCalledWith(2, 'evt_missing_0123456789abcdef');
     expect(telegramSend).not.toHaveBeenCalled();

@@ -21,6 +21,20 @@ export interface FeishuAdapterConfig {
   botName: string;
 }
 
+export type FeishuResponseErrorCategory =
+  | 'feishu_business_error'
+  | 'feishu_invalid_response';
+
+export class FeishuResponseError extends Error {
+  readonly category: FeishuResponseErrorCategory;
+
+  constructor(category: FeishuResponseErrorCategory, message: string) {
+    super(message);
+    this.name = 'FeishuResponseError';
+    this.category = category;
+  }
+}
+
 export class FeishuAdapter implements PlatformAdapter {
   name = 'feishu';
   private client: lark.Client;
@@ -286,8 +300,15 @@ export class FeishuAdapter implements PlatformAdapter {
       },
     }, options.signal));
     throwIfAborted(options.signal);
-
-    return resp.data?.message_id ?? '';
+    assertSuccessfulFeishuResponse(resp, 'card create');
+    const messageId = resp.data?.message_id?.trim();
+    if (!messageId) {
+      throw new FeishuResponseError(
+        'feishu_invalid_response',
+        'Feishu card create returned an invalid response',
+      );
+    }
+    return messageId;
   }
 
   async updateCard(
@@ -299,11 +320,12 @@ export class FeishuAdapter implements PlatformAdapter {
     throwIfAborted(options.signal);
     const card = this.buildCardJson({ type: 'streaming', content });
     throwIfAborted(options.signal);
-    await this.client.im.message.patch(withSignal({
+    const response = await this.client.im.message.patch(withSignal({
       path: { message_id: messageId },
       data: { content: JSON.stringify(card) },
     }, options.signal));
     throwIfAborted(options.signal);
+    assertSuccessfulFeishuResponse(response, 'card patch');
   }
 
   async replaceCard(
@@ -314,11 +336,12 @@ export class FeishuAdapter implements PlatformAdapter {
     throwIfAborted(options.signal);
     const cardJson = this.buildCardJson(card);
     throwIfAborted(options.signal);
-    await this.client.im.message.patch(withSignal({
+    const response = await this.client.im.message.patch(withSignal({
       path: { message_id: messageId },
       data: { content: JSON.stringify(cardJson) },
     }, options.signal));
     throwIfAborted(options.signal);
+    assertSuccessfulFeishuResponse(response, 'card patch');
   }
 
   getClient(): lark.Client {
@@ -524,6 +547,20 @@ export class FeishuAdapter implements PlatformAdapter {
           }
         : undefined,
     };
+  }
+}
+
+function assertSuccessfulFeishuResponse(response: unknown, operation: string): void {
+  if (
+    typeof response !== 'object'
+    || response === null
+    || !('code' in response)
+    || response.code !== 0
+  ) {
+    throw new FeishuResponseError(
+      'feishu_business_error',
+      `Feishu ${operation} failed`,
+    );
   }
 }
 

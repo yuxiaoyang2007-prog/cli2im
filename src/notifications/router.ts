@@ -11,6 +11,7 @@ const MAX_ATTEMPTS = RETRY_DELAYS_MS.length + 1;
 const DELAYED_AFTER_MS = 30_000;
 const UUID_SAFETY_WINDOW_MS = 55 * 60_000;
 const SHORT_EVENT_KEY_LENGTH = 8;
+const DEFAULT_SHUTDOWN_TIMEOUT_MS = 5_000;
 
 type Timer = ReturnType<typeof globalThis.setTimeout>;
 
@@ -47,6 +48,7 @@ export interface NotificationRouterOptions {
   now?: () => number;
   setTimeout?: (callback: () => void, delayMs: number) => Timer;
   clearTimeout?: (timer: Timer) => void;
+  shutdownTimeoutMs?: number;
   log?: (entry: NotificationLogEntry) => void;
 }
 
@@ -54,6 +56,7 @@ export type NotificationHandleResult =
   | 'delivered'
   | 'duplicate'
   | 'discarded'
+  | 'failed'
   | 'pending';
 
 export class NotificationRouter {
@@ -64,11 +67,14 @@ export class NotificationRouter {
   private readonly now: () => number;
   private readonly scheduleTimeout: (callback: () => void, delayMs: number) => Timer;
   private readonly cancelTimeout: (timer: Timer) => void;
+  private readonly shutdownTimeoutMs: number;
   private readonly logger: (entry: NotificationLogEntry) => void;
   private readonly timers = new Map<string, Timer>();
   private readonly inFlight = new Map<string, Promise<NotificationHandleResult>>();
   private readonly acceptedInProcess = new Map<string, TransportReceipt>();
+  private readonly abortController = new AbortController();
   private stopped = false;
+  private stopPromise?: Promise<void>;
 
   constructor(options: NotificationRouterOptions) {
     this.store = options.store;
@@ -78,10 +84,12 @@ export class NotificationRouter {
     this.now = options.now ?? Date.now;
     this.scheduleTimeout = options.setTimeout ?? globalThis.setTimeout;
     this.cancelTimeout = options.clearTimeout ?? globalThis.clearTimeout;
+    this.shutdownTimeoutMs = options.shutdownTimeoutMs ?? DEFAULT_SHUTDOWN_TIMEOUT_MS;
     this.logger = options.log ?? logNotificationFailure;
   }
 
   async handle(event: CodexNotificationEvent): Promise<NotificationHandleResult> {
+    if (this.stopped) return 'failed';
     const safeEvent = allowlistedEvent(event);
     const operation = this.beginInFlight(safeEvent.eventKey, () => this.handleNew(safeEvent));
     return operation ?? 'duplicate';
@@ -89,8 +97,10 @@ export class NotificationRouter {
 
   private async handleNew(event: CodexNotificationEvent): Promise<NotificationHandleResult> {
     if (!await this.store.enqueueNotification(event)) return 'duplicate';
+    if (this.stopped) return 'pending';
 
     const binding = await this.store.getNotificationBinding(this.botName);
+    if (this.stopped) return 'pending';
     if (!binding) {
       await this.store.markNotificationFailed(event.eventKey, 'discarded');
       this.logFailure(event, 1, 'binding_unavailable');
@@ -101,7 +111,7 @@ export class NotificationRouter {
     if (!adapter) {
       await this.store.markNotificationFailed(event.eventKey);
       this.logFailure(event, 1, 'adapter_unavailable');
-      return 'pending';
+      return 'failed';
     }
 
     return this.attemptDelivery({
@@ -121,6 +131,7 @@ export class NotificationRouter {
   async resumePending(): Promise<void> {
     if (this.stopped) return;
     const deliveries = await this.store.listPendingNotifications();
+    if (this.stopped) return;
     for (const storedDelivery of deliveries) {
       if (this.inFlight.has(storedDelivery.event.eventKey)) continue;
       const delivery = await this.preparePendingDelivery(storedDelivery);
@@ -137,10 +148,28 @@ export class NotificationRouter {
     }
   }
 
-  stop(): void {
+  stop(): Promise<void> {
+    if (!this.stopPromise) this.stopPromise = this.stopAndDrain();
+    return this.stopPromise;
+  }
+
+  private async stopAndDrain(): Promise<void> {
     this.stopped = true;
+    this.abortController.abort(new DOMException('Router stopped', 'AbortError'));
     for (const timer of this.timers.values()) this.cancelTimeout(timer);
     this.timers.clear();
+
+    const active = [...this.inFlight.values()];
+    if (active.length === 0) return;
+
+    let timeout: Timer | undefined;
+    await Promise.race([
+      Promise.allSettled(active).then(() => undefined),
+      new Promise<void>((resolve) => {
+        timeout = this.scheduleTimeout(resolve, this.shutdownTimeoutMs);
+      }),
+    ]);
+    if (timeout !== undefined) this.cancelTimeout(timeout);
   }
 
   private async attemptDelivery(
@@ -153,6 +182,7 @@ export class NotificationRouter {
     const binding = knownChatId === undefined
       ? await this.store.getNotificationBinding(this.botName)
       : null;
+    if (this.stopped) return 'pending';
     const chatId = knownChatId ?? binding?.chatId;
 
     if (!chatId) {
@@ -166,11 +196,12 @@ export class NotificationRouter {
     if (!adapter) {
       await this.store.markNotificationFailed(event.eventKey);
       this.logFailure(event, attempt, 'adapter_unavailable');
-      return 'pending';
+      return 'failed';
     }
 
     const attemptedAt = this.now();
     await this.store.markNotificationAttemptStarted(event.eventKey, attemptedAt);
+    if (this.stopped) return 'pending';
     const attemptedDelivery: StoredNotificationDelivery = {
       ...delivery,
       attempts: attempt,
@@ -185,10 +216,15 @@ export class NotificationRouter {
           delayed: false,
           timeZone: this.timeZone,
         }),
-      }, { idempotencyKey: event.eventKey });
+      }, {
+        idempotencyKey: event.eventKey,
+        signal: this.abortController.signal,
+      });
     } catch (error) {
+      if (this.stopped) return 'pending';
       return this.handleExternalFailure(attemptedDelivery, classifyError(error));
     }
+    if (this.stopped) return 'pending';
 
     const receipt: TransportReceipt = {
       messageId,
@@ -203,6 +239,7 @@ export class NotificationRouter {
     delivery: StoredNotificationDelivery,
     errorClass: string,
   ): Promise<NotificationHandleResult> {
+    if (this.stopped) return 'pending';
     const { event, attempts } = delivery;
     if (attempts >= MAX_ATTEMPTS) {
       await this.store.markNotificationFailed(event.eventKey);
@@ -235,11 +272,13 @@ export class NotificationRouter {
       || current.acknowledgedAt !== receipt.acknowledgedAt
     ) {
       try {
+        if (this.stopped) return 'pending';
         await this.store.recordNotificationReceipt(
           event.eventKey,
           receipt.messageId,
           receipt.acknowledgedAt,
         );
+        if (this.stopped) return 'pending';
         current = {
           ...current,
           transportMessageId: receipt.messageId,
@@ -247,6 +286,7 @@ export class NotificationRouter {
           nextRetryAt: null,
         };
       } catch {
+        if (this.stopped) return 'pending';
         return this.handleLocalFailure(current, receipt, retryIndex, 'receipt_state_error');
       }
     }
@@ -257,6 +297,7 @@ export class NotificationRouter {
         && current.delayedPatchCompletedAt === null
       ) {
         const adapter = knownAdapter ?? await this.getBoundFeishuAdapter();
+        if (this.stopped) return 'pending';
         if (!adapter?.replaceCard) {
           return this.handleLocalFailure(current, receipt, retryIndex, 'patch_adapter_unavailable');
         }
@@ -270,8 +311,11 @@ export class NotificationRouter {
               delayed: true,
               timeZone: this.timeZone,
             }),
+            { signal: this.abortController.signal },
           );
+          if (this.stopped) return 'pending';
         } catch (error) {
+          if (this.stopped) return 'pending';
           return this.handleLocalFailure(current, receipt, retryIndex, classifyError(error));
         }
         receipt = {
@@ -287,23 +331,29 @@ export class NotificationRouter {
           return this.handleLocalFailure(current, receipt, retryIndex, 'patch_state_error');
         }
         try {
+          if (this.stopped) return 'pending';
           await this.store.markNotificationDelayedPatchCompleted(event.eventKey, completedAt);
+          if (this.stopped) return 'pending';
           current = {
             ...current,
             delayedPatchCompletedAt: completedAt,
             nextRetryAt: null,
           };
         } catch {
+          if (this.stopped) return 'pending';
           return this.handleLocalFailure(current, receipt, retryIndex, 'patch_state_error');
         }
       }
     }
 
     try {
+      if (this.stopped) return 'pending';
       await this.store.markNotificationDelivered(event.eventKey, this.now());
+      if (this.stopped) return 'pending';
       this.acceptedInProcess.delete(event.eventKey);
       return 'delivered';
     } catch {
+      if (this.stopped) return 'pending';
       return this.handleLocalFailure(current, receipt, retryIndex, 'delivery_state_error');
     }
   }
@@ -314,6 +364,7 @@ export class NotificationRouter {
     retryIndex: number,
     errorClass: string,
   ): Promise<NotificationHandleResult> {
+    if (this.stopped) return 'pending';
     const { event, attempts } = delivery;
     this.logFailure(event, attempts, errorClass);
     if (retryIndex >= RETRY_DELAYS_MS.length) {
@@ -441,6 +492,7 @@ export class NotificationRouter {
   private async preparePendingDelivery(
     delivery: StoredNotificationDelivery,
   ): Promise<StoredNotificationDelivery | null> {
+    if (this.stopped) return null;
     const { event, attempts, firstAttemptAt } = delivery;
     if (this.acceptedInProcess.has(event.eventKey)) return delivery;
 
@@ -450,12 +502,14 @@ export class NotificationRouter {
     if (hasPersistedReceipt) {
       if (this.receiptFor(delivery)) return delivery;
       await this.store.markNotificationFailed(event.eventKey);
+      if (this.stopped) return null;
       this.logFailure(event, attempts, 'transport_receipt_unverifiable');
       return null;
     }
 
     if (attempts >= MAX_ATTEMPTS) {
       await this.store.markNotificationFailed(event.eventKey);
+      if (this.stopped) return null;
       return null;
     }
 
@@ -466,11 +520,13 @@ export class NotificationRouter {
         || firstAttemptAt > this.now()
       ) {
         await this.store.markNotificationFailed(event.eventKey);
+        if (this.stopped) return null;
         this.logFailure(event, attempts, 'idempotency_unverifiable');
         return null;
       }
       if (this.now() - firstAttemptAt >= UUID_SAFETY_WINDOW_MS) {
         await this.store.markNotificationFailed(event.eventKey);
+        if (this.stopped) return null;
         this.logFailure(event, attempts, 'idempotency_expired');
         return null;
       }
@@ -508,7 +564,9 @@ export class NotificationRouter {
   }
 
   private async getBoundFeishuAdapter(): Promise<PlatformAdapter | undefined> {
+    if (this.stopped) return undefined;
     const binding = await this.store.getNotificationBinding(this.botName);
+    if (this.stopped) return undefined;
     return this.resolveFeishuAdapter(binding?.botName, binding?.platform);
   }
 
@@ -553,6 +611,14 @@ function allowlistedEvent(event: CodexNotificationEvent): CodexNotificationEvent
 }
 
 function classifyError(error: unknown): string {
+  if (
+    error instanceof Error
+    && 'category' in error
+    && (
+      error.category === 'feishu_business_error'
+      || error.category === 'feishu_invalid_response'
+    )
+  ) return error.category;
   if (error instanceof TypeError) return 'TypeError';
   if (error instanceof RangeError) return 'RangeError';
   if (error instanceof SyntaxError) return 'SyntaxError';

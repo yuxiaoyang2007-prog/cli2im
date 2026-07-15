@@ -47,4 +47,7 @@ async function main() {
   console.log('Build complete');
 }
 
-main().catch(console.error);
+main().catch((error) => {
+  console.error(error);
+  process.exitCode = 1;
+});

@@ -26,7 +26,7 @@ interface NotificationLifecycle {
 interface NotificationEventRouter {
   resumePending(): Promise<void>;
   handle(event: CodexNotificationEvent): Promise<unknown>;
-  stop(): void;
+  stop(): Promise<void>;
 }
 
 interface MetadataResolver {

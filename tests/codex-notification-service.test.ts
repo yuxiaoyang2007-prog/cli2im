@@ -426,7 +426,7 @@ describe('CodexNotificationService', () => {
         router: {
           resumePending: vi.fn(async () => { order.push('router.resume'); }),
           handle: vi.fn(),
-          stop: vi.fn(() => { order.push('router.stop'); }),
+          stop: vi.fn(async () => { order.push('router.stop'); }),
         },
         metadataResolver: { resolve: vi.fn() },
         createSocket: () => ({
@@ -461,6 +461,59 @@ describe('CodexNotificationService', () => {
     expect(consoleError).toHaveBeenNthCalledWith(2, '[notifications] monitor stop failed');
     expect(JSON.stringify(consoleError.mock.calls)).not.toContain('private');
     consoleError.mockRestore();
+  });
+
+  it('awaits router shutdown before resolving service shutdown', async () => {
+    const routerStop = deferred<void>();
+    const order: string[] = [];
+    const service = new CodexNotificationService({
+      botName: 'codexbot',
+      workingDirectory: '/tmp/project',
+      sessionsDir: '/tmp/codex/sessions',
+      sessionIndexPath: '/tmp/codex/session_index.jsonl',
+      socketPath: '/tmp/cli2im/codex-notify.sock',
+      store: { bindNotificationTarget: vi.fn() } as unknown as SessionStore,
+      resolveAdapter: () => undefined,
+      timeZone: 'UTC',
+      dependencies: {
+        router: {
+          resumePending: vi.fn(),
+          handle: vi.fn(),
+          stop: vi.fn(async () => {
+            order.push('router.stop.start');
+            await routerStop.promise;
+            order.push('router.stop.end');
+          }),
+        },
+        metadataResolver: { resolve: vi.fn() },
+        createMonitor: () => ({
+          start: vi.fn(),
+          stop: vi.fn(async () => { order.push('monitor.stop'); }),
+        }),
+        createSocket: () => ({
+          start: vi.fn(),
+          stop: vi.fn(async () => { order.push('socket.stop'); }),
+        }),
+      },
+    });
+
+    let resolved = false;
+    const stopping = service.stop().then(() => { resolved = true; });
+    await vi.waitFor(() => expect(order).toEqual([
+      'monitor.stop',
+      'socket.stop',
+      'router.stop.start',
+    ]));
+    expect(resolved).toBe(false);
+
+    routerStop.resolve();
+    await stopping;
+    expect(order).toEqual([
+      'monitor.stop',
+      'socket.stop',
+      'router.stop.start',
+      'router.stop.end',
+    ]);
   });
 
   it('hydrates persisted rollout context when approval is the first event after restart', async () => {
@@ -635,3 +688,13 @@ describe('CodexNotificationService', () => {
     }));
   });
 });
+
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}

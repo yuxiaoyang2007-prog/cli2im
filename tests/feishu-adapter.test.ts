@@ -4,7 +4,10 @@ import { existsSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { FeishuAdapter } from '../src/platforms/feishu/adapter.js';
+import {
+  FeishuAdapter,
+  FeishuResponseError,
+} from '../src/platforms/feishu/adapter.js';
 import { MAX_ATTACHMENT_DOWNLOAD_BYTES } from '../src/security/download-limits.js';
 import type { InboundMessage } from '../src/types.js';
 
@@ -14,8 +17,8 @@ const larkMocks = vi.hoisted(() => {
   class MockClient {
     im = {
       message: {
-        create: vi.fn(async () => ({ data: { message_id: 'om_sent' } })),
-        patch: vi.fn(async () => ({})),
+        create: vi.fn(async () => ({ code: 0, data: { message_id: 'om_sent' } })),
+        patch: vi.fn(async () => ({ code: 0 })),
         delete: vi.fn(async () => ({})),
       },
       image: {
@@ -154,6 +157,79 @@ describe('FeishuAdapter file handling', () => {
         }),
       },
     });
+  });
+
+  it('rejects an HTTP-200 card create business error without exposing response details', async () => {
+    const adapter = new FeishuAdapter({ appId: 'app', appSecret: 'secret', botName: 'bot' });
+    const client = larkMocks.clients[0];
+    client.im.message.create.mockResolvedValueOnce({
+      code: 230001,
+      msg: 'PRIVATE_REMOTE_DETAIL bearer-secret-value',
+      data: { message_id: 'must-not-be-accepted' },
+    } as never);
+
+    const failure = await adapter.sendCard('oc_1', {
+      type: 'final',
+      content: 'safe card',
+    }).catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(FeishuResponseError);
+    expect(failure).toMatchObject({ category: 'feishu_business_error' });
+    expect(String(failure)).toBe('FeishuResponseError: Feishu card create failed');
+    expect(JSON.stringify(failure)).not.toMatch(/230001|PRIVATE_REMOTE_DETAIL|bearer-secret-value/);
+  });
+
+  it('rejects a successful card create response without a non-empty message id', async () => {
+    const adapter = new FeishuAdapter({ appId: 'app', appSecret: 'secret', botName: 'bot' });
+    const client = larkMocks.clients[0];
+    client.im.message.create.mockResolvedValueOnce({ code: 0, data: { message_id: '   ' } });
+
+    await expect(adapter.sendCard('oc_1', {
+      type: 'final',
+      content: 'safe card',
+    })).rejects.toMatchObject({
+      name: 'FeishuResponseError',
+      category: 'feishu_invalid_response',
+      message: 'Feishu card create returned an invalid response',
+    });
+  });
+
+  it('rejects a card create response whose business code is missing', async () => {
+    const adapter = new FeishuAdapter({ appId: 'app', appSecret: 'secret', botName: 'bot' });
+    const client = larkMocks.clients[0];
+    client.im.message.create.mockResolvedValueOnce({
+      data: { message_id: 'om_unverified' },
+    } as never);
+
+    await expect(adapter.sendCard('oc_1', {
+      type: 'final',
+      content: 'safe card',
+    })).rejects.toMatchObject({
+      name: 'FeishuResponseError',
+      category: 'feishu_business_error',
+      message: 'Feishu card create failed',
+    });
+  });
+
+  it('rejects an HTTP-200 full-card patch business error safely', async () => {
+    const adapter = new FeishuAdapter({ appId: 'app', appSecret: 'secret', botName: 'bot' });
+    const client = larkMocks.clients[0];
+    client.im.message.patch.mockResolvedValueOnce({
+      code: 230002,
+      msg: 'PRIVATE_PATCH_DETAIL bearer-secret-value',
+    } as never);
+
+    const failure = await adapter.replaceCard('om_delayed', {
+      type: 'final',
+      content: 'safe card',
+    }).catch((error: unknown) => error);
+
+    expect(failure).toMatchObject({
+      name: 'FeishuResponseError',
+      category: 'feishu_business_error',
+      message: 'Feishu card patch failed',
+    });
+    expect(JSON.stringify(failure)).not.toMatch(/230002|PRIVATE_PATCH_DETAIL|bearer-secret-value/);
   });
 
   it('parses image and file receive events into inbound attachments', () => {
