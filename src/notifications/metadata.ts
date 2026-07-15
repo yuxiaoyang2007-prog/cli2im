@@ -16,13 +16,22 @@ const CODE_LINE = /^(?:(?:async\s+)?function|const|let|var|class|interface|type|
 const DIFF_LINE = /^(?:diff --git\b|index [0-9a-f]+\.{2}[0-9a-f]+\b|---\s+\S+|\+\+\+\s+\S+|@@\s+-\d)/i;
 const LOG_LINE = /^(?:\[\d{4}-\d{2}-\d{2}[T ][^\]]*]\s*|\d{4}-\d{2}-\d{2}[T ]\S+\s+)(?:TRACE|DEBUG|INFO|WARN|WARNING|ERROR|FATAL)\b|^(?:TRACE|DEBUG|INFO|WARN|WARNING|ERROR|FATAL)\s+[\[:]/i;
 const RAW_COMMAND_HEADS = new Set([
-  'awk', 'bash', 'brew', 'bun', 'cargo', 'cat', 'cd', 'cmake', 'curl', 'deno',
-  'deploy', 'docker', 'echo', 'find', 'gh', 'git', 'go', 'grep', 'kubectl', 'ls',
-  'make', 'node', 'npm', 'npx', 'pip', 'pip3', 'pnpm', 'pwd', 'python', 'python3',
-  'rg', 'rm', 'rsync', 'scp', 'sed', 'sh', 'ssh', 'wget', 'yarn', 'zsh',
+  'awk', 'bash', 'brew', 'bun', 'cargo', 'cat', 'cd', 'cmake', 'codex', 'curl',
+  'deno', 'deploy', 'docker', 'echo', 'gh', 'git', 'grep', 'kubectl', 'lark-cli',
+  'ls', 'node', 'npm', 'npx', 'openclaw', 'pip', 'pip3', 'pnpm', 'pwd', 'python',
+  'python3', 'rg', 'rm', 'rsync', 'scp', 'sed', 'sh', 'sqlite3', 'ssh', 'wget',
+  'yarn', 'zsh',
+]);
+const GO_SUBCOMMANDS = new Set([
+  'bug', 'build', 'clean', 'doc', 'env', 'fix', 'fmt', 'generate', 'get', 'install',
+  'list', 'mod', 'run', 'telemetry', 'test', 'tool', 'version', 'vet', 'work',
 ]);
 const COMMAND_SHAPED_ARGUMENT = /(?:^|\s)(?:--?[A-Za-z0-9][A-Za-z0-9_-]*(?:=\S*)?|(?:\.{1,2}|~)?[\\/]\S+)/;
-const RELATIVE_EXECUTABLE = /^(?:\.{1,2}|~)[\\/]\S+/;
+const EXECUTABLE_PATH = /^(?:\/(?!\/)|(?:\.{1,2}|~)[\\/])\S+/;
+const FIND_EXPRESSION_ARGUMENT = /(?:^|\s)(?:\.|!|\(|\))(?:\s|$)/;
+const FIND_PATH_ARGUMENT = /(?:^|\s)\S*[\\/]\S*(?:\s|$)/;
+const MAKE_PROSE_DETERMINER = /^(?:the|a|an|this|that)\b/;
+const HTTP_URL_IN_TEXT = /\bhttps?:\/\/[^\s/]+(?:\/[^\s]*)?/gi;
 const SHELL_SYNTAX = /&&|\|\||(?:^|\s)\|(?!\|)|(?:^|\s)(?:>>?|<<?)|;(?=\s|$)/;
 const SQL_LINE = /^(?:SELECT|INSERT|UPDATE|DELETE|CREATE|ALTER|DROP|WITH)\b.*(?:\bFROM\b|\bINTO\b|\bTABLE\b|\bSET\b|\*)/;
 const CONTROL_FLOW_LINE = /^(?:if|for|while|switch|try|catch)\s*\(/;
@@ -243,9 +252,25 @@ function isUnsafeTechnicalTitle(value: string): boolean {
 }
 
 function isHighConfidenceRawCommand(value: string): boolean {
-  if (RELATIVE_EXECUTABLE.test(value)) return true;
+  if (EXECUTABLE_PATH.test(value)) return true;
   const head = /^(\S+)/.exec(value)?.[1];
   if (!head || !/^[a-z][a-z0-9._-]*$/.test(head)) return false;
+  const remainder = value.slice(head.length).trimStart();
+
+  if (head === 'find') {
+    return COMMAND_SHAPED_ARGUMENT.test(value)
+      || FIND_EXPRESSION_ARGUMENT.test(remainder)
+      || FIND_PATH_ARGUMENT.test(remainder);
+  }
+  if (head === 'go') {
+    const argument = /^(\S+)/.exec(remainder)?.[1];
+    return (argument !== undefined && GO_SUBCOMMANDS.has(argument))
+      || COMMAND_SHAPED_ARGUMENT.test(value);
+  }
+  if (head === 'make') {
+    return !MAKE_PROSE_DETERMINER.test(remainder) || COMMAND_SHAPED_ARGUMENT.test(value);
+  }
+
   return RAW_COMMAND_HEADS.has(head) || COMMAND_SHAPED_ARGUMENT.test(value);
 }
 
@@ -336,7 +361,8 @@ function sanitizeAbsolutePaths(value: string): string | null {
 }
 
 function hasAmbiguousPathContinuation(remainder: string): boolean {
-  return /^\s/.test(remainder) && /[\\/]/.test(remainder);
+  if (!/^\s/.test(remainder)) return false;
+  return /[\\/]/.test(remainder.replace(HTTP_URL_IN_TEXT, ''));
 }
 
 function splitTrailingPunctuation(value: string): { core: string; suffix: string } {

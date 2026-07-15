@@ -82,6 +82,16 @@ const syntheticSecret = true;
     expect(sanitizeTaskTitle(value)).toBe('Analyze report.csv and summarize');
   });
 
+  it('shields a complete HTTP URL while checking an unquoted local path tail', () => {
+    const title = sanitizeTaskTitle(
+      'Analyze /tmp/report.csv and compare https://example.test/a?token=x',
+    );
+
+    expect(title).toBe('Analyze report.csv and compare https://example.test/a');
+    expect(title).not.toContain('/tmp/');
+    expect(title).not.toContain('?token=x');
+  });
+
   it('consumes complete quoted named-secret values including spaces', () => {
     const title = sanitizeTaskTitle(
       'Rotate password="alpha beta" and token=\'gamma delta\' now',
@@ -132,6 +142,16 @@ const syntheticSecret = true;
     ['ambiguous lowercase command', 'deploy production'],
     ['flag-shaped command', 'runner --verbose'],
     ['relative-path-shaped command', 'runner ./script'],
+    ['Codex CLI command', 'codex update'],
+    ['Lark CLI command', 'lark-cli auth scopes'],
+    ['OpenClaw command', 'openclaw gateway status'],
+    ['SQLite command', 'sqlite3 data.db .tables'],
+    ['absolute executable command', '/usr/bin/custom deploy'],
+    ['find command', 'find ./src -name notification'],
+    ['find relative-path command', 'find src/notifications'],
+    ['Go subcommand', 'go test ./...'],
+    ['Go flag command', 'go --version'],
+    ['Make target', 'make release'],
     ['shell redirection', 'deploy > /tmp/private/output.log'],
     ['shell operator expression', 'build && deploy'],
   ])('rejects a task title that is principally a %s', (_kind, value) => {
@@ -164,6 +184,14 @@ const syntheticSecret = true;
     'implement notification handling',
     'read the report',
   ])('accepts ordinary lowercase prose: %s', (value) => {
+    expect(sanitizeTaskTitle(value)).toBe(value);
+  });
+
+  it.each([
+    'find the notification bug',
+    'go review the deployment flow',
+    'make the release safer',
+  ])('accepts an ambiguous command head in lowercase prose: %s', (value) => {
     expect(sanitizeTaskTitle(value)).toBe(value);
   });
 
