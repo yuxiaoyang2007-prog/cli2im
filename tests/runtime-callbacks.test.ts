@@ -148,7 +148,10 @@ describe('sendAgentMessageOrNotify', () => {
         message: { role: 'user', content: 'hello' },
       });
 
-      expect(warn).toHaveBeenCalledWith(expect.stringContaining('message not delivered'));
+      expect(warn).toHaveBeenCalledWith(
+        '[pipeline] message_delivery=failed reason=session_transition agent=claude-code',
+      );
+      expect(JSON.stringify(warn.mock.calls)).not.toContain('chat_1');
       expect(adapter.send).toHaveBeenCalledWith('chat_1', {
         text: '消息未送达（会话正在切换或重启），请重发',
       });

@@ -23,6 +23,7 @@ import {
   buildSenderHeader,
   buildSenderEnv,
   getGroupMessageSkipReason,
+  parseBridgeCommand,
 } from './pipeline.js';
 import {
   buildPermissionBlockedCard,
@@ -82,6 +83,25 @@ export interface BridgeCommandSender {
   platform: string;
   chatType?: string;
   userId: string;
+}
+
+export function logInboundMessageSummary(
+  botName: string,
+  message: InboundMessage,
+  relayBotCount: number,
+  botIdentityPresent: boolean,
+): void {
+  const chatType = message.chatType === 'p2p' || message.chatType === 'group'
+    ? message.chatType
+    : 'unknown';
+  const command = parseBridgeCommand(message.text)?.command ?? 'none';
+  console.log(
+    `[pipeline] ${scrubLog(botName)}: inbound chat=${chatType}`
+    + ` relay=${Boolean(message.isRelay)} command=${command}`
+    + ` textLength=${message.text.length} mentionCount=${message.mentions?.length ?? 0}`
+    + ` attachmentCount=${message.attachments?.length ?? 0}`
+    + ` relayBotCount=${relayBotCount} botIdentity=${botIdentityPresent ? 'present' : 'absent'}`,
+  );
 }
 
 async function main(): Promise<void> {
@@ -300,8 +320,8 @@ async function main(): Promise<void> {
     messageProcessors.set(botName, processMessage);
 
     adapter.onMessage((msg: InboundMessage) => {
-      void queue.enqueue(msg.chatId, () => processMessage(msg)).catch((err) => {
-        console.error('[pipeline] Message processing failed:', err);
+      void queue.enqueue(msg.chatId, () => processMessage(msg)).catch(() => {
+        console.error('[pipeline] message_processing_failed');
       });
     });
 
@@ -324,8 +344,6 @@ async function main(): Promise<void> {
     adapter: PlatformAdapter,
   ): (msg: InboundMessage) => Promise<void> {
     return async (msg) => {
-      console.log(`[pipeline] ${scrubLog(botName)}: incoming ${scrubLog(msg.chatType ?? '')} from=${scrubLog(msg.userId)} isRelay=${!!msg.isRelay} mentions=${scrubLog(msg.mentions ?? [])} text=${scrubLog(msg.text, 60)}`);
-
       // Lazy relay registration on first group message
       if (msg.chatType === 'group' && botConfig.relay?.enabled) {
         relayManager.registerBot(botName, msg.chatId, botConfig.relay.maxConsecutiveRounds ?? 10);
@@ -337,11 +355,12 @@ async function main(): Promise<void> {
       }
 
       const relayBotCount = relayManager.getBotsInChat(msg.chatId).length;
-      console.log(`[pipeline] ${scrubLog(botName)}: relayBotCount=${relayBotCount} botOpenId=${scrubLog(getAdapterBotOpenId(adapter) ?? 'none')}`);
+      const botOpenId = getAdapterBotOpenId(adapter);
+      logInboundMessageSummary(botName, msg, relayBotCount, Boolean(botOpenId));
       const groupSkipReason = getGroupMessageSkipReason(
         msg,
         botConfig,
-        getAdapterBotOpenId(adapter),
+        botOpenId,
         relayBotCount,
       );
       if (groupSkipReason) {
@@ -430,9 +449,9 @@ async function main(): Promise<void> {
             msg.text = sanitizeVoiceTranscript(transcript);
             msg.attachments = msg.attachments?.filter(a => a !== audioAttachment);
             pendingVoiceChatId = msg.chatId;
-            console.log(`[voice] STT transcribed for ${scrubLog(sessionKey)}: ${scrubLog(msg.text, 80)}`);
+            console.log(`[voice] stt=success textLength=${msg.text.length}`);
           } else {
-            console.warn(`[voice] STT failed for ${scrubLog(sessionKey)}, sending as attachment`);
+            console.warn('[voice] stt=failed fallback=attachment');
           }
         }
       }
@@ -460,7 +479,7 @@ async function main(): Promise<void> {
       );
 
       if (isNewProcess) {
-        console.log(`[pipeline] ${scrubLog(botName)}: spawning ${scrubLog(botConfig.agent)} in ${scrubLog(session.workingDirectory)}`);
+        console.log(`[pipeline] ${scrubLog(botName)}: agent=${scrubLog(botConfig.agent)} action=spawn`);
         const handlers = createEventHandlers(sessionKey);
 
         const senderEnv = buildSenderEnv(sender);
@@ -487,9 +506,9 @@ async function main(): Promise<void> {
         const plugin = agentManager.getPlugin(botConfig.agent);
         const latestId = agentManager.getLatestSessionId(sessionKey) ?? session.agentSessionId;
         if (latestId && plugin?.capabilities.sessionResume) {
-          console.log(`[pipeline] ${scrubLog(botName)}: resuming session ${scrubLog(latestId)}`);
+          console.log(`[pipeline] ${scrubLog(botName)}: agent=${scrubLog(botConfig.agent)} action=resume`);
         } else {
-          console.log(`[pipeline] ${scrubLog(botName)}: fresh spawn`);
+          console.log(`[pipeline] ${scrubLog(botName)}: agent=${scrubLog(botConfig.agent)} action=fresh_spawn`);
         }
         await startAgentProcessForSession({
           agentManager,
@@ -975,7 +994,7 @@ export async function sendAgentMessageOrNotify(params: {
   if (delivered) return true;
 
   console.warn(
-    `[pipeline] message not delivered (session switching/restarting): session=${scrubLog(sessionKey)} agent=${scrubLog(agentName)}`,
+    `[pipeline] message_delivery=failed reason=session_transition agent=${scrubLog(agentName)}`,
   );
   await adapter.send(chatId, { text: '消息未送达（会话正在切换或重启），请重发' });
   return false;

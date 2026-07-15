@@ -9,7 +9,7 @@ export type ParsedRolloutLine =
   | { type: 'session_meta'; sessionId: string; cwd: string; source: string }
   | { type: 'turn_context'; turnId: string; cwd: string }
   | { type: 'user_message'; turnId: string; userText?: string; attachmentName?: string }
-  | { type: 'question'; turnId: string; requestId: string; occurredAt?: number }
+  | { type: 'question'; turnId?: string; requestId: string; occurredAt?: number }
   | { type: 'completed'; turnId: string; occurredAt: number; durationMs?: number }
   | { type: 'aborted'; turnId: string };
 
@@ -95,18 +95,20 @@ function parseResponseItem(
   payload: Record<string, unknown>,
   occurredAt: number | undefined,
 ): ParsedRolloutLine | null {
-  const turnId = passthroughTurnId(payload.internal_chat_message_metadata_passthrough);
-  if (!turnId) return null;
-
   if (payload.type === 'function_call' && payload.name === 'request_user_input') {
     const requestId = asString(payload.call_id);
+    const turnId = nestedTurnId(payload.internal_chat_message_metadata_passthrough)
+      ?? nestedTurnId(payload.metadata);
     return requestId ? {
       type: 'question',
-      turnId,
+      ...(turnId ? { turnId } : {}),
       requestId,
       ...(occurredAt === undefined ? {} : { occurredAt }),
     } : null;
   }
+
+  const turnId = nestedTurnId(payload.internal_chat_message_metadata_passthrough);
+  if (!turnId) return null;
 
   if (payload.type !== 'message' || payload.role !== 'user' || !Array.isArray(payload.content)) {
     return null;
@@ -171,7 +173,7 @@ function normalizeCompletionTimestamp(value: unknown): number | undefined {
   ) ? milliseconds : undefined;
 }
 
-function passthroughTurnId(value: unknown): string | undefined {
+function nestedTurnId(value: unknown): string | undefined {
   return isRecord(value) ? asString(value.turn_id) : undefined;
 }
 

@@ -11,8 +11,9 @@ import {
 import { CodexNotificationService } from '../src/notifications/service.js';
 import type { NotificationMetadataResolver } from '../src/notifications/metadata.js';
 import type { NotificationRouter } from '../src/notifications/router.js';
-import type { SessionStore } from '../src/session/store.js';
+import { SessionStore } from '../src/session/store.js';
 import { startNotificationServiceBeforeReady } from '../src/index.js';
+import type { PlatformAdapter } from '../src/types.js';
 
 describe('CodexNotificationService', () => {
   it('starts and stops dependencies in order and routes stable question and completion events', async () => {
@@ -241,6 +242,109 @@ describe('CodexNotificationService', () => {
     await onRollout?.({ type: 'question', turnId: 'turn_fallback', requestId: 'question_fallback' }, filePath);
 
     expect(router.handle).toHaveBeenCalledWith(expect.objectContaining({ occurredAt: 44_000 }));
+  });
+
+  it('associates a no-id question only with the single active turn_context', async () => {
+    let onRollout: ((event: ParsedRolloutLine, filePath: string) => void | Promise<void>) | undefined;
+    const router = {
+      resumePending: vi.fn(), handle: vi.fn().mockResolvedValue('delivered'), stop: vi.fn(),
+    } as unknown as NotificationRouter;
+    const service = new CodexNotificationService({
+      botName: 'codexbot', workingDirectory: '/tmp/project', sessionsDir: '/tmp/codex/sessions',
+      sessionIndexPath: '/tmp/codex/session_index.jsonl', socketPath: '/tmp/cli2im/codex-notify.sock',
+      store: { bindNotificationTarget: vi.fn() } as unknown as SessionStore,
+      resolveAdapter: () => undefined, timeZone: 'UTC', now: () => 55_000,
+      dependencies: {
+        router,
+        metadataResolver: { resolve: vi.fn().mockResolvedValue({
+          projectName: 'cli2im', taskName: '唯一活跃轮次', surface: 'CLI', shortTaskId: 'session_',
+        }) },
+        createMonitor: (handler) => {
+          onRollout = handler;
+          return { start: vi.fn(), stop: vi.fn() };
+        },
+        createSocket: () => ({ start: vi.fn(), stop: vi.fn() }),
+      },
+    });
+    const filePath = '/tmp/codex/sessions/rollout-no-id-active.jsonl';
+    const noIdQuestion = parseRolloutLine(JSON.stringify({
+      timestamp: '2026-07-15T18:32:10.250Z',
+      type: 'response_item',
+      payload: {
+        type: 'function_call', name: 'request_user_input', call_id: 'question_no_id',
+        arguments: '{"questions":[{"question":"private active secret"}]}',
+      },
+    }));
+
+    await onRollout?.({
+      type: 'session_meta', sessionId: 'session_no_id', cwd: '/tmp/project', source: 'cli',
+    }, filePath);
+    await onRollout?.({ type: 'turn_context', turnId: 'turn_only', cwd: '/tmp/project' }, filePath);
+    await onRollout?.({ type: 'user_message', turnId: 'turn_only', userText: '唯一活跃轮次' }, filePath);
+    if (noIdQuestion) await onRollout?.(noIdQuestion, filePath);
+
+    expect(router.handle).toHaveBeenCalledWith(expect.objectContaining({
+      eventKey: eventKey(['session_no_id', 'turn_only', 'question_no_id', 'question']),
+      turnId: 'turn_only',
+      requestId: 'question_no_id',
+      occurredAt: Date.parse('2026-07-15T18:32:10.250Z'),
+    }));
+    expect(JSON.stringify(vi.mocked(router.handle).mock.calls)).not.toContain('private active secret');
+  });
+
+  it.each([
+    ['no active context', []],
+    ['ambiguous active contexts', [
+      { type: 'turn_context', turnId: 'turn_first', cwd: '/tmp/project' },
+      { type: 'turn_context', turnId: 'turn_second', cwd: '/tmp/project' },
+    ]],
+    ['an aborted context', [
+      { type: 'turn_context', turnId: 'turn_aborted', cwd: '/tmp/project' },
+      { type: 'aborted', turnId: 'turn_aborted' },
+    ]],
+    ['a completed context', [
+      { type: 'turn_context', turnId: 'turn_completed', cwd: '/tmp/project' },
+      { type: 'completed', turnId: 'turn_completed', occurredAt: 1_000 },
+    ]],
+  ] as const)('drops a no-id question with %s', async (_label, contextEvents) => {
+    let onRollout: ((event: ParsedRolloutLine, filePath: string) => void | Promise<void>) | undefined;
+    const router = {
+      resumePending: vi.fn(), handle: vi.fn().mockResolvedValue('delivered'), stop: vi.fn(),
+    } as unknown as NotificationRouter;
+    const service = new CodexNotificationService({
+      botName: 'codexbot', workingDirectory: '/tmp/project', sessionsDir: '/tmp/codex/sessions',
+      sessionIndexPath: '/tmp/codex/session_index.jsonl', socketPath: '/tmp/cli2im/codex-notify.sock',
+      store: { bindNotificationTarget: vi.fn() } as unknown as SessionStore,
+      resolveAdapter: () => undefined, timeZone: 'UTC',
+      dependencies: {
+        router,
+        metadataResolver: { resolve: vi.fn() },
+        createMonitor: (handler) => {
+          onRollout = handler;
+          return { start: vi.fn(), stop: vi.fn() };
+        },
+        createSocket: () => ({ start: vi.fn(), stop: vi.fn() }),
+      },
+    });
+    const filePath = `/tmp/codex/sessions/rollout-no-id-${_label}.jsonl`;
+    await onRollout?.({
+      type: 'session_meta', sessionId: `session_${_label}`, cwd: '/tmp/project', source: 'cli',
+    }, filePath);
+    for (const contextEvent of contextEvents) {
+      await onRollout?.(contextEvent as ParsedRolloutLine, filePath);
+    }
+    const question = parseRolloutLine(JSON.stringify({
+      type: 'response_item',
+      payload: {
+        type: 'function_call', name: 'request_user_input', call_id: 'question_no_id_drop',
+        arguments: '{"questions":[{"question":"private dropped secret"}]}',
+      },
+    }));
+    if (question) await onRollout?.(question, filePath);
+
+    expect(router.handle).not.toHaveBeenCalledWith(expect.objectContaining({
+      requestId: 'question_no_id_drop',
+    }));
   });
 
   it('keeps the first valid user message metadata for a turn', async () => {
@@ -552,6 +656,84 @@ describe('CodexNotificationService', () => {
       'router.stop.start',
       'router.stop.end',
     ]);
+  });
+
+  it('aborts a stalled adapter send before producer callback drain and stops idempotently', async () => {
+    vi.useRealTimers();
+    const store = await SessionStore.create(':memory:');
+    await store.bindNotificationTarget({
+      botName: 'codexbot', platform: 'feishu', chatId: 'oc_private', userId: 'ou_allowed', updatedAt: 1,
+    });
+    let onRollout: ((event: ParsedRolloutLine, filePath: string) => void | Promise<void>) | undefined;
+    let activeCallback: Promise<void> | undefined;
+    let abortSignal: AbortSignal | undefined;
+    const cleanupSend = deferred<void>();
+    const send = vi.fn<PlatformAdapter['send']>(async (_chatId, _content, options) => {
+      abortSignal = options?.signal;
+      await new Promise<void>((resolve, reject) => {
+        const signal = options?.signal;
+        if (signal?.aborted) {
+          reject(signal.reason);
+          return;
+        }
+        signal?.addEventListener('abort', () => reject(signal.reason), { once: true });
+        void cleanupSend.promise.then(resolve, reject);
+      });
+      return 'om_never_delivered';
+    });
+    const adapter = {
+      name: 'feishu', connect: vi.fn(), disconnect: vi.fn(), onMessage: vi.fn(),
+      send, editMessage: vi.fn(), deleteMessage: vi.fn(), replaceCard: vi.fn(),
+    } as unknown as PlatformAdapter;
+    const monitorStop = vi.fn(async () => { await activeCallback; });
+    const socketStop = vi.fn();
+    const service = new CodexNotificationService({
+      botName: 'codexbot', workingDirectory: '/tmp/project', sessionsDir: '/tmp/codex/sessions',
+      sessionIndexPath: '/tmp/codex/session_index.jsonl', socketPath: '/tmp/cli2im/codex-notify.sock',
+      store, resolveAdapter: () => adapter, timeZone: 'UTC',
+      dependencies: {
+        metadataResolver: { resolve: vi.fn().mockResolvedValue({
+          projectName: 'cli2im', taskName: '停机测试', surface: 'CLI', shortTaskId: 'session_',
+        }) },
+        createMonitor: (handler) => {
+          onRollout = handler;
+          return { start: vi.fn(), stop: monitorStop };
+        },
+        createSocket: () => ({ start: vi.fn(), stop: socketStop }),
+      },
+    });
+    const filePath = '/tmp/codex/sessions/rollout-shutdown.jsonl';
+    await onRollout?.({
+      type: 'session_meta', sessionId: 'session_shutdown', cwd: '/tmp/project', source: 'cli',
+    }, filePath);
+    await onRollout?.({ type: 'turn_context', turnId: 'turn_shutdown', cwd: '/tmp/project' }, filePath);
+    activeCallback = Promise.resolve(onRollout?.({
+      type: 'question', turnId: 'turn_shutdown', requestId: 'question_shutdown', occurredAt: 10,
+    }, filePath)).then(() => undefined);
+    await vi.waitFor(() => expect(send).toHaveBeenCalledTimes(1));
+
+    const stopping = service.stop();
+    const secondStop = service.stop();
+    const outcome = await Promise.race([
+      Promise.all([stopping, secondStop]).then(() => 'stopped' as const),
+      new Promise<'timeout'>((resolve) => setTimeout(() => resolve('timeout'), 100)),
+    ]);
+    if (outcome === 'timeout') {
+      cleanupSend.resolve();
+      await Promise.all([stopping, secondStop]);
+    }
+
+    expect(outcome).toBe('stopped');
+    expect(abortSignal?.aborted).toBe(true);
+    expect(monitorStop).toHaveBeenCalledTimes(1);
+    expect(socketStop).toHaveBeenCalledTimes(1);
+    expect(await store.listPendingNotifications()).toHaveLength(1);
+
+    store.close();
+    await expect(onRollout?.({
+      type: 'question', turnId: 'turn_shutdown', requestId: 'late_question', occurredAt: 20,
+    }, filePath)).resolves.toBeUndefined();
+    expect(send).toHaveBeenCalledTimes(1);
   });
 
   it('hydrates persisted rollout context when approval is the first event after restart', async () => {

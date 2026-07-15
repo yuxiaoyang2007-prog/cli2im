@@ -79,6 +79,7 @@ interface RolloutContext {
   cwd?: string;
   source?: string;
   turns: Map<string, TurnMetadata>;
+  activeTurnIds: Set<string>;
 }
 
 export class CodexNotificationService {
@@ -100,6 +101,7 @@ export class CodexNotificationService {
   private readonly contextsByFile = new Map<string, RolloutContext>();
   private readonly contextsBySession = new Map<string, RolloutContext>();
   private readonly hydratedFiles = new Set<string>();
+  private stopPromise?: Promise<void>;
 
   constructor(options: CodexNotificationServiceOptions) {
     this.botName = options.botName;
@@ -165,9 +167,15 @@ export class CodexNotificationService {
   }
 
   async stop(): Promise<void> {
-    await runLifecycleStep('monitor stop', () => this.monitor.stop());
-    await runLifecycleStep('socket stop', () => this.socket.stop());
-    await runLifecycleStep('router stop', () => this.router.stop());
+    if (!this.stopPromise) this.stopPromise = this.stopAndDrain();
+    return this.stopPromise;
+  }
+
+  private async stopAndDrain(): Promise<void> {
+    const monitorStop = runLifecycleStep('monitor stop', () => this.monitor.stop());
+    const socketStop = runLifecycleStep('socket stop', () => this.socket.stop());
+    const routerStop = runLifecycleStep('router stop', () => this.router.stop());
+    await Promise.all([monitorStop, socketStop, routerStop]);
   }
 
   async bindTarget(input: Omit<NotificationBinding, 'updatedAt'>): Promise<void> {
@@ -180,7 +188,7 @@ export class CodexNotificationService {
   private async handleRolloutEvent(event: ParsedRolloutLine, filePath: string): Promise<void> {
     let context = this.contextsByFile.get(filePath);
     if (!context) {
-      context = { turns: new Map() };
+      context = createRolloutContext();
       this.contextsByFile.set(filePath, context);
     }
 
@@ -190,10 +198,12 @@ export class CodexNotificationService {
     this.applyContextEvent(context, event);
 
     if (event.type === 'question') {
-      await this.routeRolloutNotification(context, event, {
+      const turnId = event.turnId ?? this.singleActiveTurnId(context);
+      if (!turnId) return;
+      await this.routeRolloutNotification(context, { ...event, turnId }, {
         eventKey: (sessionId) => eventKey([
           sessionId,
-          event.turnId,
+          turnId,
           event.requestId,
           'question',
         ]),
@@ -209,9 +219,9 @@ export class CodexNotificationService {
         occurredAt: event.occurredAt,
         durationMs: event.durationMs,
       });
-      this.releaseContext(filePath, context);
+      this.releaseTurnContext(filePath, context, event.turnId);
     } else if (event.type === 'aborted') {
-      this.releaseContext(filePath, context);
+      this.releaseTurnContext(filePath, context, event.turnId);
     }
   }
 
@@ -237,6 +247,7 @@ export class CodexNotificationService {
       const turn = context.turns.get(event.turnId) ?? {};
       turn.cwd = event.cwd;
       context.turns.set(event.turnId, turn);
+      context.activeTurnIds.add(event.turnId);
       return;
     }
 
@@ -247,12 +258,17 @@ export class CodexNotificationService {
       turn.attachmentName = event.attachmentName;
       turn.hasUserMessage = true;
       context.turns.set(event.turnId, turn);
+      return;
+    }
+
+    if (event.type === 'completed' || event.type === 'aborted') {
+      context.activeTurnIds.delete(event.turnId);
     }
   }
 
   private async routeRolloutNotification(
     context: RolloutContext,
-    event: Extract<ParsedRolloutLine, { turnId: string }>,
+    event: { turnId: string },
     fields: {
       eventKey: (sessionId: string) => string;
       kind: CodexNotificationEvent['kind'];
@@ -303,19 +319,35 @@ export class CodexNotificationService {
     if (existing) return existing;
 
     const filePath = await this.findContextFile(this.sessionsDir, sessionId);
-    if (!filePath) return { turns: new Map() };
+    if (!filePath) return createRolloutContext();
 
     let context = this.contextsByFile.get(filePath);
     if (!context) {
-      context = { turns: new Map() };
+      context = createRolloutContext();
       this.contextsByFile.set(filePath, context);
     }
     await this.hydrateContext(filePath, context);
-    return context.sessionId === sessionId ? context : { turns: new Map() };
+    return context.sessionId === sessionId ? context : createRolloutContext();
+  }
+
+  private singleActiveTurnId(context: RolloutContext): string | undefined {
+    if (context.activeTurnIds.size !== 1) return undefined;
+    return context.activeTurnIds.values().next().value;
+  }
+
+  private releaseTurnContext(
+    filePath: string,
+    context: RolloutContext,
+    turnId: string,
+  ): void {
+    context.turns.delete(turnId);
+    context.activeTurnIds.delete(turnId);
+    if (context.activeTurnIds.size === 0) this.releaseContext(filePath, context);
   }
 
   private releaseContext(filePath: string, context: RolloutContext): void {
     context.turns.clear();
+    context.activeTurnIds.clear();
     if (this.contextsByFile.get(filePath) === context) {
       this.contextsByFile.delete(filePath);
       this.hydratedFiles.delete(filePath);
@@ -342,6 +374,10 @@ export class CodexNotificationService {
       attachmentName: turn?.attachmentName,
     });
   }
+}
+
+function createRolloutContext(): RolloutContext {
+  return { turns: new Map(), activeTurnIds: new Set() };
 }
 
 const MAX_CONTEXT_SEARCH_ENTRIES = 20_000;

@@ -369,7 +369,8 @@ describe('NotificationRouter', () => {
     });
 
     await expect(router.handle(attentionEvent())).resolves.toBe('pending');
-    await vi.advanceTimersByTimeAsync(1_000 + 5_000 + 20_000);
+    await vi.advanceTimersByTimeAsync(1_000 + 5_000);
+    await vi.runOnlyPendingTimersAsync();
 
     expect(send).toHaveBeenCalledTimes(4);
     expect(markAttemptStarted).toHaveBeenCalledTimes(4);
@@ -379,6 +380,41 @@ describe('NotificationRouter', () => {
 
     await vi.runAllTimersAsync();
     expect(send).toHaveBeenCalledTimes(4);
+  });
+
+  it('returns failed and persists terminal state for the fourth external failure', async () => {
+    const store = await SessionStore.create(':memory:');
+    stores.push(store);
+    await bindTarget(store);
+    const event = attentionEvent({ eventKey: 'fourth_failure_result_01' });
+    await store.enqueueNotification(event);
+    const send = vi.fn<PlatformAdapter['send']>().mockRejectedValue(new Error('private failure'));
+    const adapter = adapterWith(send);
+    const router = new NotificationRouter({
+      store,
+      botName: 'codexbot',
+      adapters: new Map([['codexbot', adapter]]),
+      timeZone: 'America/New_York',
+      log: vi.fn(),
+      ...timerDependencies(),
+    });
+    const delivery = {
+      ...(await store.listPendingNotifications())[0],
+      attempts: 3,
+      firstAttemptAt: STARTED_AT,
+    };
+
+    const result = await (router as unknown as {
+      attemptDelivery(
+        stored: typeof delivery,
+        chatId: string,
+        boundAdapter: PlatformAdapter,
+      ): Promise<string>;
+    }).attemptDelivery(delivery, 'oc_notification_target', adapter);
+
+    expect(result).toBe('failed');
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(await store.listPendingNotifications()).toEqual([]);
   });
 
   it('retries only local finalization after a delivered-state failure', async () => {

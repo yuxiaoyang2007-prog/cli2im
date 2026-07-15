@@ -244,7 +244,7 @@ export class NotificationRouter {
     if (attempts >= MAX_ATTEMPTS) {
       await this.store.markNotificationFailed(event.eventKey);
       this.logFailure(event, attempts, errorClass);
-      return 'pending';
+      return 'failed';
     }
 
     const retryDelayMs = RETRY_DELAYS_MS[attempts - 1];

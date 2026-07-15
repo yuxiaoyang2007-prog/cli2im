@@ -203,6 +203,64 @@ describe('Codex notification event parsing', () => {
     expect(JSON.stringify(parseRolloutLine(line))).not.toContain('secret question');
   });
 
+  it.each([
+    [
+      'Desktop/CLI passthrough metadata',
+      { internal_chat_message_metadata_passthrough: { turn_id: 'turn_passthrough' } },
+      'turn_passthrough',
+    ],
+    [
+      'SDK metadata',
+      { metadata: { turn_id: 'turn_sdk' } },
+      'turn_sdk',
+    ],
+  ])('parses request_user_input turn id from %s', (_label, metadata, turnId) => {
+    const parsed = parseRolloutLine(JSON.stringify({
+      timestamp: '2026-07-15T18:32:10.250Z',
+      type: 'response_item',
+      payload: {
+        type: 'function_call',
+        name: 'request_user_input',
+        call_id: 'call_structural',
+        arguments: '{"questions":[{"question":"private structural secret"}]}',
+        ...metadata,
+      },
+    }));
+
+    expect(parsed).toEqual({
+      type: 'question',
+      turnId,
+      requestId: 'call_structural',
+      occurredAt: Date.parse('2026-07-15T18:32:10.250Z'),
+    });
+    expect(Object.keys(parsed ?? {}).sort()).toEqual([
+      'occurredAt', 'requestId', 'turnId', 'type',
+    ]);
+    expect(JSON.stringify(parsed)).not.toContain('private structural secret');
+  });
+
+  it('retains only safe request metadata when request_user_input has no turn id', () => {
+    const parsed = parseRolloutLine(JSON.stringify({
+      timestamp: '2026-07-15T18:32:10.250Z',
+      type: 'response_item',
+      payload: {
+        type: 'function_call',
+        name: 'request_user_input',
+        call_id: 'call_without_turn',
+        arguments: '{"questions":[{"question":"private no-id secret"}]}',
+        metadata: { unrelated: 'private metadata secret' },
+      },
+    }));
+
+    expect(parsed).toEqual({
+      type: 'question',
+      requestId: 'call_without_turn',
+      occurredAt: Date.parse('2026-07-15T18:32:10.250Z'),
+    });
+    expect(Object.keys(parsed ?? {}).sort()).toEqual(['occurredAt', 'requestId', 'type']);
+    expect(JSON.stringify(parsed)).not.toContain('secret');
+  });
+
   it('parses a valid outer ISO timestamp for request_user_input', () => {
     const timestamp = '2026-07-15T14:32:10.250-04:00';
     const parsed = parseRolloutLine(JSON.stringify({

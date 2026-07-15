@@ -1,10 +1,19 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { handleBridgeCommand, type BridgeCommandSender } from '../src/index.js';
+import {
+  handleBridgeCommand,
+  logInboundMessageSummary,
+  type BridgeCommandSender,
+} from '../src/index.js';
 import { SessionStore } from '../src/session/store.js';
 import type { CodexNotificationService } from '../src/notifications/service.js';
 import type { AgentManager } from '../src/agents/manager.js';
 import type { HandoffService } from '../src/services/handoff.js';
-import type { BotConfig, PlatformAdapter, SessionKey } from '../src/types.js';
+import type {
+  BotConfig,
+  InboundMessage,
+  PlatformAdapter,
+  SessionKey,
+} from '../src/types.js';
 
 describe('/notify-me', () => {
   let store: SessionStore;
@@ -30,6 +39,7 @@ describe('/notify-me', () => {
 
   beforeEach(async () => {
     store = await SessionStore.create(':memory:');
+    botConfig.allowFrom = ['ou_allowed'];
     vi.mocked(adapter.send).mockClear();
     vi.mocked(service.bindTarget).mockClear();
   });
@@ -41,12 +51,13 @@ describe('/notify-me', () => {
   async function runNotifyMe(
     sender: BridgeCommandSender,
     selectedBotName = 'codexbot',
+    chatId = 'oc_private',
   ): Promise<void> {
     await handleBridgeCommand(
       { command: 'notify-me', args: [] },
-      'feishu:oc_private:codexbot' as SessionKey,
+      `feishu:${chatId}:codexbot` as SessionKey,
       selectedBotName,
-      'oc_private',
+      chatId,
       adapter,
       store,
       agentManager,
@@ -73,6 +84,41 @@ describe('/notify-me', () => {
     expect(adapter.send).toHaveBeenCalledWith('oc_private', {
       text: 'Codex 通知已绑定到当前私聊。后续只发送项目、任务和状态。',
     });
+  });
+
+  it('logs a /notify-me inbound message without user, text, mention, or recipient identifiers', async () => {
+    const log = vi.spyOn(console, 'log').mockImplementation(() => undefined);
+    const userSecret = 'ou_unique_private_user_82e1';
+    const textSecret = 'unique_private_prompt_613a';
+    const mentionSecret = 'ou_unique_private_mention_29bc';
+    const recipientSecret = 'oc_unique_private_chat_94d2';
+    const message: InboundMessage = {
+      platform: 'feishu',
+      chatId: recipientSecret,
+      userId: userSecret,
+      text: `/notify-me ${textSecret}`,
+      chatType: 'p2p',
+      mentions: [mentionSecret],
+    };
+    botConfig.allowFrom = [userSecret];
+
+    try {
+      logInboundMessageSummary('codexbot', message, 0, true);
+      await runNotifyMe({ platform: 'feishu', chatType: 'p2p', userId: userSecret }, 'codexbot', recipientSecret);
+
+      const output = JSON.stringify(log.mock.calls);
+      expect(output).toContain(
+        `[pipeline] codexbot: inbound chat=p2p relay=false command=notify-me textLength=${message.text.length} mentionCount=1 attachmentCount=0 relayBotCount=0 botIdentity=present`,
+      );
+      for (const secret of [userSecret, textSecret, mentionSecret, recipientSecret]) {
+        expect(output).not.toContain(secret);
+      }
+      expect(service.bindTarget).toHaveBeenCalledWith({
+        botName: 'codexbot', platform: 'feishu', chatId: recipientSecret, userId: userSecret,
+      });
+    } finally {
+      log.mockRestore();
+    }
   });
 
   it.each([
