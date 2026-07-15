@@ -128,6 +128,7 @@ export interface CardPayload {
   type: 'streaming' | 'final' | 'permission' | 'error' | 'session_list';
   content: string;
   title?: string;
+  headerTemplate?: 'orange' | 'green';
   buttons?: CardButton[];
   rawElements?: object[];
 }
@@ -287,6 +288,11 @@ export interface AgentConfig {
   env?: Record<string, string>;
 }
 
+export interface CodexNotificationConfig {
+  enabled: boolean;
+  botName: string;
+}
+
 export interface AppConfig {
   bots: Record<string, BotConfig>;
   agents: Record<string, AgentConfig>;
@@ -311,5 +317,8 @@ export interface AppConfig {
   contentGuard?: {
     enabled: boolean;
     blockThreshold?: number;
+  };
+  notifications?: {
+    codex: CodexNotificationConfig;
   };
 }

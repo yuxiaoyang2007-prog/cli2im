@@ -501,7 +501,10 @@ export class FeishuAdapter implements PlatformAdapter {
         })) ?? []),
       ],
       header: card.title
-        ? { title: { tag: 'plain_text', content: card.title } }
+        ? {
+            title: { tag: 'plain_text', content: card.title },
+            ...(card.headerTemplate ? { template: card.headerTemplate } : {}),
+          }
         : undefined,
     };
   }

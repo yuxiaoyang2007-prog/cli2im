@@ -3,6 +3,7 @@ import { loadConfig, substituteEnvVars } from '../src/config/loader.js';
 import { writeFileSync, mkdirSync, rmSync, realpathSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
+import type { AppConfig } from '../src/types.js';
 
 describe('substituteEnvVars', () => {
   it('replaces ${VAR} with env value', () => {
@@ -24,12 +25,57 @@ describe('substituteEnvVars', () => {
 describe('loadConfig', () => {
   const tmpDir = join(tmpdir(), 'cli2im-test-config');
 
+  function loadNotificationFixture(notificationYaml: string): AppConfig {
+    const configPath = join(tmpDir, `notifications-${Date.now()}.yaml`);
+    writeFileSync(configPath, `
+bots:
+  codexbot:
+    agent: codex
+    platform: feishu
+    feishu: { appId: app, appSecret: secret }
+    workingDirectory: /tmp/project
+    allowFrom: [ou_user]
+    permissionMode: blacklist
+agents:
+  codex: { binary: /opt/homebrew/bin/codex }
+session: { maxActive: 64, idleResetMinutes: 120, dbPath: /tmp/cli2im.db }
+dangerousPatterns: []
+streaming: { intervalMs: 200, minDeltaChars: 30, highWaterMark: 1048576 }
+server: { port: 3900, host: 127.0.0.1, token: test }
+newMessageBehavior: queue
+${notificationYaml}
+`);
+    return loadConfig(configPath);
+  }
+
   beforeEach(() => {
     mkdirSync(tmpDir, { recursive: true });
   });
 
   afterEach(() => {
     rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it('accepts a valid Codex notification config', () => {
+    const config = loadNotificationFixture(`
+notifications:
+  codex:
+    enabled: true
+    botName: codexbot
+`);
+    expect(config.notifications?.codex).toEqual({ enabled: true, botName: 'codexbot' });
+  });
+
+  it.each([
+    ['enabled', 'yes'],
+    ['botName', ''],
+  ])('rejects invalid notifications.codex.%s', (field, value) => {
+    expect(() => loadNotificationFixture(`
+notifications:
+  codex:
+    enabled: ${field === 'enabled' ? value : 'true'}
+    botName: ${field === 'botName' ? JSON.stringify(value) : 'codexbot'}
+`)).toThrow('Config error: notifications.codex');
   });
 
   it('loads and parses yaml config with env substitution', () => {

@@ -115,6 +115,21 @@ function validateConfig(config: AppConfig): void {
   if (!config.agents || typeof config.agents !== 'object') {
     throw new Error('Config error: "agents" section is required');
   }
+  if (config.notifications?.codex) {
+    const codex = config.notifications.codex;
+    if (typeof codex.enabled !== 'boolean') {
+      throw new Error('Config error: notifications.codex.enabled must be a boolean');
+    }
+    if (typeof codex.botName !== 'string' || codex.botName.trim().length === 0) {
+      throw new Error('Config error: notifications.codex.botName must be a non-empty string');
+    }
+    if (!config.bots[codex.botName]) {
+      throw new Error('Config error: notifications.codex.botName must name an existing bot');
+    }
+    if (config.bots[codex.botName].platform !== 'feishu') {
+      throw new Error('Config error: notifications.codex.botName must use the feishu platform');
+    }
+  }
   if (config.sandboxExtraRoots != null) {
     if (!Array.isArray(config.sandboxExtraRoots)) {
       throw new Error('Config error: "sandboxExtraRoots" must be an array');

@@ -162,6 +162,11 @@ server:
 newMessageBehavior: queue          # queue = hold until agent is free
                                    # interrupt = abort current turn, start new one
 
+notifications:
+  codex:
+    enabled: true
+    botName: codexbot
+
 # ----------------------------------------------------------
 # Content guard — optional content safety filtering
 # `content-guard` is an optional peer dependency; filtering is disabled when absent.

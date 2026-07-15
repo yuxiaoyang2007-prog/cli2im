@@ -89,6 +89,26 @@ describe('FeishuAdapter file handling', () => {
     vi.unstubAllGlobals();
   });
 
+  it('renders an allowlisted Feishu card header color', async () => {
+    const adapter = new FeishuAdapter({ appId: 'app', appSecret: 'secret', botName: 'bot' });
+    const client = larkMocks.clients[0];
+    await adapter.send('oc_1', {
+      card: {
+        type: 'final',
+        title: '🟠 待你处理',
+        headerTemplate: 'orange',
+        content: '项目：cli2im',
+      },
+    });
+    const createMock = client.im.message.create as ReturnType<typeof vi.fn>;
+    const request = createMock.mock.calls[0]?.[0] as { data: { content: string } };
+    const sentCard = JSON.parse(request.data.content);
+    expect(sentCard.header).toEqual({
+      title: { tag: 'plain_text', content: '🟠 待你处理' },
+      template: 'orange',
+    });
+  });
+
   it('parses image and file receive events into inbound attachments', () => {
     const adapter = new FeishuAdapter({ appId: 'app', appSecret: 'secret', botName: 'bot' });
     const received: InboundMessage[] = [];
