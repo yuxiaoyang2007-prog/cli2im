@@ -1,4 +1,5 @@
 import { execFile } from 'node:child_process';
+import { Buffer } from 'node:buffer';
 import { promisify } from 'node:util';
 import { basename, join } from 'node:path';
 import type { CodexSurface } from './types.js';
@@ -11,10 +12,12 @@ const OPENAI_STYLE_KEY = /\b(?:sk|sess)-[A-Za-z0-9_-]{12,}\b/g;
 const GITHUB_TOKEN = /\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})\b/gi;
 const AWS_ACCESS_KEY = /\b(?:A3T[A-Z0-9]|ABIA|ACCA|AGPA|AIDA|AIPA|AKIA|ANPA|ANVA|APKA|AROA|ASCA|ASIA)[A-Z0-9]{16}\b/g;
 const JWT = /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/g;
-const AUTHORIZATION_CREDENTIAL = /\b(?:authorization|proxy-authorization|auth)\s*[:=]\s*(?:"(?:\\.|[^"\\])*(?:"|$)|'(?:\\.|[^'\\])*(?:'|$)|(?:(?:bearer|basic)\s+)?[^\s,;]+)/gi;
+const EXPLICIT_AUTHORIZATION_CREDENTIAL = /\b(?:authorization|proxy-authorization|auth)\s*[:=]\s*(?:"(?:bearer|basic)\s+(?:\\.|[^"\\])*(?:"|$)|'(?:bearer|basic)\s+(?:\\.|[^'\\])*(?:'|$)|(?:bearer|basic)\s+[^\s,;]+)/gi;
+const REDACTED_AUTHORIZATION_ASSIGNMENT = /\b(?:authorization|proxy-authorization|auth)\s*[:=]\s*(?:"\[REDACTED\]"|'\[REDACTED\]'|\[REDACTED\])/gi;
 const BEARER_CREDENTIAL = /\bbearer\s+[^\s,;]+/gi;
-const BASIC_CREDENTIAL = /\bbasic\s+[A-Za-z0-9+/=]{8,}/gi;
+const BASIC_CREDENTIAL = /\bbasic\s+([A-Za-z0-9+/]+={0,2})(?=$|[\s,;)])/gi;
 const REDACTION = '[REDACTED]';
+const SAFE_STANDALONE_IDENTIFIER = /^(?:[A-Z][A-Za-z0-9]+|[A-Za-z][A-Za-z0-9]*(?:[_-][A-Za-z0-9]+)+)$/;
 const MARKDOWN_LINK = /\[([^\]]+)]\([^\s)]+\)/g;
 const CODE_FENCE = /```[\s\S]*?```/g;
 const CJK = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/u;
@@ -300,6 +303,7 @@ function normalizeLexicalStart(value: string): string {
 }
 
 function isEligibleNaturalTitle(value: string): boolean {
+  if (SAFE_STANDALONE_IDENTIFIER.test(value)) return true;
   const firstToken = /^(\S+)/.exec(value)?.[1];
   if (!firstToken || !/^[a-z]/.test(firstToken)) return true;
   if (!/^[a-z]+$/.test(firstToken)) return false;
@@ -383,22 +387,33 @@ function redactNamedSecrets(value: string): string {
 }
 
 function redactCredentialTokens(value: string): string {
-  return redactAmbiguousCredentialTokens(redactBasicCredentialForms(value
-    .replace(AUTHORIZATION_CREDENTIAL, REDACTION)
+  let redacted = value
+    .replace(EXPLICIT_AUTHORIZATION_CREDENTIAL, REDACTION)
     .replace(BEARER_CREDENTIAL, REDACTION)
     .replace(GITHUB_TOKEN, REDACTION)
     .replace(AWS_ACCESS_KEY, REDACTION)
-    .replace(JWT, REDACTION)));
+    .replace(JWT, REDACTION);
+  redacted = redactBasicCredentialForms(redacted);
+  redacted = redactAmbiguousCredentialTokens(redacted);
+  return redacted.replace(REDACTED_AUTHORIZATION_ASSIGNMENT, REDACTION);
 }
 
 function redactBasicCredentialForms(value: string): string {
   return value.replace(BASIC_CREDENTIAL, (match, token: string) => (
-    /[A-Z]/.test(token)
-      && /[a-z]/.test(token)
-      && (token.length >= 20 || /[\d+/=]/.test(token))
-      ? REDACTION
-      : match
+    isBasicCredentialToken(token) ? REDACTION : match
   ));
+}
+
+function isBasicCredentialToken(value: string): boolean {
+  if (value.length < 8 || value.length % 4 !== 0) return false;
+  try {
+    const decoded = Buffer.from(value, 'base64');
+    const canonical = decoded.toString('base64').replace(/=+$/, '');
+    return canonical === value.replace(/=+$/, '')
+      && decoded.toString('utf8').includes(':');
+  } catch {
+    return false;
+  }
 }
 
 function redactAmbiguousCredentialTokens(value: string): string {
@@ -422,9 +437,10 @@ function isAmbiguousCredentialToken(value: string): boolean {
   }
   const classes = [/[a-z]/, /[A-Z]/, /\d/, /[_~+/=-]/]
     .filter((pattern) => pattern.test(value)).length;
-  const uniqueRatio = new Set(value).size / value.length;
-  if (classes >= 3) return uniqueRatio >= 0.35;
-  return value.length >= 32 && classes >= 2 && uniqueRatio >= 0.4;
+  return classes >= 3
+    && /[a-z]/.test(value)
+    && /[A-Z]/.test(value)
+    && shannonEntropy(value) >= 3.5;
 }
 
 function shannonEntropy(value: string): number {

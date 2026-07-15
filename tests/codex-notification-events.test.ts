@@ -122,6 +122,24 @@ describe('Codex notification event parsing', () => {
     expect(parsed).toBeNull();
   });
 
+  it('redacts a short valid Basic credential from a parsed user event', () => {
+    const withContext = (text: string) => parseRolloutLine(JSON.stringify({
+      type: 'response_item',
+      payload: {
+        type: 'message', role: 'user', content: [{ type: 'input_text', text }],
+        internal_chat_message_metadata_passthrough: { turn_id: 'turn_basic' },
+      },
+    }));
+
+    expect(withContext('Review Basic YTpwYXNz')).toEqual({
+      type: 'user_message',
+      turnId: 'turn_basic',
+      userText: 'Review [REDACTED]',
+    });
+    expect(withContext('Basic YTpwYXNz')).toBeNull();
+    expect(JSON.stringify(withContext('Review Basic YTpwYXNz'))).not.toContain('YTpwYXNz');
+  });
+
   it('keeps a sanitized technical-looking attachment basename', () => {
     const parsed = parseRolloutLine(JSON.stringify({
       type: 'response_item',

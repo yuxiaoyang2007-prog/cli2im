@@ -17,7 +17,8 @@ describe('sanitizeTaskTitle', () => {
     ['Bearer credential', 'Bearer mF_9xQ7vK2pL8sN4dR6tY1wB3cE5hJ0z', 'Review [REDACTED]'],
     ['short Bearer credential', 'Bearer abc123', 'Review [REDACTED]'],
     ['Authorization credential', 'Authorization: Basic YWxhZGRpbjpvcGVuc2VzYW1l', 'Review [REDACTED]'],
-    ['quoted auth credential', 'auth="alpha beta secret"', 'Review [REDACTED]'],
+    ['quoted auth credential', 'auth="Bearer abc123"', 'Review [REDACTED]'],
+    ['short Basic credential', 'Basic YTpwYXNz', 'Review [REDACTED]'],
     ['signed URL', 'https://example.test/download?X-Amz-Credential=AKIAIOSFODNN7EXAMPLE&X-Amz-Signature=0123456789abcdef0123456789abcdef', 'Review https://example.test/download'],
     ['Slack webhook URL', 'https://hooks.slack.com/services/T00000000/B00000000/XXXXXXXXXXXXXXXXXXXXXXXX', 'Review https://hooks.slack.com/[REDACTED]'],
     ['generic secret-bearing webhook URL', 'https://example.test/api/webhook/mF_9xQ7vK2pL8sN4dR6tY1wB3cE5hJ0z', 'Review https://example.test/api/webhook/[REDACTED]'],
@@ -47,6 +48,28 @@ describe('sanitizeTaskTitle', () => {
     'ASIAIOSFODNN7EXAMPLE',
   ])('redacts an additional PAT or temporary AWS credential family: %s', (credential) => {
     expect(sanitizeTaskTitle(`Review ${credential}`)).toBe('Review [REDACTED]');
+  });
+
+  it.each([
+    'CodexNotificationMetadataResolver',
+    'codex_notification_delivery_timeout',
+    'notification-delivery-retry-handler',
+  ])('preserves a common non-secret identifier as a task title: %s', (identifier) => {
+    expect(sanitizeTaskTitle(identifier)).toBe(identifier);
+  });
+
+  it.each([
+    'Authorization: callback',
+    'Fix auth: login redirect',
+  ])('preserves ordinary authorization prose: %s', (title) => {
+    expect(sanitizeTaskTitle(title)).toBe(title);
+  });
+
+  it.each([
+    'Review Authorization: Bearer abc123',
+    'Review auth=ghp_1234567890abcdefghijklmnopqrstuvwxyzAB',
+  ])('redacts an explicit or credential-shaped authorization value: %s', (title) => {
+    expect(sanitizeTaskTitle(title)).toBe('Review [REDACTED]');
   });
 
   it('removes secrets URLs home paths and instruction wrappers from a task title', () => {
@@ -402,6 +425,67 @@ describe('NotificationMetadataResolver', () => {
 
     expect(result.projectName).toBe('未识别项目');
     expect(JSON.stringify(result)).not.toContain(credential);
+  });
+
+  it.each([
+    'CodexNotificationMetadataResolver',
+    'codex_notification_delivery_timeout',
+    'notification-delivery-retry-handler',
+  ])('preserves a common identifier as project and task metadata: %s', async (identifier) => {
+    const codexDir = makeTemporaryDirectory();
+    const resolver = new NotificationMetadataResolver({
+      codexDir,
+      resolveGitRoot: async () => `/workspace/${identifier}`,
+    });
+
+    expect(await resolver.resolve({
+      sessionId: 'identifier-session',
+      cwd: `/workspace/${identifier}`,
+      source: 'cli',
+      userText: identifier,
+      attachmentName: undefined,
+    })).toMatchObject({
+      projectName: identifier,
+      taskName: identifier,
+    });
+  });
+
+  it('falls back when a short valid Basic credential is the only task title', async () => {
+    const codexDir = makeTemporaryDirectory();
+    const resolver = new NotificationMetadataResolver({
+      codexDir,
+      resolveGitRoot: async () => '/workspace/safe-project',
+    });
+
+    const result = await resolver.resolve({
+      sessionId: 'basic-credential-session',
+      cwd: '/workspace/safe-project',
+      source: 'cli',
+      userText: 'Basic YTpwYXNz',
+      attachmentName: undefined,
+    });
+
+    expect(result.taskName).toBe('未命名任务 · basic-cr');
+    expect(JSON.stringify(result)).not.toContain('YTpwYXNz');
+  });
+
+  it.each([
+    'Authorization: callback',
+    'Fix auth: login redirect',
+  ])('keeps ordinary authorization prose in resolved task metadata: %s', async (title) => {
+    const codexDir = makeTemporaryDirectory();
+    const resolver = new NotificationMetadataResolver({
+      codexDir,
+      resolveGitRoot: async () => '/workspace/safe-project',
+    });
+
+    expect((await resolver.resolve({
+      sessionId: 'auth-prose-session',
+      cwd: '/workspace/safe-project',
+      source: 'cli',
+      userText: title,
+      attachmentName: undefined,
+    })).taskName).toBe(title);
   });
 
   it('uses bounded session-index titles before user text and attachments', async () => {
