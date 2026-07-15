@@ -13,7 +13,7 @@ import {
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
-import initSqlJs from 'sql.js';
+import initSqlJs, { type Database } from 'sql.js';
 import { afterEach, describe, expect, it } from 'vitest';
 import { SessionStore } from '../src/session/store.js';
 import type { CodexNotificationEvent } from '../src/notifications/types.js';
@@ -114,6 +114,7 @@ describe('notification persistence', () => {
       locateFile: (file: string) => join(sqlWasmDir, file),
     });
     const legacyDb = new SQL.Database();
+    createExpectedSessionsTable(legacyDb);
     legacyDb.run(`
       CREATE TABLE notification_cursors (
         file_path TEXT PRIMARY KEY,
@@ -220,6 +221,7 @@ describe('notification persistence', () => {
       locateFile: (file: string) => join(sqlWasmDir, file),
     });
     const legacyDb = new SQL.Database();
+    createExpectedSessionsTable(legacyDb);
     legacyDb.run(`
       CREATE TABLE notification_deliveries (
         event_key TEXT PRIMARY KEY,
@@ -374,6 +376,123 @@ describe('notification persistence', () => {
     backup.close();
   });
 
+  it.each([
+    ['delivered', 20],
+    ['failed', 40],
+    ['discarded', 80],
+  ] as const)(
+    'securely removes a marker after %s terminalization (length %i)',
+    async (status, markerLength) => {
+      const directory = mkdtempSync(join(tmpdir(), 'cli2im-notification-store-'));
+      temporaryDirectories.push(directory);
+      const dbPath = join(directory, 'sessions.db');
+      const marker = makeRawMarker(markerLength);
+      const event = completionEvent({
+        eventKey: `evt_secure_${status}`,
+        projectName: marker,
+        taskName: marker,
+      });
+      const store = await SessionStore.create(dbPath);
+      await store.enqueueNotification(event);
+      await store.markNotificationAttemptStarted(event.eventKey, 1500);
+      await store.recordNotificationReceipt(event.eventKey, 'om_terminal', 1800);
+      expect(readFileSync(dbPath).includes(Buffer.from(marker))).toBe(true);
+
+      if (status === 'delivered') {
+        await store.markNotificationDelivered(event.eventKey, 3000);
+      } else {
+        await store.markNotificationFailed(event.eventKey, status);
+      }
+      store.close();
+
+      assertSnapshotsExclude(dbPath, marker);
+
+      const reopened = await SessionStore.create(dbPath);
+      await reopened.upsertNotificationCursor({
+        filePath: `/tmp/${status}.jsonl`,
+        fileId: '1:2',
+        byteOffset: 1,
+        continuityHash: '0123456789abcdef01234567',
+        updatedAt: 4000,
+      });
+      reopened.close();
+
+      assertSnapshotsExclude(dbPath, marker);
+    },
+  );
+
+  it('compacts legacy terminal residual data out of live and backup snapshots on open', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'cli2im-notification-store-'));
+    temporaryDirectories.push(directory);
+    const dbPath = join(directory, 'sessions.db');
+    const marker = makeRawMarker(80);
+    const event = completionEvent({
+      eventKey: 'evt_legacy_residual',
+      projectName: marker,
+      taskName: marker,
+    });
+    const store = await SessionStore.create(dbPath);
+    await store.enqueueNotification(event);
+    store.close();
+
+    const SQL = await initSqlJs({ locateFile: (file: string) => join(sqlWasmDir, file) });
+    const legacy = new SQL.Database(readFileSync(dbPath));
+    legacy.run('PRAGMA secure_delete = OFF');
+    legacy.run(
+      `UPDATE notification_deliveries
+       SET event_json = '{}', status = 'failed'
+       WHERE event_key = ?`,
+      [event.eventKey],
+    );
+    const legacyBytes = Buffer.from(legacy.export());
+    legacy.close();
+    expect(legacyBytes.includes(Buffer.from(marker))).toBe(true);
+    writeFileSync(dbPath, legacyBytes);
+    writeFileSync(`${dbPath}.bak`, legacyBytes);
+
+    const compacted = await SessionStore.create(dbPath);
+    compacted.close();
+
+    assertSnapshotsExclude(dbPath, marker);
+  });
+
+  it('recovers the sanitized terminal snapshot after pair publication stops before main rename', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'cli2im-notification-store-'));
+    temporaryDirectories.push(directory);
+    const dbPath = join(directory, 'sessions.db');
+    const marker = makeRawMarker(80);
+    const event = completionEvent({
+      eventKey: 'evt_interrupted_terminal_pair',
+      projectName: marker,
+      taskName: marker,
+    });
+    const store = await SessionStore.create(dbPath);
+    await store.enqueueNotification(event);
+    store.close();
+    const pendingMain = readFileSync(dbPath);
+
+    const SQL = await initSqlJs({ locateFile: (file: string) => join(sqlWasmDir, file) });
+    const sanitized = new SQL.Database(pendingMain);
+    sanitized.run('PRAGMA secure_delete = ON');
+    sanitized.run(
+      `UPDATE notification_deliveries
+       SET event_json = '{}', status = 'failed'
+       WHERE event_key = ?`,
+      [event.eventKey],
+    );
+    sanitized.run('VACUUM');
+    writeFileSync(`${dbPath}.bak`, Buffer.from(sanitized.export()));
+    sanitized.close();
+    expect(readFileSync(dbPath).includes(Buffer.from(marker))).toBe(true);
+    expect(readFileSync(`${dbPath}.bak`).includes(Buffer.from(marker))).toBe(false);
+
+    const recovered = await SessionStore.create(dbPath);
+    expect(await recovered.listPendingNotifications()).toEqual([]);
+    recovered.close();
+
+    assertSnapshotsExclude(dbPath, marker);
+  });
+
   it('keeps live, temporary, and backup database snapshots owner-only', async () => {
     const directory = mkdtempSync(join(tmpdir(), 'cli2im-notification-store-'));
     temporaryDirectories.push(directory);
@@ -473,4 +592,107 @@ describe('notification persistence', () => {
       verified.close();
     },
   );
+
+  it('recovers a zero-byte main snapshot from a valid backup', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'cli2im-notification-store-'));
+    temporaryDirectories.push(directory);
+    const dbPath = join(directory, 'sessions.db');
+    const first = completionEvent({ eventKey: 'evt_zero_recoverable' });
+    const second = completionEvent({ eventKey: 'evt_zero_newer' });
+    const store = await SessionStore.create(dbPath);
+    await store.enqueueNotification(first);
+    await store.enqueueNotification(second);
+    store.close();
+    writeFileSync(dbPath, Buffer.alloc(0));
+
+    const recovered = await SessionStore.create(dbPath);
+
+    expect((await recovered.listPendingNotifications()).map((row) => row.event.eventKey)).toEqual([
+      first.eventKey,
+    ]);
+    recovered.close();
+  });
+
+  it.each([
+    ['zero main and corrupt backup', Buffer.alloc(0), Buffer.from('not sqlite')],
+    ['corrupt main and zero backup', Buffer.from('not sqlite'), Buffer.alloc(0)],
+  ] as const)('rejects %s without creating a replacement database', async (_name, main, backup) => {
+    const directory = mkdtempSync(join(tmpdir(), 'cli2im-notification-store-'));
+    temporaryDirectories.push(directory);
+    const dbPath = join(directory, 'sessions.db');
+    writeFileSync(dbPath, main);
+    writeFileSync(`${dbPath}.bak`, backup);
+
+    await expect(SessionStore.create(dbPath)).rejects.toThrow(
+      'Session database has no valid snapshot',
+    );
+
+    expect(readFileSync(dbPath)).toEqual(main);
+    expect(readFileSync(`${dbPath}.bak`)).toEqual(backup);
+  });
+
+  it('rejects a structurally unrelated SQLite database with a valid header', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'cli2im-notification-store-'));
+    temporaryDirectories.push(directory);
+    const dbPath = join(directory, 'sessions.db');
+    const SQL = await initSqlJs({ locateFile: (file: string) => join(sqlWasmDir, file) });
+    const unrelated = new SQL.Database();
+    unrelated.run('CREATE TABLE unrelated (value TEXT)');
+    writeFileSync(dbPath, Buffer.from(unrelated.export()));
+    unrelated.close();
+
+    await expect(SessionStore.create(dbPath)).rejects.toThrow(
+      'Session database has no valid snapshot',
+    );
+  });
+
+  it('rejects structural corruption outside the required sessions table', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'cli2im-notification-store-'));
+    temporaryDirectories.push(directory);
+    const dbPath = join(directory, 'sessions.db');
+    const SQL = await initSqlJs({ locateFile: (file: string) => join(sqlWasmDir, file) });
+    const source = new SQL.Database();
+    createExpectedSessionsTable(source);
+    source.run('CREATE TABLE payloads (value TEXT NOT NULL)');
+    source.run('INSERT INTO payloads (value) VALUES (?)', ['x'.repeat(12_000)]);
+    const rootPage = (source as unknown as ReadOnlyTestDatabase).exec(
+      "SELECT rootpage FROM sqlite_master WHERE name = 'payloads'",
+    )[0]?.values[0]?.[0] as number;
+    const corrupted = Buffer.from(source.export());
+    source.close();
+    const encodedPageSize = corrupted.readUInt16BE(16);
+    const pageSize = encodedPageSize === 1 ? 65_536 : encodedPageSize;
+    corrupted[(rootPage - 1) * pageSize] = 0xff;
+    writeFileSync(dbPath, corrupted);
+
+    await expect(SessionStore.create(dbPath)).rejects.toThrow(
+      'Session database has no valid snapshot',
+    );
+  });
 });
+
+function makeRawMarker(length: number): string {
+  const prefix = `RAW${length}_`;
+  return `${prefix}${'Z'.repeat(length - prefix.length)}`;
+}
+
+function assertSnapshotsExclude(dbPath: string, marker: string): void {
+  const encoded = Buffer.from(marker);
+  expect(readFileSync(dbPath).includes(encoded)).toBe(false);
+  expect(readFileSync(`${dbPath}.bak`).includes(encoded)).toBe(false);
+}
+
+function createExpectedSessionsTable(db: Database): void {
+  db.run(`
+    CREATE TABLE sessions (
+      id TEXT PRIMARY KEY,
+      key TEXT UNIQUE NOT NULL,
+      agent_name TEXT NOT NULL,
+      agent_session_id TEXT,
+      working_directory TEXT NOT NULL,
+      state TEXT NOT NULL DEFAULT 'active',
+      created_at INTEGER NOT NULL,
+      last_active_at INTEGER NOT NULL
+    )
+  `);
+}

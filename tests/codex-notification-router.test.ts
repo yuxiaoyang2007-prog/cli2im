@@ -1134,6 +1134,18 @@ async function createLegacyNotificationDatabase(
   });
   const db = new SQL.Database();
   db.run(`
+    CREATE TABLE sessions (
+      id TEXT PRIMARY KEY,
+      key TEXT UNIQUE NOT NULL,
+      agent_name TEXT NOT NULL,
+      agent_session_id TEXT,
+      working_directory TEXT NOT NULL,
+      state TEXT NOT NULL DEFAULT 'active',
+      created_at INTEGER NOT NULL,
+      last_active_at INTEGER NOT NULL
+    )
+  `);
+  db.run(`
     CREATE TABLE notification_deliveries (
       event_key TEXT PRIMARY KEY,
       event_json TEXT NOT NULL,

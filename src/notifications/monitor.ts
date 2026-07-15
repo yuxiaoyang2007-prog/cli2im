@@ -12,12 +12,21 @@ interface NotificationCursorStore {
 }
 
 type MonitorState = 'stopped' | 'starting' | 'started' | 'stopping';
+type ProcessingOrigin = 'direct' | 'discovery' | 'watcher' | 'settle';
+
+interface TrackedGeneration {
+  fileId: string;
+  phase: 'active' | 'replacing';
+  revision: number;
+  lastChangeAt: number;
+}
 
 const CONTINUITY_WINDOW_BYTES = 64;
 const MAX_IDENTITY_RECHECKS = 4;
 const READ_CHUNK_BYTES = 64 * 1024;
 const MAX_LINE_BYTES = 1024 * 1024;
 const WATCH_COALESCE_MS = 25;
+const REPLACEMENT_QUIET_MS = 250;
 
 export interface CodexEventMonitorOptions {
   sessionsDir: string;
@@ -31,12 +40,15 @@ export class CodexEventMonitor {
   private readonly onEvent: CodexEventMonitorOptions['onEvent'];
   private readonly pending = new Map<string, Promise<void>>();
   private readonly watcherTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  private readonly replacementTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  private readonly generations = new Map<string, TrackedGeneration>();
   private watcher: FSWatcher | null = null;
   private state: MonitorState = 'stopped';
   private startPromise: Promise<void> | null = null;
   private stopPromise: Promise<void> | null = null;
   private stopRequested = false;
   private rediscoverRequested = false;
+  private discoveryPromise: Promise<void> | null = null;
 
   constructor(options: CodexEventMonitorOptions) {
     this.sessionsDir = options.sessionsDir;
@@ -97,10 +109,7 @@ export class CodexEventMonitor {
         }
       });
       this.watcher = watcher;
-      do {
-        this.rediscoverRequested = false;
-        await this.discoverFiles();
-      } while (this.rediscoverRequested && !this.stopRequested);
+      await this.discoverFiles();
       if (this.stopRequested) {
         watcher.close();
         if (this.watcher === watcher) this.watcher = null;
@@ -129,24 +138,56 @@ export class CodexEventMonitor {
     this.watcher = null;
     for (const timer of this.watcherTimers.values()) clearTimeout(timer);
     this.watcherTimers.clear();
+    for (const timer of this.replacementTimers.values()) clearTimeout(timer);
+    this.replacementTimers.clear();
+    this.rediscoverRequested = false;
+    if (this.discoveryPromise) {
+      try {
+        await this.discoveryPromise;
+      } catch {
+        // Discovery failure is reported to its initiating start/callback.
+      }
+    }
     await Promise.allSettled([...this.pending.values()]);
     this.state = 'stopped';
   }
 
   private scheduleWatchedFile(filePath: string): void {
+    const replacementTimer = this.replacementTimers.get(filePath);
+    if (replacementTimer) {
+      clearTimeout(replacementTimer);
+      this.replacementTimers.delete(filePath);
+    }
+    const generation = this.generations.get(filePath);
+    if (generation?.phase === 'replacing') {
+      if (Date.now() - generation.lastChangeAt >= REPLACEMENT_QUIET_MS) {
+        this.setGeneration(filePath, generation.fileId, 'active');
+      } else {
+        generation.revision += 1;
+        generation.lastChangeAt = Date.now();
+      }
+    }
     const existing = this.watcherTimers.get(filePath);
     if (existing) clearTimeout(existing);
     const timer = setTimeout(() => {
       this.watcherTimers.delete(filePath);
       if (this.state !== 'started') return;
-      void this.processFile(filePath).catch(() => undefined);
+      void this.queueFile(filePath, 'watcher')
+        .then(() => this.scheduleReplacementSettle(filePath))
+        .catch(() => undefined);
     }, WATCH_COALESCE_MS);
     this.watcherTimers.set(filePath, timer);
   }
 
   async processFile(filePath: string): Promise<void> {
+    await this.queueFile(filePath, 'direct');
+  }
+
+  private async queueFile(filePath: string, origin: ProcessingOrigin): Promise<void> {
     const previous = this.pending.get(filePath) ?? Promise.resolve();
-    const current = previous.catch(() => undefined).then(() => this.processFileOnce(filePath));
+    const current = previous
+      .catch(() => undefined)
+      .then(() => this.processFileOnce(filePath, origin));
     this.pending.set(filePath, current);
 
     try {
@@ -156,8 +197,28 @@ export class CodexEventMonitor {
     }
   }
 
-  private async discoverFiles(directory = this.sessionsDir): Promise<void> {
-    const files = await discoverRolloutFiles(directory);
+  private async discoverFiles(): Promise<void> {
+    this.rediscoverRequested = true;
+    if (this.discoveryPromise) return this.discoveryPromise;
+
+    const operation = this.runDiscoveryLoop();
+    this.discoveryPromise = operation;
+    try {
+      await operation;
+    } finally {
+      if (this.discoveryPromise === operation) this.discoveryPromise = null;
+    }
+  }
+
+  private async runDiscoveryLoop(): Promise<void> {
+    while (this.rediscoverRequested && !this.stopRequested) {
+      this.rediscoverRequested = false;
+      await this.discoverFilesOnce();
+    }
+  }
+
+  private async discoverFilesOnce(): Promise<void> {
+    const files = await discoverRolloutFiles(this.sessionsDir);
     const baselines: NotificationCursor[] = [];
     const processAfterBaseline: string[] = [];
 
@@ -182,7 +243,8 @@ export class CodexEventMonitor {
     }
 
     for (const filePath of processAfterBaseline) {
-      await this.processFile(filePath);
+      await this.queueFile(filePath, 'discovery');
+      this.scheduleReplacementSettle(filePath);
     }
   }
 
@@ -197,6 +259,8 @@ export class CodexEventMonitor {
       if (!fileStat.isFile()) return null;
       const fileId = `${fileStat.dev}:${fileStat.ino}`;
       const cursor = await this.store.getNotificationCursor(filePath);
+      const generation = this.generations.get(filePath);
+      const isLiveNew = this.state === 'started' && !cursor && !generation;
       const precedingBytes = await readPrecedingBytes(handle, cursor?.byteOffset ?? fileStat.size);
       const hasValidCursor = cursor
         && cursor.fileId === fileId
@@ -204,18 +268,31 @@ export class CodexEventMonitor {
         && typeof cursor.continuityHash === 'string'
         && cursor.continuityHash === hashBytes(precedingBytes);
       if (!hasValidCursor) {
+        const byteOffset = isLiveNew ? 0 : fileStat.size;
+        const isReplacement = this.state === 'started'
+          && !isLiveNew
+          && Boolean(cursor || generation);
+        this.setGeneration(filePath, fileId, isReplacement ? 'replacing' : 'active');
+        return {
+          baseline: await makeBaselineCursor(handle, filePath, fileId, byteOffset),
+          hasUnreadBytes: isLiveNew && fileStat.size > 0,
+        };
+      }
+      if (generation?.phase === 'replacing') {
+        this.setGeneration(filePath, fileId, 'replacing');
         return {
           baseline: await makeBaselineCursor(handle, filePath, fileId, fileStat.size),
           hasUnreadBytes: false,
         };
       }
+      this.setGeneration(filePath, fileId, 'active');
       return { hasUnreadBytes: fileStat.size > cursor.byteOffset };
     } finally {
       await handle.close();
     }
   }
 
-  private async processFileOnce(filePath: string): Promise<void> {
+  private async processFileOnce(filePath: string, origin: ProcessingOrigin): Promise<void> {
     if (!isRolloutPath(filePath)) return;
 
     let handle = await openIfPresent(filePath);
@@ -227,7 +304,7 @@ export class CodexEventMonitor {
       }
       const fileId = `${fileStat.dev}:${fileStat.ino}`;
       try {
-        await this.processOpenedFile(filePath, handle, fileId, fileStat.size);
+        await this.processOpenedFile(filePath, handle, fileId, fileStat.size, origin);
       } finally {
         await handle.close();
       }
@@ -237,6 +314,7 @@ export class CodexEventMonitor {
       const currentStat = await handle.stat();
       const currentFileId = `${currentStat.dev}:${currentStat.ino}`;
       if (currentFileId === fileId) {
+        if (currentStat.size > fileStat.size) continue;
         await handle.close();
         return;
       }
@@ -249,10 +327,29 @@ export class CodexEventMonitor {
     handle: FileHandle,
     fileId: string,
     fileSize: number,
+    origin: ProcessingOrigin,
   ): Promise<void> {
-    const cursor = await this.store.getNotificationCursor(filePath);
+    let cursor = await this.store.getNotificationCursor(filePath);
+    const generation = this.generations.get(filePath);
+    const trackReplacement = origin !== 'direct' && this.state === 'started';
+    if (!cursor && !generation && trackReplacement) {
+      cursor = await makeBaselineCursor(handle, filePath, fileId, 0);
+      await this.store.upsertNotificationCursor(cursor);
+      this.setGeneration(filePath, fileId, 'active');
+    }
     if (!cursor || cursor.fileId !== fileId || fileSize < cursor.byteOffset) {
       await this.baseline(handle, filePath, fileId, fileSize);
+      this.setGeneration(
+        filePath,
+        fileId,
+        trackReplacement && Boolean(generation || cursor) ? 'replacing' : 'active',
+      );
+      return;
+    }
+
+    if (generation?.phase === 'replacing' && origin !== 'direct') {
+      await this.baseline(handle, filePath, fileId, fileSize);
+      this.setGeneration(filePath, fileId, 'replacing');
       return;
     }
 
@@ -260,12 +357,15 @@ export class CodexEventMonitor {
     const continuityHash = hashBytes(precedingBytes);
     if (!cursor.continuityHash) {
       await this.baseline(handle, filePath, fileId, fileSize);
+      this.setGeneration(filePath, fileId, trackReplacement ? 'replacing' : 'active');
       return;
     }
     if (cursor.continuityHash !== continuityHash) {
       await this.baseline(handle, filePath, fileId, fileSize);
+      this.setGeneration(filePath, fileId, trackReplacement ? 'replacing' : 'active');
       return;
     }
+    this.setGeneration(filePath, fileId, generation?.phase ?? 'active');
     if (fileSize === cursor.byteOffset) {
       return;
     }
@@ -348,6 +448,48 @@ export class CodexEventMonitor {
     await this.store.upsertNotificationCursor(
       await makeBaselineCursor(handle, filePath, fileId, byteOffset),
     );
+  }
+
+  private setGeneration(
+    filePath: string,
+    fileId: string,
+    phase: TrackedGeneration['phase'],
+  ): void {
+    const previous = this.generations.get(filePath);
+    this.generations.set(filePath, {
+      fileId,
+      phase,
+      revision: phase === 'replacing' && previous?.phase !== 'replacing'
+        ? (previous?.revision ?? 0) + 1
+        : (previous?.revision ?? 0),
+      lastChangeAt: phase === 'replacing'
+        ? (previous?.phase === 'replacing' ? previous.lastChangeAt : Date.now())
+        : 0,
+    });
+  }
+
+  private scheduleReplacementSettle(filePath: string): void {
+    if (this.state !== 'started') return;
+    const generation = this.generations.get(filePath);
+    if (generation?.phase !== 'replacing') return;
+    const existing = this.replacementTimers.get(filePath);
+    if (existing) clearTimeout(existing);
+    const revision = generation.revision;
+    const timer = setTimeout(() => {
+      this.replacementTimers.delete(filePath);
+      if (this.state !== 'started') return;
+      void this.queueFile(filePath, 'settle').then(() => {
+        const current = this.generations.get(filePath);
+        if (
+          this.state === 'started'
+          && current?.phase === 'replacing'
+          && current.revision === revision
+        ) {
+          this.setGeneration(filePath, current.fileId, 'active');
+        }
+      }).catch(() => undefined);
+    }, REPLACEMENT_QUIET_MS);
+    this.replacementTimers.set(filePath, timer);
   }
 }
 

@@ -28,6 +28,17 @@ import type {
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const require = createRequire(import.meta.url);
 const sqlWasmDir = dirname(require.resolve('sql.js/dist/sql-wasm.wasm'));
+const SQLITE_HEADER = Buffer.from('SQLite format 3\0', 'ascii');
+const EXPECTED_SESSION_COLUMNS = new Set([
+  'id',
+  'key',
+  'agent_name',
+  'agent_session_id',
+  'working_directory',
+  'state',
+  'created_at',
+  'last_active_at',
+]);
 
 export class SessionStore {
   private db: Database;
@@ -43,22 +54,38 @@ export class SessionStore {
       locateFile: (file: string) => join(sqlWasmDir, file),
     });
     let db: Database;
+    let openedExistingSnapshot = false;
 
     if (dbPath === ':memory:') {
       db = new SQL.Database();
     } else {
       hardenDatabaseSnapshotModes(dbPath);
       const mainExists = existsSync(dbPath);
+      const backupPath = databaseBackupPath(dbPath);
+      const backupExists = existsSync(backupPath);
       const mainSnapshot = loadDatabaseSnapshot(SQL, dbPath);
-      if (mainSnapshot) {
+      const backupSnapshot = loadDatabaseSnapshot(SQL, backupPath);
+      if (
+        mainSnapshot
+        && backupSnapshot
+        && backupSupersedesPendingTerminalState(
+          mainSnapshot.database,
+          backupSnapshot.database,
+        )
+      ) {
+        mainSnapshot.database.close();
+        restoreDatabaseSnapshot(dbPath, backupSnapshot.bytes);
+        db = backupSnapshot.database;
+        openedExistingSnapshot = true;
+      } else if (mainSnapshot) {
+        backupSnapshot?.database.close();
         db = mainSnapshot.database;
+        openedExistingSnapshot = true;
       } else {
-        const backupPath = databaseBackupPath(dbPath);
-        const backupExists = existsSync(backupPath);
-        const backupSnapshot = loadDatabaseSnapshot(SQL, backupPath);
         if (backupSnapshot) {
           restoreDatabaseSnapshot(dbPath, backupSnapshot.bytes);
           db = backupSnapshot.database;
+          openedExistingSnapshot = true;
         } else if (mainExists || backupExists) {
           throw new Error('Session database has no valid snapshot');
         } else {
@@ -120,7 +147,12 @@ export class SessionStore {
     const deliverySchemaMigrated = ensureNotificationDeliveryColumns(db);
 
     const store = new SessionStore(db, dbPath);
-    if (cursorSchemaMigrated || deliverySchemaMigrated) store.save();
+    if (openedExistingSnapshot) {
+      compactDatabaseForPrivacy(db);
+      saveDatabaseSnapshotPair(dbPath, Buffer.from(db.export()));
+    } else if (cursorSchemaMigrated || deliverySchemaMigrated) {
+      store.save();
+    }
     return store;
   }
 
@@ -444,6 +476,7 @@ export class SessionStore {
   }
 
   async markNotificationDelivered(eventKey: string, deliveredAt: number): Promise<void> {
+    this.db.run('PRAGMA secure_delete = ON');
     this.db.run(
       `UPDATE notification_deliveries
        SET event_json = '{}',
@@ -460,6 +493,7 @@ export class SessionStore {
        WHERE event_key = ? AND status = 'pending'`,
       [deliveredAt, eventKey],
     );
+    this.db.run('VACUUM');
     this.saveTerminalSnapshot();
   }
 
@@ -467,6 +501,7 @@ export class SessionStore {
     eventKey: string,
     status: 'failed' | 'discarded' = 'failed',
   ): Promise<void> {
+    this.db.run('PRAGMA secure_delete = ON');
     this.db.run(
       `UPDATE notification_deliveries
        SET event_json = '{}',
@@ -483,6 +518,7 @@ export class SessionStore {
        WHERE event_key = ? AND status = 'pending'`,
       [status, eventKey],
     );
+    this.db.run('VACUUM');
     this.saveTerminalSnapshot();
   }
 
@@ -495,7 +531,7 @@ export class SessionStore {
   private saveTerminalSnapshot(): void {
     if (this.dbPath === ':memory:') return;
     const data = this.db.export();
-    saveDatabaseSnapshot(this.dbPath, Buffer.from(data), true);
+    saveDatabaseSnapshotPair(this.dbPath, Buffer.from(data));
   }
 
   close(): void {
@@ -542,10 +578,16 @@ function loadDatabaseSnapshot(
   if (!existsSync(path)) return null;
   chmodSync(path, 0o600);
   const bytes = readFileSync(path);
+  if (bytes.length < 100 || !bytes.subarray(0, SQLITE_HEADER.length).equals(SQLITE_HEADER)) {
+    return null;
+  }
   let database: Database | undefined;
   try {
     database = new SQL.Database(bytes);
-    database.run('PRAGMA schema_version');
+    if (!hasValidIntegrity(database) || !hasExpectedSessionsSchema(database)) {
+      database.close();
+      return null;
+    }
     return { database, bytes };
   } catch {
     database?.close();
@@ -556,7 +598,6 @@ function loadDatabaseSnapshot(
 function saveDatabaseSnapshot(
   dbPath: string,
   data: Buffer,
-  mirrorCurrentToBackup = false,
 ): void {
   const directory = dirname(dbPath);
   mkdirSync(directory, { recursive: true, mode: 0o700 });
@@ -566,14 +607,35 @@ function saveDatabaseSnapshot(
 
   try {
     writeDurableFile(liveTemp, data);
-    if (existsSync(dbPath) || mirrorCurrentToBackup) {
+    if (existsSync(dbPath)) {
       if (existsSync(dbPath)) chmodSync(dbPath, 0o600);
-      const backupData = mirrorCurrentToBackup ? data : readFileSync(dbPath);
-      writeDurableFile(backupTemp, backupData);
+      writeDurableFile(backupTemp, readFileSync(dbPath));
       renameSync(backupTemp, databaseBackupPath(dbPath));
       chmodSync(databaseBackupPath(dbPath), 0o600);
       fsyncDirectory(directory);
     }
+    renameSync(liveTemp, dbPath);
+    chmodSync(dbPath, 0o600);
+    fsyncDirectory(directory);
+  } finally {
+    rmSync(liveTemp, { force: true });
+    rmSync(backupTemp, { force: true });
+  }
+}
+
+function saveDatabaseSnapshotPair(dbPath: string, data: Buffer): void {
+  const directory = dirname(dbPath);
+  mkdirSync(directory, { recursive: true, mode: 0o700 });
+  const token = `${process.pid}-${randomUUID()}`;
+  const liveTemp = join(directory, `.${basename(dbPath)}.tmp-${token}`);
+  const backupTemp = join(directory, `.${basename(dbPath)}.bak.tmp-${token}`);
+
+  try {
+    writeDurableFile(liveTemp, data);
+    writeDurableFile(backupTemp, data);
+    renameSync(backupTemp, databaseBackupPath(dbPath));
+    chmodSync(databaseBackupPath(dbPath), 0o600);
+    fsyncDirectory(directory);
     renameSync(liveTemp, dbPath);
     chmodSync(dbPath, 0o600);
     fsyncDirectory(directory);
@@ -614,6 +676,74 @@ function fsyncDirectory(directory: string): void {
     fsyncSync(descriptor);
   } finally {
     closeSync(descriptor);
+  }
+}
+
+function compactDatabaseForPrivacy(db: Database): void {
+  db.run('PRAGMA secure_delete = ON');
+  db.run('VACUUM');
+}
+
+function hasValidIntegrity(db: Database): boolean {
+  const stmt = db.prepare('PRAGMA integrity_check');
+  const hasRow = stmt.step();
+  const result = hasRow ? Object.values(stmt.getAsObject())[0] : undefined;
+  const valid = result === 'ok' && !stmt.step();
+  stmt.free();
+  return valid;
+}
+
+function hasExpectedSessionsSchema(db: Database): boolean {
+  const stmt = db.prepare('PRAGMA table_info(sessions)');
+  const names = new Set<unknown>();
+  while (stmt.step()) names.add(stmt.getAsObject().name);
+  stmt.free();
+  return names.size === EXPECTED_SESSION_COLUMNS.size
+    && [...EXPECTED_SESSION_COLUMNS].every((name) => names.has(name));
+}
+
+function backupSupersedesPendingTerminalState(main: Database, backup: Database): boolean {
+  const mainStatuses = readDeliveryStatuses(main);
+  const backupStatuses = readDeliveryStatuses(backup);
+  if (!mainStatuses || !backupStatuses) return false;
+  for (const [eventKey, current] of mainStatuses) {
+    const recovered = backupStatuses.get(eventKey);
+    if (
+      current.status === 'pending'
+      && recovered?.eventJson === '{}'
+      && ['delivered', 'failed', 'discarded'].includes(recovered.status)
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function readDeliveryStatuses(
+  db: Database,
+): Map<string, { eventJson: string; status: string }> | null {
+  try {
+    const stmt = db.prepare(
+      'SELECT event_key, event_json, status FROM notification_deliveries',
+    );
+    const statuses = new Map<string, { eventJson: string; status: string }>();
+    while (stmt.step()) {
+      const row = stmt.getAsObject();
+      if (
+        typeof row.event_key === 'string'
+        && typeof row.event_json === 'string'
+        && typeof row.status === 'string'
+      ) {
+        statuses.set(row.event_key, {
+          eventJson: row.event_json,
+          status: row.status,
+        });
+      }
+    }
+    stmt.free();
+    return statuses;
+  } catch {
+    return null;
   }
 }
 

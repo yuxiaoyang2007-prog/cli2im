@@ -65,6 +65,51 @@ describe('CodexEventMonitor', () => {
     );
   });
 
+  it('processes a rollout first created after watcher startup from byte zero', async () => {
+    const { file, monitor, onEvent } = await setup();
+    await monitor.start();
+    const liveQuestion = makeQuestionLine('live-created-question');
+    const liveCompletion = JSON.stringify({
+      type: 'event_msg',
+      payload: {
+        type: 'task_complete',
+        turn_id: 'turn_live_created',
+        completed_at: 2000,
+      },
+    });
+
+    await writeFile(file, `${liveQuestion}\n${liveCompletion}\n`);
+    await waitFor(() => onEvent.mock.calls.length === 2);
+
+    expect(onEvent.mock.calls.map(([event]) => event.type)).toEqual(['question', 'completed']);
+    expect(onEvent).toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'question', requestId: 'live-created-question' }),
+      file,
+    );
+  });
+
+  it('suppresses slow non-atomic replacement history and resumes a later append', async () => {
+    const { file, monitor, onEvent } = await setup();
+    await writeFile(file, `${historicalCompletion}\n`);
+    await monitor.start();
+    const replacementHistory = makeQuestionLine('slow-replacement-history');
+    const futureAppend = makeQuestionLine('after-slow-replacement');
+
+    await writeFile(file, '');
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    await appendFile(file, `${replacementHistory}\n`);
+    await new Promise((resolve) => setTimeout(resolve, 350));
+
+    expect(onEvent).not.toHaveBeenCalled();
+
+    await appendFile(file, `${futureAppend}\n`);
+    await waitFor(() => onEvent.mock.calls.length === 1);
+    expect(onEvent).toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'question', requestId: 'after-slow-replacement' }),
+      file,
+    );
+  });
+
   it('keeps an incomplete final line unread until the newline arrives', async () => {
     const { file, monitor, onEvent } = await setup();
     await writeFile(file, '');
@@ -236,6 +281,18 @@ describe('CodexEventMonitor', () => {
     });
     const legacyDb = new SQL.Database();
     legacyDb.run(`
+      CREATE TABLE sessions (
+        id TEXT PRIMARY KEY,
+        key TEXT UNIQUE NOT NULL,
+        agent_name TEXT NOT NULL,
+        agent_session_id TEXT,
+        working_directory TEXT NOT NULL,
+        state TEXT NOT NULL DEFAULT 'active',
+        created_at INTEGER NOT NULL,
+        last_active_at INTEGER NOT NULL
+      )
+    `);
+    legacyDb.run(`
       CREATE TABLE notification_cursors (
         file_path TEXT PRIMARY KEY,
         file_id TEXT NOT NULL,
@@ -351,6 +408,121 @@ describe('CodexEventMonitor', () => {
     await new Promise((resolve) => setTimeout(resolve, 30));
 
     expect(await store.getNotificationCursor(laterFile)).toBeNull();
+  });
+
+  it('serializes concurrent rediscovery scans', async () => {
+    const { file, onEvent, sessionsDir, store } = await setup();
+    await monitors.pop()?.stop();
+    await writeFile(file, `${historicalCompletion}\n`);
+    let block = false;
+    let active = 0;
+    let maxActive = 0;
+    let enteredResolve!: () => void;
+    let releaseResolve!: () => void;
+    const entered = new Promise<void>((resolve) => { enteredResolve = resolve; });
+    const release = new Promise<void>((resolve) => { releaseResolve = resolve; });
+    const blockingStore = {
+      getNotificationCursor: async (filePath: string) => {
+        active += 1;
+        maxActive = Math.max(maxActive, active);
+        if (block) {
+          enteredResolve();
+          await release;
+        }
+        try {
+          return await store.getNotificationCursor(filePath);
+        } finally {
+          active -= 1;
+        }
+      },
+      upsertNotificationCursor: store.upsertNotificationCursor.bind(store),
+      upsertNotificationCursors: store.upsertNotificationCursors.bind(store),
+    };
+    const monitor = new CodexEventMonitor({ sessionsDir, store: blockingStore, onEvent });
+    monitors.push(monitor);
+    await monitor.start();
+    block = true;
+    const discover = (monitor as unknown as { discoverFiles(): Promise<void> }).discoverFiles.bind(
+      monitor,
+    );
+
+    const first = discover();
+    await entered;
+    const second = discover();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    expect(maxActive).toBe(1);
+
+    releaseResolve();
+    await Promise.all([first, second]);
+  });
+
+  it('drains an in-flight rediscovery before stop resolves and starts no later work', async () => {
+    const { file, onEvent, sessionsDir, store } = await setup();
+    await monitors.pop()?.stop();
+    const monitor = new CodexEventMonitor({
+      sessionsDir,
+      store: {
+        getNotificationCursor: async (filePath: string) => {
+          enteredResolve();
+          await release;
+          return store.getNotificationCursor(filePath);
+        },
+        upsertNotificationCursor: store.upsertNotificationCursor.bind(store),
+        upsertNotificationCursors: store.upsertNotificationCursors.bind(store),
+      },
+      onEvent,
+    });
+    monitors.push(monitor);
+    let enteredResolve!: () => void;
+    let releaseResolve!: () => void;
+    const entered = new Promise<void>((resolve) => { enteredResolve = resolve; });
+    const release = new Promise<void>((resolve) => { releaseResolve = resolve; });
+    await monitor.start();
+    await writeFile(file, `${makeQuestionLine('stop-drain-live')}\n`);
+    const discover = (monitor as unknown as { discoverFiles(): Promise<void> }).discoverFiles.bind(
+      monitor,
+    );
+    const scanning = discover();
+    await entered;
+
+    const stopping = monitor.stop();
+    const earlyResult = await Promise.race([
+      stopping.then(() => 'stopped'),
+      new Promise<'waiting'>((resolve) => setTimeout(() => resolve('waiting'), 30)),
+    ]);
+    expect(earlyResult).toBe('waiting');
+
+    releaseResolve();
+    await Promise.all([scanning, stopping]);
+    const callsAfterStop = onEvent.mock.calls.length;
+    const cursorAfterStop = await store.getNotificationCursor(file);
+    await appendFile(file, `${makeQuestionLine('after-stop')}\n`);
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    expect(onEvent).toHaveBeenCalledTimes(callsAfterStop);
+    expect(await store.getNotificationCursor(file)).toEqual(cursorAfterStop);
+  });
+
+  it('loops over same-inode growth that occurs during a discovery callback', async () => {
+    const { file, sessionsDir, store } = await setup();
+    await monitors.pop()?.stop();
+    await writeFile(file, `${historicalCompletion}\n`);
+    const first = makeQuestionLine('scan-growth-first');
+    const second = makeQuestionLine('scan-growth-second');
+    const requestIds: string[] = [];
+    const onEvent = vi.fn(async (event: ParsedRolloutLine) => {
+      if (event.type !== 'question') return;
+      requestIds.push(event.requestId);
+      if (event.requestId === 'scan-growth-first') await appendFile(file, `${second}\n`);
+    });
+    const monitor = new CodexEventMonitor({ sessionsDir, store, onEvent });
+    monitors.push(monitor);
+    await monitor.processFile(file);
+    await appendFile(file, `${first}\n`);
+
+    await (monitor as unknown as { discoverFiles(): Promise<void> }).discoverFiles();
+
+    expect(requestIds).toEqual(['scan-growth-first', 'scan-growth-second']);
   });
 
   it('discovers rollout files sequentially and durably baselines them with one save', async () => {
@@ -474,4 +646,12 @@ function makeQuestionLine(requestId: string, question = 'synthetic question'): s
       internal_chat_message_metadata_passthrough: { turn_id: `turn_${requestId}` },
     },
   });
+}
+
+async function waitFor(condition: () => boolean, timeoutMs = 1500): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!condition()) {
+    if (Date.now() >= deadline) throw new Error('Timed out waiting for monitor event');
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
 }
