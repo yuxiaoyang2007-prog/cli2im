@@ -73,8 +73,8 @@ export function eventKey(parts: string[]): string {
 function parseSessionMeta(payload: Record<string, unknown>): ParsedRolloutLine | null {
   const sessionId = asString(payload.id);
   const cwd = asString(payload.cwd);
-  const source = asString(payload.source);
-  if (!sessionId || !cwd || !source) return null;
+  if (!sessionId || !cwd) return null;
+  const source = normalizeSessionSource(payload.source, payload.originator);
   return { type: 'session_meta', sessionId, cwd, source };
 }
 
@@ -151,6 +151,45 @@ function safeAttachmentName(item: Record<string, unknown>): string {
     return sanitizeTaskTitle(basename(value.replaceAll('\\', '/')));
   }
   return '';
+}
+
+function normalizeSessionSource(source: unknown, originator: unknown): string {
+  if (isRecord(source)) {
+    return Object.hasOwn(source, 'subagent') ? 'subagent' : 'unknown';
+  }
+  if (typeof source !== 'string') return 'unknown';
+
+  switch (source.trim().toLowerCase()) {
+    case 'vscode':
+      return typeof originator === 'string'
+        && originator.trim().toLowerCase() === 'codex desktop'
+        ? 'codex-desktop'
+        : 'vscode';
+    case 'exec':
+    case 'cli':
+    case 'codex-cli':
+    case 'codex_cli':
+      return 'cli';
+    case 'codex-desktop':
+    case 'codex_desktop':
+    case 'desktop':
+      return 'codex-desktop';
+    case 'chatgpt':
+    case 'chatgpt-work':
+    case 'chatgpt_work':
+    case 'work':
+      return 'chatgpt-work';
+    case 'ide':
+    case 'jetbrains':
+      return 'ide';
+    case 'codexbot':
+    case 'cli2im':
+      return 'codexbot';
+    case 'subagent':
+      return 'subagent';
+    default:
+      return 'unknown';
+  }
 }
 
 function asString(value: unknown): string | undefined {

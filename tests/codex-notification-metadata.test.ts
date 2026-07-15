@@ -40,6 +40,44 @@ const syntheticSecret = true;
     expect(title).toBe('Review [REDACTED] password=[REDACTED] [REDACTED] remaining text');
   });
 
+  it('keeps only basenames from absolute POSIX paths', () => {
+    const title = sanitizeTaskTitle(
+      '请检查 /tmp/private/run.log 和 /var/log/service/app.log 后继续',
+    );
+
+    expect(title).toBe('请检查 run.log 和 app.log 后继续');
+    expect(title).not.toContain('/tmp/private');
+    expect(title).not.toContain('/var/log/service');
+  });
+
+  it('consumes complete quoted named-secret values including spaces', () => {
+    const title = sanitizeTaskTitle(
+      'Rotate password="alpha beta" and token=\'gamma delta\' now',
+    );
+
+    expect(title).toBe('Rotate password=[REDACTED] and token=[REDACTED] now');
+    expect(title).not.toContain('alpha beta');
+    expect(title).not.toContain('gamma delta');
+  });
+
+  it.each([
+    ['shell command', 'echo "deploy" && rm -rf /tmp/private'],
+    ['unfenced code', 'const secretValue = process.env.SYNTHETIC_TOKEN;'],
+    ['unfenced assignment', 'result = await runTask();'],
+    ['unfenced JSON', '{"command":"synthetic","ok":true}'],
+    ['diff', 'diff --git a/src/old.ts b/src/new.ts'],
+    ['log line', '[2026-07-15T12:00:00.000Z] ERROR synthetic failure'],
+  ])('rejects a task title that is principally a %s', (_kind, value) => {
+    expect(sanitizeTaskTitle(value)).toBe('');
+  });
+
+  it('keeps natural-language requests that mention technical commands', () => {
+    expect(sanitizeTaskTitle('请运行 npm test 并总结失败原因')).toBe('请运行 npm test 并总结失败原因');
+    expect(sanitizeTaskTitle('Please review the git diff and explain the change')).toBe(
+      'Please review the git diff and explain the change',
+    );
+  });
+
   it('truncates CJK-heavy and Latin-heavy titles by Unicode code points', () => {
     expect(Array.from(sanitizeTaskTitle('测'.repeat(45)))).toHaveLength(40);
     expect(Array.from(sanitizeTaskTitle('a'.repeat(90)))).toHaveLength(80);
@@ -133,6 +171,54 @@ describe('NotificationMetadataResolver', () => {
       surface: 'codexbot',
       shortTaskId: 'attachme',
     });
+  });
+
+  it('falls through unsafe technical titles to the next safe source or fallback', async () => {
+    const codexDir = makeTemporaryDirectory();
+    await writeFile(join(codexDir, 'session_index.jsonl'), JSON.stringify({
+      id: 'unsafe-index',
+      thread_name: 'diff --git a/private.ts b/private.ts',
+    }), 'utf8');
+    const resolver = new NotificationMetadataResolver({ codexDir, resolveGitRoot: async () => null });
+
+    expect((await resolver.resolve({
+      sessionId: 'unsafe-index',
+      cwd: '/workspace/project',
+      source: 'cli',
+      userText: 'Review the notification privacy boundary',
+      attachmentName: undefined,
+    })).taskName).toBe('Review the notification privacy boundary');
+
+    expect((await resolver.resolve({
+      sessionId: 'unsafe-attachment',
+      cwd: '/workspace/project',
+      source: 'cli',
+      userText: 'npm test -- --runInBand',
+      attachmentName: '/tmp/private/report.pdf',
+    })).taskName).toBe('处理文件：report.pdf');
+
+    expect((await resolver.resolve({
+      sessionId: 'fallback-1234',
+      cwd: '/workspace/project',
+      source: 'cli',
+      userText: '[2026-07-15T12:00:00Z] ERROR synthetic failure',
+      attachmentName: undefined,
+    })).taskName).toBe('未命名任务 · fallback');
+  });
+
+  it('maps normalized parser sources to accurate surfaces', async () => {
+    const codexDir = makeTemporaryDirectory();
+    const resolver = new NotificationMetadataResolver({ codexDir, resolveGitRoot: async () => null });
+    const base = {
+      sessionId: 'surface-1234',
+      cwd: '/workspace/project',
+      userText: 'Safe task title',
+      attachmentName: undefined,
+    };
+
+    expect((await resolver.resolve({ ...base, source: 'codex-desktop' })).surface).toBe('Codex Desktop');
+    expect((await resolver.resolve({ ...base, source: 'exec' })).surface).toBe('CLI');
+    expect((await resolver.resolve({ ...base, source: 'vscode' })).surface).toBe('IDE');
   });
 
   it('caches Git-root resolution per cwd and never exposes the cwd', async () => {

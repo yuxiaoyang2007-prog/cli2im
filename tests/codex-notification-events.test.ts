@@ -37,6 +37,49 @@ describe('Codex notification event parsing', () => {
     });
   });
 
+  it('normalizes object-valued subagent sources without retaining the object', () => {
+    const parsed = parseRolloutLine(JSON.stringify({
+      type: 'session_meta',
+      payload: {
+        id: 'session_subagent',
+        cwd: '/workspace/project',
+        source: {
+          subagent: { thread_spawn: { parent_thread_id: 'synthetic-parent' } },
+          secret: 'synthetic-source-secret',
+        },
+      },
+    }));
+
+    expect(parsed).toEqual({
+      type: 'session_meta',
+      sessionId: 'session_subagent',
+      cwd: '/workspace/project',
+      source: 'subagent',
+    });
+    expect(JSON.stringify(parsed)).not.toContain('synthetic-parent');
+    expect(JSON.stringify(parsed)).not.toContain('synthetic-source-secret');
+  });
+
+  it('normalizes allowlisted source and origin combinations', () => {
+    function session(source: unknown, originator?: unknown) {
+      return parseRolloutLine(JSON.stringify({
+        type: 'session_meta',
+        payload: {
+          id: 'session_1',
+          cwd: '/workspace/project',
+          source,
+          ...(originator === undefined ? {} : { originator }),
+        },
+      }));
+    }
+
+    expect(session('vscode', 'Codex Desktop')).toMatchObject({ source: 'codex-desktop' });
+    expect(session('exec')).toMatchObject({ source: 'cli' });
+    expect(session('vscode')).toMatchObject({ source: 'vscode' });
+    expect(session('vscode', 'synthetic-arbitrary-origin')).toMatchObject({ source: 'vscode' });
+    expect(JSON.stringify(session('vscode', 'synthetic-arbitrary-origin'))).not.toContain('synthetic-arbitrary-origin');
+  });
+
   it('extracts only a sanitized user-message title candidate', () => {
     const parsed = parseRolloutLine(JSON.stringify({
       type: 'response_item',
@@ -60,6 +103,20 @@ describe('Codex notification event parsing', () => {
     expect(JSON.stringify(parsed)).not.toContain('/Users/test');
     expect(JSON.stringify(parsed)).not.toContain('synthetic-secret-value');
     expect(JSON.stringify(parsed)).not.toContain('never retain');
+  });
+
+  it('does not emit a raw technical user-message candidate', () => {
+    const parsed = parseRolloutLine(JSON.stringify({
+      type: 'response_item',
+      payload: {
+        type: 'message',
+        role: 'user',
+        content: [{ type: 'input_text', text: 'git diff -- src/private.ts' }],
+        internal_chat_message_metadata_passthrough: { turn_id: 'turn_1' },
+      },
+    }));
+
+    expect(parsed).toBeNull();
   });
 
   it('parses request_user_input as a question event without retaining arguments', () => {

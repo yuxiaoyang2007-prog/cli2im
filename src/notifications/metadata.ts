@@ -8,15 +8,19 @@ const execFileAsync = promisify(execFile);
 
 const PRIVATE_KEY = /-----BEGIN [A-Z ]*PRIVATE KEY-----/gi;
 const OPENAI_STYLE_KEY = /\b(?:sk|sess)-[A-Za-z0-9_-]{12,}\b/g;
-const NAMED_SECRET = /\b(token|password|passwd|secret|cookie|api[_-]?key)\s*[:=]\s*\S+/gi;
-const HOME_PATH = /\/(?:Users|home)\/[^/\s]+\//g;
+const NAMED_SECRET = /\b(token|password|passwd|secret|cookie|api[_-]?key)\s*[:=]\s*(?:"[^"\r\n]*"|'[^'\r\n]*'|\S+)/gi;
 const URL_QUERY = /(https?:\/\/[^\s?#]+)(?:[?#]\S*)/g;
 
-const HOME_FULL_PATH = /\/(?:Users|home)\/[^/\s]+\/(?:[^\s/]+\/)*([^\s/]+)/g;
+const QUOTED_ABSOLUTE_POSIX_PATH = /(["'])(\/(?!\/)[^"'\r\n]*)\1/g;
+const ABSOLUTE_POSIX_PATH = /(?<![:/A-Za-z0-9._-])\/(?!\/)((?:[^\s/"'`<>|)\],;!?}]+\/)*[^\s/"'`<>|)\],;!?}]+)/g;
 const MARKDOWN_LINK = /\[([^\]]+)]\([^\s)]+\)/g;
 const CODE_FENCE = /```[\s\S]*?```/g;
 const CJK = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/u;
 const IMAGE_EXTENSION = /\.(?:avif|bmp|gif|heic|jpeg|jpg|png|tiff|webp)$/i;
+const SHELL_COMMAND = /^(?:[$#]\s*)?(?:(?:[A-Za-z_][A-Za-z0-9_]*=\S+)\s+)*(?:sudo\s+)?(?:bash|sh|zsh|fish|cd|ls|cat|echo|printf|cp|mv|rm|mkdir|touch|chmod|chown|curl|wget|git|diff|grep|rg|sed|awk|find|xargs|npm|npx|pnpm|yarn|node|python|python3|pip|pip3|docker|docker-compose|kubectl|ssh|scp|rsync|tar|make|cmake|cargo|go)\b/i;
+const CODE_LINE = /^(?:(?:async\s+)?function|const|let|var|class|interface|type|enum|namespace|import|export|def)\b|^(?:console\.log|print)\s*\(|^(?:[A-Za-z_$][\w$]*\.)+[A-Za-z_$][\w$]*\s*\([^)]*\)\s*;?$|^[A-Za-z_$][\w$]*(?:\.[\w$]+)*\s*=(?!=)\s*\S|^\{\s*"[^"]+"\s*:|^\[\s*(?:\{|\[|"|-?\d|true\b|false\b|null\b)|^<[/!]?[A-Za-z][^>]*>/;
+const DIFF_LINE = /^(?:diff --git\b|index [0-9a-f]+\.{2}[0-9a-f]+\b|---\s+\S+|\+\+\+\s+\S+|@@\s+-\d)/i;
+const LOG_LINE = /^(?:\[\d{4}-\d{2}-\d{2}[T ][^\]]*]\s*|\d{4}-\d{2}-\d{2}[T ]\S+\s+)(?:TRACE|DEBUG|INFO|WARN|WARNING|ERROR|FATAL)\b|^(?:TRACE|DEBUG|INFO|WARN|WARNING|ERROR|FATAL)\s+[\[:]/;
 
 const WRAPPER_BLOCKS = [
   'environment_context',
@@ -66,8 +70,8 @@ export function sanitizeTaskTitle(value: string): string {
     .replace(PRIVATE_KEY, '[REDACTED]')
     .replace(OPENAI_STYLE_KEY, '[REDACTED]')
     .replace(NAMED_SECRET, (_match, name: string) => `${name}=[REDACTED]`)
-    .replace(HOME_FULL_PATH, '$1')
-    .replace(HOME_PATH, '')
+    .replace(QUOTED_ABSOLUTE_POSIX_PATH, (_match, _quote: string, path: string) => basename(path))
+    .replace(ABSOLUTE_POSIX_PATH, (_match, path: string) => basename(path))
     .replace(/[ \t]+/g, ' ');
 
   const firstMeaningfulLine = sanitized
@@ -75,7 +79,9 @@ export function sanitizeTaskTitle(value: string): string {
     .map((line) => line.trim())
     .find(Boolean) ?? '';
 
-  return truncateTitle(firstMeaningfulLine);
+  return isUnsafeTechnicalTitle(firstMeaningfulLine)
+    ? ''
+    : truncateTitle(firstMeaningfulLine);
 }
 
 export class NotificationMetadataResolver {
@@ -181,6 +187,7 @@ function resolveSurface(source: string): CodexSurface {
     case 'desktop':
       return 'Codex Desktop';
     case 'cli':
+    case 'exec':
     case 'codex-cli':
     case 'codex_cli':
       return 'CLI';
@@ -194,6 +201,13 @@ function resolveSurface(source: string): CodexSurface {
     default:
       return 'Codex';
   }
+}
+
+function isUnsafeTechnicalTitle(value: string): boolean {
+  return SHELL_COMMAND.test(value)
+    || CODE_LINE.test(value)
+    || DIFF_LINE.test(value)
+    || LOG_LINE.test(value);
 }
 
 function truncateTitle(value: string): string {
