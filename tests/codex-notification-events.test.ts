@@ -73,11 +73,13 @@ describe('Codex notification event parsing', () => {
       }));
     }
 
-    expect(session('vscode', 'Codex Desktop')).toMatchObject({ source: 'codex-desktop' });
+    expect(session('exec', 'Codex Desktop')).toMatchObject({ source: 'codex-desktop' });
+    expect(session('exec', 'codex_exec')).toMatchObject({ source: 'cli' });
+    expect(session('vscode', 'codex_chrome_sidepanel')).toMatchObject({ source: 'codex' });
     expect(session('exec')).toMatchObject({ source: 'cli' });
     expect(session('vscode')).toMatchObject({ source: 'vscode' });
-    expect(session('vscode', 'synthetic-arbitrary-origin')).toMatchObject({ source: 'vscode' });
-    expect(JSON.stringify(session('vscode', 'synthetic-arbitrary-origin'))).not.toContain('synthetic-arbitrary-origin');
+    expect(session('exec', 'synthetic-arbitrary-origin')).toMatchObject({ source: 'codex' });
+    expect(JSON.stringify(session('exec', 'synthetic-arbitrary-origin'))).not.toContain('synthetic-arbitrary-origin');
   });
 
   it('extracts only a sanitized user-message title candidate', () => {
@@ -117,6 +119,25 @@ describe('Codex notification event parsing', () => {
     }));
 
     expect(parsed).toBeNull();
+  });
+
+  it('keeps a sanitized technical-looking attachment basename', () => {
+    const parsed = parseRolloutLine(JSON.stringify({
+      type: 'response_item',
+      payload: {
+        type: 'message',
+        role: 'user',
+        content: [{ type: 'input_file', filename: '/tmp/private/git diff.txt' }],
+        internal_chat_message_metadata_passthrough: { turn_id: 'turn_1' },
+      },
+    }));
+
+    expect(parsed).toEqual({
+      type: 'user_message',
+      turnId: 'turn_1',
+      attachmentName: 'git diff.txt',
+    });
+    expect(JSON.stringify(parsed)).not.toContain('/tmp/private');
   });
 
   it('parses request_user_input as a question event without retaining arguments', () => {

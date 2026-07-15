@@ -50,6 +50,29 @@ const syntheticSecret = true;
     expect(title).not.toContain('/var/log/service');
   });
 
+  it.each([
+    ['file triple-slash URI', 'Open file:///Users/test/private/report.csv', 'Open report.csv'],
+    ['file single-slash URI', 'Open file:/Users/test/private/report.csv', 'Open report.csv'],
+    ['VS Code file URI', 'Open vscode://file/Users/test/private/report.csv', 'Open report.csv'],
+  ])('removes directories from a %s', (_kind, value, expected) => {
+    const title = sanitizeTaskTitle(value);
+    expect(title).toBe(expected);
+    expect(title).not.toContain('/Users/test/private');
+  });
+
+  it('keeps an HTTP URL only after removing its query and fragment', () => {
+    expect(sanitizeTaskTitle(
+      'Open https://example.test/private/report.csv?token=synthetic#section',
+    )).toBe('Open https://example.test/private/report.csv');
+  });
+
+  it.each([
+    'Analyze /tmp/private folder/report.csv and summarize',
+    'Analyze /tmp/private with spaces/report.csv',
+  ])('rejects an ambiguous unquoted absolute path containing spaces', (value) => {
+    expect(sanitizeTaskTitle(value)).toBe('');
+  });
+
   it('consumes complete quoted named-secret values including spaces', () => {
     const title = sanitizeTaskTitle(
       'Rotate password="alpha beta" and token=\'gamma delta\' now',
@@ -60,6 +83,23 @@ const syntheticSecret = true;
     expect(title).not.toContain('gamma delta');
   });
 
+  it('consumes balanced quoted secrets containing escaped quote characters', () => {
+    const title = sanitizeTaskTitle(String.raw`Rotate password="alpha \"beta\" gamma" and token='delta \'echo\' zeta' now`);
+
+    expect(title).toBe('Rotate password=[REDACTED] and token=[REDACTED] now');
+    expect(title).not.toContain('beta');
+    expect(title).not.toContain('echo');
+  });
+
+  it('consumes unclosed quoted secrets through the end of the candidate', () => {
+    expect(sanitizeTaskTitle('Rotate password="alpha beta credential suffix')).toBe(
+      'Rotate password=[REDACTED]',
+    );
+    expect(sanitizeTaskTitle("Rotate token='gamma delta credential suffix")).toBe(
+      'Rotate token=[REDACTED]',
+    );
+  });
+
   it.each([
     ['shell command', 'echo "deploy" && rm -rf /tmp/private'],
     ['unfenced code', 'const secretValue = process.env.SYNTHETIC_TOKEN;'],
@@ -67,6 +107,14 @@ const syntheticSecret = true;
     ['unfenced JSON', '{"command":"synthetic","ok":true}'],
     ['diff', 'diff --git a/src/old.ts b/src/new.ts'],
     ['log line', '[2026-07-15T12:00:00.000Z] ERROR synthetic failure'],
+    ['lowercase command', 'brew install package'],
+    ['lowercase CLI command', 'gh pr view 1'],
+    ['SQL', 'SELECT * FROM users;'],
+    ['control-flow code', 'if (ready) deploy();'],
+    ['error line', 'Error: failed'],
+    ['stack line', 'at deploy (/tmp/private/app.js:10:2)'],
+    ['shell redirection', 'deploy > /tmp/private/output.log'],
+    ['shell operator expression', 'build && deploy'],
   ])('rejects a task title that is principally a %s', (_kind, value) => {
     expect(sanitizeTaskTitle(value)).toBe('');
   });
@@ -76,6 +124,9 @@ const syntheticSecret = true;
     expect(sanitizeTaskTitle('Please review the git diff and explain the change')).toBe(
       'Please review the git diff and explain the change',
     );
+    expect(sanitizeTaskTitle('Go review the deployment flow')).toBe('Go review the deployment flow');
+    expect(sanitizeTaskTitle('Make the release safer')).toBe('Make the release safer');
+    expect(sanitizeTaskTitle('Find the notification bug')).toBe('Find the notification bug');
   });
 
   it('truncates CJK-heavy and Latin-heavy titles by Unicode code points', () => {
@@ -219,6 +270,27 @@ describe('NotificationMetadataResolver', () => {
     expect((await resolver.resolve({ ...base, source: 'codex-desktop' })).surface).toBe('Codex Desktop');
     expect((await resolver.resolve({ ...base, source: 'exec' })).surface).toBe('CLI');
     expect((await resolver.resolve({ ...base, source: 'vscode' })).surface).toBe('IDE');
+  });
+
+  it('keeps project and attachment basenames separate from technical-title rejection', async () => {
+    const codexDir = makeTemporaryDirectory();
+    const resolver = new NotificationMetadataResolver({
+      codexDir,
+      resolveGitRoot: async () => '/workspace/go',
+    });
+
+    expect(await resolver.resolve({
+      sessionId: 'basename-1234',
+      cwd: '/workspace/fallback',
+      source: 'cli',
+      userText: '',
+      attachmentName: '/tmp/private/git diff.txt',
+    })).toEqual({
+      projectName: 'go',
+      taskName: '处理文件：git diff.txt',
+      surface: 'CLI',
+      shortTaskId: 'basename',
+    });
   });
 
   it('caches Git-root resolution per cwd and never exposes the cwd', async () => {

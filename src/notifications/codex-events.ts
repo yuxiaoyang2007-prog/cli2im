@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { basename } from 'node:path';
-import { sanitizeTaskTitle } from './metadata.js';
+import { sanitizeMetadataBasename, sanitizeTaskTitle } from './metadata.js';
 
 export type ParsedRolloutLine =
   | { type: 'session_meta'; sessionId: string; cwd: string; source: string }
@@ -148,12 +148,35 @@ function safeAttachmentName(item: Record<string, unknown>): string {
   for (const field of ['name', 'filename', 'file_name']) {
     const value = asString(item[field]);
     if (!value) continue;
-    return sanitizeTaskTitle(basename(value.replaceAll('\\', '/')));
+    return sanitizeMetadataBasename(basename(value.replaceAll('\\', '/')));
   }
   return '';
 }
 
 function normalizeSessionSource(source: unknown, originator: unknown): string {
+  const normalizedOriginator = typeof originator === 'string'
+    ? originator.trim().toLowerCase()
+    : '';
+  const hasOriginator = normalizedOriginator.length > 0
+    || (originator !== undefined && originator !== null && typeof originator !== 'string');
+
+  if (hasOriginator) {
+    switch (normalizedOriginator) {
+      case 'codex desktop':
+        return 'codex-desktop';
+      case 'codex_exec':
+      case 'codex exec':
+        return 'cli';
+      case 'codex_chrome_sidepanel':
+      case 'codex chrome sidepanel':
+      case 'codex-chrome-sidepanel':
+      case 'chrome sidepanel':
+        return 'codex';
+      default:
+        return 'codex';
+    }
+  }
+
   if (isRecord(source)) {
     return Object.hasOwn(source, 'subagent') ? 'subagent' : 'unknown';
   }
@@ -161,10 +184,7 @@ function normalizeSessionSource(source: unknown, originator: unknown): string {
 
   switch (source.trim().toLowerCase()) {
     case 'vscode':
-      return typeof originator === 'string'
-        && originator.trim().toLowerCase() === 'codex desktop'
-        ? 'codex-desktop'
-        : 'vscode';
+      return 'vscode';
     case 'exec':
     case 'cli':
     case 'codex-cli':
