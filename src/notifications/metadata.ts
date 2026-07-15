@@ -15,6 +15,7 @@ const IMAGE_EXTENSION = /\.(?:avif|bmp|gif|heic|jpeg|jpg|png|tiff|webp)$/i;
 const CODE_LINE = /^(?:(?:async\s+)?function|const|let|var|class|interface|type|enum|namespace|import|export|def)\b|^(?:console\.log|print)\s*\(|^(?:[A-Za-z_$][\w$]*\.)+[A-Za-z_$][\w$]*\s*\([^)]*\)\s*;?$|^[A-Za-z_$][\w$]*(?:\.[\w$]+)*\s*=(?!=)\s*\S|^\{\s*"[^"]+"\s*:|^\[\s*(?:\{|\[|"|-?\d|true\b|false\b|null\b)|^<[/!]?[A-Za-z][^>]*>/;
 const DIFF_LINE = /^(?:diff --git\b|index [0-9a-f]+\.{2}[0-9a-f]+\b|---\s+\S+|\+\+\+\s+\S+|@@\s+-\d)/i;
 const LOG_LINE = /^[^\p{L}]*(?:\[\d{4}-\d{2}-\d{2}[T ][^\]]*\]\s*|\d{4}-\d{2}-\d{2}[T ]\S+\s+)(?:TRACE|DEBUG|INFO|WARN|WARNING|ERROR|FATAL)\b|^(?:TRACE|DEBUG|INFO|WARN|WARNING|ERROR|FATAL)\s+(?:\[|:)/iu;
+const ISO_TIMESTAMP_LINE = /^[^\p{L}]*(?:\[\s*)?\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/iu;
 const RAW_COMMAND_HEADS = new Set([
   'awk', 'bash', 'brew', 'bun', 'cargo', 'cat', 'cd', 'cmake', 'codex', 'curl',
   'deno', 'deploy', 'docker', 'echo', 'gh', 'git', 'grep', 'kubectl', 'lark-cli',
@@ -43,6 +44,7 @@ const HTTP_URL_IN_TEXT = /\bhttps?:\/\/[^\s/]+(?:\/[^\s]*)?/gi;
 const CLAUSE_CONNECTOR = /^(?:and|then|but|or)\b/i;
 const HTML_TAG = /<[/!]?[A-Za-z][^>]*>/;
 const SHELL_SYNTAX = /&&|\|\||(?:^|\s)\|(?!\|)|(?:^|\s)(?:>>?|<<?)|;(?=\s|$)/;
+const SHELL_WRAPPED_CANDIDATE = /^(?:[^\p{L}]*\([^()\r\n]*\)|[^\p{L}]*`[^`\r\n]*`)$/u;
 const SQL_LINE = /^(?:SELECT|INSERT|UPDATE|DELETE|CREATE|ALTER|DROP|WITH)\b.*(?:\bFROM\b|\bINTO\b|\bTABLE\b|\bSET\b|\*)/;
 const CONTROL_FLOW_LINE = /^(?:if|for|while|switch|try|catch)\s*\(/;
 const ERROR_OR_STACK_LINE = /^(?:(?:[A-Za-z_$][\w$.]*)?(?:Error|Exception)):\s+\S|^at\s+\S+(?:\s+\(|:\d)/i;
@@ -259,9 +261,11 @@ function isUnsafeTechnicalTitle(value: string): boolean {
 }
 
 function hasUnsafePreLexicalStructure(value: string): boolean {
-  return CODE_LINE.test(value)
+  return hasUnsafePreLexicalShellStructure(value)
+    || CODE_LINE.test(value)
     || DIFF_LINE.test(value)
     || LOG_LINE.test(value)
+    || ISO_TIMESTAMP_LINE.test(value)
     || SQL_LINE.test(value)
     || CONTROL_FLOW_LINE.test(value)
     || ERROR_OR_STACK_LINE.test(value)
@@ -269,6 +273,11 @@ function hasUnsafePreLexicalStructure(value: string): boolean {
     || TRACEBACK_HEADER.test(value)
     || SIMPLE_CALL_LINE.test(value)
     || HTML_TAG.test(value);
+}
+
+function hasUnsafePreLexicalShellStructure(value: string): boolean {
+  const shellCandidate = value.replace(/^(?:>\s+)+(?=\p{L})/u, '');
+  return SHELL_WRAPPED_CANDIDATE.test(value) || SHELL_SYNTAX.test(shellCandidate);
 }
 
 function hasUnsafeTechnicalStructure(value: string): boolean {
