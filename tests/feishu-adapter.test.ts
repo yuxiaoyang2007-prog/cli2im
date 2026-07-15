@@ -130,6 +130,58 @@ describe('FeishuAdapter file handling', () => {
     ]);
   });
 
+  it.each([
+    {
+      label: 'an HTTP-200 business error',
+      response: {
+        code: 230003,
+        msg: 'PRIVATE_TEXT_DETAIL bearer-secret-value',
+        data: { message_id: 'must-not-be-accepted' },
+      },
+      category: 'feishu_business_error',
+      message: 'Feishu text create failed',
+    },
+    {
+      label: 'a missing business code',
+      response: { data: { message_id: 'om_unverified' } },
+      category: 'feishu_business_error',
+      message: 'Feishu text create failed',
+    },
+    {
+      label: 'a missing message id',
+      response: { code: 0, data: {} },
+      category: 'feishu_invalid_response',
+      message: 'Feishu text create returned an invalid response',
+    },
+    {
+      label: 'a blank message id',
+      response: { code: 0, data: { message_id: '   ' } },
+      category: 'feishu_invalid_response',
+      message: 'Feishu text create returned an invalid response',
+    },
+  ] as const)('rejects text create with $label without exposing response details', async ({
+    response,
+    category,
+    message,
+  }) => {
+    const adapter = new FeishuAdapter({ appId: 'app', appSecret: 'secret', botName: 'bot' });
+    const client = larkMocks.clients[0];
+    client.im.message.create.mockResolvedValueOnce(response as never);
+
+    const failure = await adapter.send('oc_1', { text: 'binding confirmation' })
+      .catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(FeishuResponseError);
+    expect(failure).toMatchObject({
+      name: 'FeishuResponseError',
+      category,
+      message,
+    });
+    expect(JSON.stringify(failure)).not.toMatch(
+      /230003|PRIVATE_TEXT_DETAIL|bearer-secret-value|must-not-be-accepted|om_unverified/,
+    );
+  });
+
   it('serializes a full replacement card through Feishu message patch', async () => {
     const adapter = new FeishuAdapter({ appId: 'app', appSecret: 'secret', botName: 'bot' });
     const client = larkMocks.clients[0];

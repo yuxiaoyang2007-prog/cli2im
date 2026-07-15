@@ -88,4 +88,17 @@ describe('/notify-me', () => {
       text: '通知绑定失败：请使用获授权的 codexbot 飞书私聊。',
     });
   });
+
+  it('propagates a binding-confirmation delivery failure instead of reporting success', async () => {
+    vi.mocked(adapter.send).mockRejectedValueOnce(new Error('safe transport failure'));
+
+    await expect(runNotifyMe({
+      platform: 'feishu',
+      chatType: 'p2p',
+      userId: 'ou_allowed',
+    })).rejects.toThrow('safe transport failure');
+
+    expect(service.bindTarget).toHaveBeenCalledTimes(1);
+    expect(adapter.send).toHaveBeenCalledTimes(1);
+  });
 });

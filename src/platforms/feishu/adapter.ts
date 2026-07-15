@@ -104,8 +104,7 @@ export class FeishuAdapter implements PlatformAdapter {
       },
     }, options.signal));
     throwIfAborted(options.signal);
-
-    return resp.data?.message_id ?? '';
+    return requireSuccessfulFeishuMessageId(resp, 'text create');
   }
 
   async editMessage(_chatId: string, msgId: string, content: string): Promise<void> {
@@ -300,15 +299,7 @@ export class FeishuAdapter implements PlatformAdapter {
       },
     }, options.signal));
     throwIfAborted(options.signal);
-    assertSuccessfulFeishuResponse(resp, 'card create');
-    const messageId = resp.data?.message_id?.trim();
-    if (!messageId) {
-      throw new FeishuResponseError(
-        'feishu_invalid_response',
-        'Feishu card create returned an invalid response',
-      );
-    }
-    return messageId;
+    return requireSuccessfulFeishuMessageId(resp, 'card create');
   }
 
   async updateCard(
@@ -562,6 +553,18 @@ function assertSuccessfulFeishuResponse(response: unknown, operation: string): v
       `Feishu ${operation} failed`,
     );
   }
+}
+
+function requireSuccessfulFeishuMessageId(response: unknown, operation: string): string {
+  assertSuccessfulFeishuResponse(response, operation);
+  const messageId = readNestedString(response, ['data', 'message_id'])?.trim();
+  if (!messageId) {
+    throw new FeishuResponseError(
+      'feishu_invalid_response',
+      `Feishu ${operation} returned an invalid response`,
+    );
+  }
+  return messageId;
 }
 
 interface FeishuMention {
