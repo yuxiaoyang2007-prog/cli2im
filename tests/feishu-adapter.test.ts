@@ -7,6 +7,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   FeishuAdapter,
   FeishuResponseError,
+  FeishuSdkBoundaryError,
 } from '../src/platforms/feishu/adapter.js';
 import { MAX_ATTACHMENT_DOWNLOAD_BYTES } from '../src/security/download-limits.js';
 import type { InboundMessage } from '../src/types.js';
@@ -87,6 +88,7 @@ describe('FeishuAdapter file handling', () => {
   });
 
   afterEach(() => {
+    vi.useRealTimers();
     childProcessMocks.spawn.mockReset();
     vi.restoreAllMocks();
     vi.unstubAllGlobals();
@@ -466,18 +468,68 @@ describe('FeishuAdapter file handling', () => {
     expect(client.im.message.create).not.toHaveBeenCalled();
   });
 
-  it('passes abort signals through text message creation', async () => {
+  it('aborts a never-settling text create at the local promise boundary without forwarding signal', async () => {
     const adapter = new FeishuAdapter({ appId: 'app', appSecret: 'secret', botName: 'bot' });
     const client = larkMocks.clients[0];
     const controller = new AbortController();
+    const sdkResult = deferred<{ code: number; data: { message_id: string } }>();
+    const unhandled = vi.fn();
+    process.on('unhandledRejection', unhandled);
+    client.im.message.create.mockReturnValueOnce(sdkResult.promise);
 
-    await adapter.send('oc_1', { text: 'hello' }, { signal: controller.signal });
+    try {
+      const sending = adapter.send('oc_1', { text: 'hello' }, { signal: controller.signal });
+      expect(client.im.message.create).toHaveBeenCalledTimes(1);
+      const createMock = client.im.message.create as ReturnType<typeof vi.fn>;
+      expect(createMock.mock.calls[0]?.[0]).not.toHaveProperty('signal');
 
-    expect(client.im.message.create).toHaveBeenCalledWith(
-      expect.objectContaining({
-        signal: controller.signal,
-      }),
-    );
+      controller.abort(new Error('private abort reason'));
+      await expect(sending).rejects.toMatchObject({
+        name: 'AbortError',
+        message: 'Feishu request aborted',
+      });
+
+      sdkResult.reject(new Error('private late sdk rejection'));
+      await new Promise((resolve) => setImmediate(resolve));
+      expect(unhandled).not.toHaveBeenCalled();
+    } finally {
+      process.off('unhandledRejection', unhandled);
+    }
+  });
+
+  it('rejects an already-aborted card create without starting an SDK request', async () => {
+    const adapter = new FeishuAdapter({ appId: 'app', appSecret: 'secret', botName: 'bot' });
+    const client = larkMocks.clients[0];
+    const controller = new AbortController();
+    controller.abort(new Error('private already-aborted reason'));
+
+    await expect(adapter.sendCard('oc_1', {
+      type: 'final', content: 'safe card',
+    }, { signal: controller.signal })).rejects.toMatchObject({
+      name: 'AbortError',
+      message: 'Feishu request aborted',
+    });
+    expect(client.im.message.create).not.toHaveBeenCalled();
+  });
+
+  it('times out a never-settling full-card patch with a fixed safe boundary error', async () => {
+    vi.useFakeTimers();
+    const adapter = new FeishuAdapter({ appId: 'app', appSecret: 'secret', botName: 'bot' });
+    const client = larkMocks.clients[0];
+    client.im.message.patch.mockReturnValueOnce(new Promise(() => undefined));
+
+    const patching = adapter.replaceCard('om_delayed', {
+      type: 'final', content: 'safe card',
+    });
+    const failure = patching.catch((error: unknown) => error);
+    await vi.advanceTimersByTimeAsync(10_000);
+
+    await expect(failure).resolves.toEqual(expect.objectContaining({
+      name: 'FeishuSdkBoundaryError',
+      category: 'feishu_request_timeout',
+      message: 'Feishu request timed out',
+    }));
+    expect(await failure).toBeInstanceOf(FeishuSdkBoundaryError);
   });
 
   it('removes the temporary opus file when audio upload aborts', async () => {
@@ -586,4 +638,14 @@ function mockFfmpegOutput(output: Buffer): void {
     });
     return proc;
   });
+}
+
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
 }

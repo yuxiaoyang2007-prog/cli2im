@@ -80,6 +80,7 @@ interface RolloutContext {
   source?: string;
   turns: Map<string, TurnMetadata>;
   activeTurnIds: Set<string>;
+  activeTurnStateTrusted: boolean;
 }
 
 export class CodexNotificationService {
@@ -153,15 +154,14 @@ export class CodexNotificationService {
       console.log('[notifications] healthy router=ready socket=ready monitor=ready');
     } catch {
       console.error('[notifications] start failed');
-      if (monitorAttempted) {
-        await runLifecycleStep('monitor stop', () => this.monitor.stop());
+      if (!this.stopPromise) {
+        this.stopPromise = this.stopComponents({
+          monitor: monitorAttempted,
+          socket: socketAttempted,
+          router: routerAttempted,
+        });
       }
-      if (socketAttempted) {
-        await runLifecycleStep('socket stop', () => this.socket.stop());
-      }
-      if (routerAttempted) {
-        await runLifecycleStep('router stop', () => this.router.stop());
-      }
+      await this.stopPromise;
       throw new Error('Codex notification service failed to start');
     }
   }
@@ -172,10 +172,25 @@ export class CodexNotificationService {
   }
 
   private async stopAndDrain(): Promise<void> {
-    const monitorStop = runLifecycleStep('monitor stop', () => this.monitor.stop());
-    const socketStop = runLifecycleStep('socket stop', () => this.socket.stop());
-    const routerStop = runLifecycleStep('router stop', () => this.router.stop());
-    await Promise.all([monitorStop, socketStop, routerStop]);
+    await this.stopComponents({ monitor: true, socket: true, router: true });
+  }
+
+  private async stopComponents(components: {
+    monitor: boolean;
+    socket: boolean;
+    router: boolean;
+  }): Promise<void> {
+    const stops: Promise<void>[] = [];
+    if (components.monitor) {
+      stops.push(runLifecycleStep('monitor stop', () => this.monitor.stop()));
+    }
+    if (components.socket) {
+      stops.push(runLifecycleStep('socket stop', () => this.socket.stop()));
+    }
+    if (components.router) {
+      stops.push(runLifecycleStep('router stop', () => this.router.stop()));
+    }
+    await Promise.all(stops);
   }
 
   async bindTarget(input: Omit<NotificationBinding, 'updatedAt'>): Promise<void> {
@@ -195,7 +210,7 @@ export class CodexNotificationService {
     if (event.type !== 'session_meta' && !context.sessionId && !this.hydratedFiles.has(filePath)) {
       await this.hydrateContext(filePath, context);
     }
-    this.applyContextEvent(context, event);
+    this.applyContextEvent(context, event, 'live');
 
     if (event.type === 'question') {
       const turnId = event.turnId ?? this.singleActiveTurnId(context);
@@ -229,12 +244,16 @@ export class CodexNotificationService {
     const content = await this.readContextFile(filePath);
     for (const line of content.split(/\r?\n/)) {
       const parsed = parseRolloutLine(line);
-      if (parsed) this.applyContextEvent(context, parsed);
+      if (parsed) this.applyContextEvent(context, parsed, 'hydrated');
     }
     if (context.sessionId) this.hydratedFiles.add(filePath);
   }
 
-  private applyContextEvent(context: RolloutContext, event: ParsedRolloutLine): void {
+  private applyContextEvent(
+    context: RolloutContext,
+    event: ParsedRolloutLine,
+    origin: 'live' | 'hydrated',
+  ): void {
     if (event.type === 'session_meta') {
       context.sessionId = event.sessionId;
       context.cwd = event.cwd;
@@ -244,6 +263,11 @@ export class CodexNotificationService {
     }
 
     if (event.type === 'turn_context') {
+      if (origin === 'live' && !context.activeTurnStateTrusted) {
+        context.turns.clear();
+        context.activeTurnIds.clear();
+        context.activeTurnStateTrusted = true;
+      }
       const turn = context.turns.get(event.turnId) ?? {};
       turn.cwd = event.cwd;
       context.turns.set(event.turnId, turn);
@@ -331,7 +355,7 @@ export class CodexNotificationService {
   }
 
   private singleActiveTurnId(context: RolloutContext): string | undefined {
-    if (context.activeTurnIds.size !== 1) return undefined;
+    if (!context.activeTurnStateTrusted || context.activeTurnIds.size !== 1) return undefined;
     return context.activeTurnIds.values().next().value;
   }
 
@@ -377,7 +401,7 @@ export class CodexNotificationService {
 }
 
 function createRolloutContext(): RolloutContext {
-  return { turns: new Map(), activeTurnIds: new Set() };
+  return { turns: new Map(), activeTurnIds: new Set(), activeTurnStateTrusted: false };
 }
 
 const MAX_CONTEXT_SEARCH_ENTRIES = 20_000;

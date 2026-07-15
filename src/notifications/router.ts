@@ -617,6 +617,7 @@ function classifyError(error: unknown): string {
     && (
       error.category === 'feishu_business_error'
       || error.category === 'feishu_invalid_response'
+      || error.category === 'feishu_request_timeout'
     )
   ) return error.category;
   if (error instanceof TypeError) return 'TypeError';

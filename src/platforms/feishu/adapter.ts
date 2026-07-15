@@ -35,6 +35,15 @@ export class FeishuResponseError extends Error {
   }
 }
 
+export class FeishuSdkBoundaryError extends Error {
+  readonly category = 'feishu_request_timeout' as const;
+
+  constructor() {
+    super('Feishu request timed out');
+    this.name = 'FeishuSdkBoundaryError';
+  }
+}
+
 export class FeishuAdapter implements PlatformAdapter {
   name = 'feishu';
   private client: lark.Client;
@@ -88,30 +97,30 @@ export class FeishuAdapter implements PlatformAdapter {
   }
 
   async send(chatId: string, content: OutboundContent, options: AbortableOptions = {}): Promise<string> {
-    throwIfAborted(options.signal);
     if (content.card) {
       return this.sendCard(chatId, content.card, options);
     }
 
-    throwIfAborted(options.signal);
-    const resp = await this.client.im.message.create(withSignal({
-      params: { receive_id_type: 'chat_id' as const },
-      data: {
-        receive_id: chatId,
-        msg_type: 'text',
-        content: JSON.stringify({ text: content.text ?? '' }),
-        ...(options.idempotencyKey ? { uuid: options.idempotencyKey } : {}),
-      },
-    }, options.signal));
-    throwIfAborted(options.signal);
+    const resp = await atFeishuSdkBoundary(
+      () => this.client.im.message.create({
+        params: { receive_id_type: 'chat_id' as const },
+        data: {
+          receive_id: chatId,
+          msg_type: 'text',
+          content: JSON.stringify({ text: content.text ?? '' }),
+          ...(options.idempotencyKey ? { uuid: options.idempotencyKey } : {}),
+        },
+      }),
+      options.signal,
+    );
     return requireSuccessfulFeishuMessageId(resp, 'text create');
   }
 
   async editMessage(_chatId: string, msgId: string, content: string): Promise<void> {
-    await this.client.im.message.patch({
+    await atFeishuSdkBoundary(() => this.client.im.message.patch({
       path: { message_id: msgId },
       data: { content: JSON.stringify({ text: content }) },
-    });
+    }));
   }
 
   async deleteMessage(_chatId: string, msgId: string): Promise<void> {
@@ -286,19 +295,19 @@ export class FeishuAdapter implements PlatformAdapter {
   }
 
   async sendCard(chatId: string, card: CardPayload, options: AbortableOptions = {}): Promise<string> {
-    throwIfAborted(options.signal);
     const cardJson = this.buildCardJson(card);
-    throwIfAborted(options.signal);
-    const resp = await this.client.im.message.create(withSignal({
-      params: { receive_id_type: 'chat_id' as const },
-      data: {
-        receive_id: chatId,
-        msg_type: 'interactive',
-        content: JSON.stringify(cardJson),
-        ...(options.idempotencyKey ? { uuid: options.idempotencyKey } : {}),
-      },
-    }, options.signal));
-    throwIfAborted(options.signal);
+    const resp = await atFeishuSdkBoundary(
+      () => this.client.im.message.create({
+        params: { receive_id_type: 'chat_id' as const },
+        data: {
+          receive_id: chatId,
+          msg_type: 'interactive',
+          content: JSON.stringify(cardJson),
+          ...(options.idempotencyKey ? { uuid: options.idempotencyKey } : {}),
+        },
+      }),
+      options.signal,
+    );
     return requireSuccessfulFeishuMessageId(resp, 'card create');
   }
 
@@ -308,14 +317,14 @@ export class FeishuAdapter implements PlatformAdapter {
     _seq: number,
     options: AbortableOptions = {},
   ): Promise<void> {
-    throwIfAborted(options.signal);
     const card = this.buildCardJson({ type: 'streaming', content });
-    throwIfAborted(options.signal);
-    const response = await this.client.im.message.patch(withSignal({
-      path: { message_id: messageId },
-      data: { content: JSON.stringify(card) },
-    }, options.signal));
-    throwIfAborted(options.signal);
+    const response = await atFeishuSdkBoundary(
+      () => this.client.im.message.patch({
+        path: { message_id: messageId },
+        data: { content: JSON.stringify(card) },
+      }),
+      options.signal,
+    );
     assertSuccessfulFeishuResponse(response, 'card patch');
   }
 
@@ -324,14 +333,14 @@ export class FeishuAdapter implements PlatformAdapter {
     card: CardPayload,
     options: AbortableOptions = {},
   ): Promise<void> {
-    throwIfAborted(options.signal);
     const cardJson = this.buildCardJson(card);
-    throwIfAborted(options.signal);
-    const response = await this.client.im.message.patch(withSignal({
-      path: { message_id: messageId },
-      data: { content: JSON.stringify(cardJson) },
-    }, options.signal));
-    throwIfAborted(options.signal);
+    const response = await atFeishuSdkBoundary(
+      () => this.client.im.message.patch({
+        path: { message_id: messageId },
+        data: { content: JSON.stringify(cardJson) },
+      }),
+      options.signal,
+    );
     assertSuccessfulFeishuResponse(response, 'card patch');
   }
 
@@ -647,6 +656,52 @@ function isImageFile(pathOrName: string): boolean {
 function withSignal<T extends object>(payload: T, signal?: AbortSignal): T {
   if (!signal) return payload;
   return { ...payload, signal } as T;
+}
+
+const FEISHU_SDK_TIMEOUT_MS = 10_000;
+
+function atFeishuSdkBoundary<T>(
+  operation: () => Promise<T>,
+  signal?: AbortSignal,
+): Promise<T> {
+  if (signal?.aborted) return Promise.reject(feishuSdkAbortError());
+
+  let sdkPromise: Promise<T>;
+  try {
+    sdkPromise = Promise.resolve(operation());
+  } catch (error) {
+    return Promise.reject(error);
+  }
+
+  return new Promise<T>((resolve, reject) => {
+    let settled = false;
+    const finish = (continuation: () => void) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      signal?.removeEventListener('abort', abort);
+      continuation();
+    };
+    const abort = () => finish(() => reject(feishuSdkAbortError()));
+    const timeout = setTimeout(
+      () => finish(() => reject(new FeishuSdkBoundaryError())),
+      FEISHU_SDK_TIMEOUT_MS,
+    );
+
+    signal?.addEventListener('abort', abort, { once: true });
+    // The generated SDK ignores AbortSignal. Keep handlers attached so a late
+    // HTTP completion is consumed; UUID create recovery and same-message patch
+    // idempotency remain the caller's recovery boundary.
+    void sdkPromise.then(
+      (value) => finish(() => resolve(value)),
+      (error: unknown) => finish(() => reject(error)),
+    );
+    if (signal?.aborted) abort();
+  });
+}
+
+function feishuSdkAbortError(): DOMException {
+  return new DOMException('Feishu request aborted', 'AbortError');
 }
 
 async function withFeishuUploadHint<T>(operation: Promise<T>, action: string): Promise<T> {

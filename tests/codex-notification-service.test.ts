@@ -14,6 +14,7 @@ import type { NotificationRouter } from '../src/notifications/router.js';
 import { SessionStore } from '../src/session/store.js';
 import { startNotificationServiceBeforeReady } from '../src/index.js';
 import type { PlatformAdapter } from '../src/types.js';
+import { FeishuAdapter } from '../src/platforms/feishu/adapter.js';
 
 describe('CodexNotificationService', () => {
   it('starts and stops dependencies in order and routes stable question and completion events', async () => {
@@ -290,6 +291,84 @@ describe('CodexNotificationService', () => {
       occurredAt: Date.parse('2026-07-15T18:32:10.250Z'),
     }));
     expect(JSON.stringify(vi.mocked(router.handle).mock.calls)).not.toContain('private active secret');
+  });
+
+  it('does not trust a bounded restart window for no-id association, then trusts a live turn_context', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'cli2im-no-id-window-'));
+    try {
+      const filePath = join(directory, 'rollout-large.jsonl');
+      const sessionId = 'session_large_window';
+      const historical = [
+        JSON.stringify({
+          type: 'session_meta', payload: { id: sessionId, cwd: '/tmp/project', source: 'cli' },
+        }),
+        JSON.stringify({
+          type: 'turn_context', payload: { turn_id: 'turn_old_head', cwd: '/tmp/project' },
+        }),
+      ].join('\n');
+      const omittedMiddle = [
+        JSON.stringify({
+          type: 'event_msg', payload: { type: 'turn_aborted', turn_id: 'turn_old_head' },
+        }),
+        JSON.stringify({
+          type: 'turn_context', payload: { turn_id: 'turn_current_middle', cwd: '/tmp/project' },
+        }),
+      ].join('\n');
+      const noIdLine = JSON.stringify({
+        type: 'response_item',
+        payload: {
+          type: 'function_call', name: 'request_user_input', call_id: 'question_tail_no_id',
+          arguments: '{"questions":[{"question":"private tail question"}]}',
+        },
+      });
+      await writeFile(filePath, [
+        historical,
+        'x'.repeat(40_000),
+        omittedMiddle,
+        'y'.repeat(40_000),
+        noIdLine,
+      ].join('\n'));
+
+      let onRollout: ((event: ParsedRolloutLine, filePath: string) => void | Promise<void>) | undefined;
+      const router = {
+        resumePending: vi.fn(), handle: vi.fn().mockResolvedValue('delivered'), stop: vi.fn(),
+      } as unknown as NotificationRouter;
+      const service = new CodexNotificationService({
+        botName: 'codexbot', workingDirectory: '/tmp/project', sessionsDir: directory,
+        sessionIndexPath: join(directory, 'session_index.jsonl'), socketPath: join(directory, 'notify.sock'),
+        store: { bindNotificationTarget: vi.fn() } as unknown as SessionStore,
+        resolveAdapter: () => undefined, timeZone: 'UTC',
+        dependencies: {
+          router,
+          metadataResolver: { resolve: vi.fn().mockResolvedValue({
+            projectName: 'cli2im', taskName: '窗口信任测试', surface: 'CLI', shortTaskId: 'session_',
+          }) },
+          createMonitor: (handler) => {
+            onRollout = handler;
+            return { start: vi.fn(), stop: vi.fn() };
+          },
+          createSocket: () => ({ start: vi.fn(), stop: vi.fn() }),
+        },
+      });
+      const noIdQuestion = parseRolloutLine(noIdLine);
+      expect(noIdQuestion).toMatchObject({ type: 'question', requestId: 'question_tail_no_id' });
+
+      await onRollout?.(noIdQuestion as ParsedRolloutLine, filePath);
+      expect(router.handle).not.toHaveBeenCalled();
+
+      await onRollout?.({
+        type: 'turn_context', turnId: 'turn_live_observed', cwd: '/tmp/project',
+      }, filePath);
+      await onRollout?.(noIdQuestion as ParsedRolloutLine, filePath);
+
+      expect(router.handle).toHaveBeenCalledTimes(1);
+      expect(router.handle).toHaveBeenCalledWith(expect.objectContaining({
+        eventKey: eventKey([sessionId, 'turn_live_observed', 'question_tail_no_id', 'question']),
+        turnId: 'turn_live_observed',
+      }));
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
   });
 
   it.each([
@@ -592,6 +671,65 @@ describe('CodexNotificationService', () => {
     consoleLog.mockRestore();
   });
 
+  it('aborts a callback-blocked router concurrently when monitor startup fails', async () => {
+    vi.useRealTimers();
+    const routerStopGate = deferred<void>();
+    let activeSocketCallback: Promise<void> | undefined;
+    const router = {
+      resumePending: vi.fn(),
+      handle: vi.fn(async () => { await routerStopGate.promise; return 'pending'; }),
+      stop: vi.fn(() => { routerStopGate.resolve(); }),
+    } as unknown as NotificationRouter;
+    const socketStop = vi.fn(async () => { await activeSocketCallback; });
+    const monitorStop = vi.fn();
+    const service = new CodexNotificationService({
+      botName: 'codexbot', workingDirectory: '/tmp/project', sessionsDir: '/tmp/codex/sessions',
+      sessionIndexPath: '/tmp/codex/session_index.jsonl', socketPath: '/tmp/cli2im/codex-notify.sock',
+      store: { bindNotificationTarget: vi.fn() } as unknown as SessionStore,
+      resolveAdapter: () => undefined, timeZone: 'UTC',
+      dependencies: {
+        router,
+        metadataResolver: { resolve: vi.fn().mockResolvedValue({
+          projectName: 'cli2im', taskName: '启动回滚', surface: 'CLI', shortTaskId: 'session_',
+        }) },
+        findContextFile: vi.fn().mockResolvedValue(undefined),
+        createSocket: (handler) => ({
+          start: vi.fn(async () => {
+            activeSocketCallback = Promise.resolve(handler({
+              type: 'approval', sessionId: 'session_start_fail', turnId: 'turn_start_fail',
+              requestId: 'approval_start_fail', occurredAt: 1,
+            })).then(() => undefined);
+          }),
+          stop: socketStop,
+        }),
+        createMonitor: () => ({
+          start: vi.fn(async () => { throw new Error('private monitor start failure'); }),
+          stop: monitorStop,
+        }),
+      },
+    });
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+
+    const starting = service.start();
+    const outcome = await Promise.race([
+      starting.then(() => 'resolved' as const, () => 'rejected' as const),
+      new Promise<'timeout'>((resolve) => setTimeout(() => resolve('timeout'), 100)),
+    ]);
+    if (outcome === 'timeout') {
+      routerStopGate.resolve();
+      await starting.catch(() => undefined);
+    }
+
+    expect(outcome).toBe('rejected');
+    expect(router.stop).toHaveBeenCalledTimes(1);
+    expect(socketStop).toHaveBeenCalledTimes(1);
+    expect(monitorStop).toHaveBeenCalledTimes(1);
+    await expect(service.stop()).resolves.toBeUndefined();
+    expect(router.stop).toHaveBeenCalledTimes(1);
+    expect(JSON.stringify(consoleError.mock.calls)).not.toContain('private monitor start failure');
+    consoleError.mockRestore();
+  });
+
   it('does not print generic Ready when enabled notification startup rejects', async () => {
     const ready = vi.fn();
     const service = {
@@ -734,6 +872,61 @@ describe('CodexNotificationService', () => {
       type: 'question', turnId: 'turn_shutdown', requestId: 'late_question', occurredAt: 20,
     }, filePath)).resolves.toBeUndefined();
     expect(send).toHaveBeenCalledTimes(1);
+  });
+
+  it('stops with a production Feishu adapter whose generated SDK create promise never settles', async () => {
+    vi.useRealTimers();
+    const store = await SessionStore.create(':memory:');
+    await store.bindNotificationTarget({
+      botName: 'codexbot', platform: 'feishu', chatId: 'oc_private', userId: 'ou_allowed', updatedAt: 1,
+    });
+    const adapter = new FeishuAdapter({ appId: 'app', appSecret: 'secret', botName: 'codexbot' });
+    const sdkResult = deferred<unknown>();
+    const sdkCreate = vi.spyOn(adapter.getClient().im.message, 'create')
+      .mockReturnValue(sdkResult.promise as never);
+    let onRollout: ((event: ParsedRolloutLine, filePath: string) => void | Promise<void>) | undefined;
+    let activeCallback: Promise<void> | undefined;
+    const service = new CodexNotificationService({
+      botName: 'codexbot', workingDirectory: '/tmp/project', sessionsDir: '/tmp/codex/sessions',
+      sessionIndexPath: '/tmp/codex/session_index.jsonl', socketPath: '/tmp/cli2im/codex-notify.sock',
+      store, resolveAdapter: () => adapter, timeZone: 'UTC',
+      dependencies: {
+        metadataResolver: { resolve: vi.fn().mockResolvedValue({
+          projectName: 'cli2im', taskName: '真实适配器停机', surface: 'CLI', shortTaskId: 'session_',
+        }) },
+        createMonitor: (handler) => {
+          onRollout = handler;
+          return { start: vi.fn(), stop: vi.fn(async () => { await activeCallback; }) };
+        },
+        createSocket: () => ({ start: vi.fn(), stop: vi.fn() }),
+      },
+    });
+    const filePath = '/tmp/codex/sessions/rollout-production-adapter-shutdown.jsonl';
+    await onRollout?.({
+      type: 'session_meta', sessionId: 'session_production_adapter', cwd: '/tmp/project', source: 'cli',
+    }, filePath);
+    await onRollout?.({
+      type: 'turn_context', turnId: 'turn_production_adapter', cwd: '/tmp/project',
+    }, filePath);
+    activeCallback = Promise.resolve(onRollout?.({
+      type: 'question', turnId: 'turn_production_adapter', requestId: 'question_production_adapter',
+      occurredAt: 1,
+    }, filePath)).then(() => undefined);
+    await vi.waitFor(() => expect(sdkCreate).toHaveBeenCalledTimes(1));
+
+    const stopping = service.stop();
+    const outcome = await Promise.race([
+      stopping.then(() => 'stopped' as const),
+      new Promise<'timeout'>((resolve) => setTimeout(() => resolve('timeout'), 100)),
+    ]);
+    if (outcome === 'timeout') {
+      sdkResult.resolve({ code: 0, data: { message_id: 'om_cleanup' } });
+      await stopping;
+    }
+
+    expect(outcome).toBe('stopped');
+    expect(await store.listPendingNotifications()).toHaveLength(1);
+    store.close();
   });
 
   it('hydrates persisted rollout context when approval is the first event after restart', async () => {
