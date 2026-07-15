@@ -38,7 +38,16 @@ const REPLACEMENT_QUIET_MS = 250;
 export interface CodexEventMonitorOptions {
   sessionsDir: string;
   store: NotificationCursorStore;
-  onEvent: (event: ParsedRolloutLine, filePath: string) => void | Promise<void>;
+  onEvent: (
+    event: ParsedRolloutLine,
+    filePath: string,
+    delivery?: CodexMonitorDelivery,
+  ) => void | Promise<void>;
+}
+
+export interface CodexMonitorDelivery {
+  mode: 'startup-catchup';
+  notificationAllowed: boolean;
 }
 
 export class CodexEventMonitor {
@@ -543,8 +552,15 @@ export class CodexEventMonitor {
         if (newline !== -1) {
           if (!oversizedLine) {
             const parsed = parseRolloutLine(Buffer.concat(lineParts, lineBytes).toString('utf8'));
-            if (parsed && shouldEmitEvent(parsed, catchupBoundary)) {
-              await this.onEvent(parsed, filePath);
+            if (parsed) {
+              if (catchupBoundary === undefined) {
+                await this.onEvent(parsed, filePath);
+              } else {
+                await this.onEvent(parsed, filePath, {
+                  mode: 'startup-catchup',
+                  notificationAllowed: shouldEmitEvent(parsed, catchupBoundary),
+                });
+              }
             }
           }
           persistedOffset = chunkStartOffset + segmentEnd;

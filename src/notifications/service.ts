@@ -13,7 +13,7 @@ import {
   NotificationMetadataResolver,
   type NotificationMetadataInput,
 } from './metadata.js';
-import { CodexEventMonitor } from './monitor.js';
+import { CodexEventMonitor, type CodexMonitorDelivery } from './monitor.js';
 import { NotificationRouter } from './router.js';
 import { CodexNotificationSocket } from './socket-server.js';
 import type { CodexNotificationEvent, NotificationBinding } from './types.js';
@@ -41,6 +41,7 @@ interface MetadataResolver {
 type RolloutHandler = (
   event: ParsedRolloutLine,
   filePath: string,
+  delivery?: CodexMonitorDelivery,
 ) => void | Promise<void>;
 
 type ApprovalHandler = (event: PermissionHookEvent) => void | Promise<void>;
@@ -126,11 +127,11 @@ export class CodexNotificationService {
     this.metadataResolver = options.dependencies?.metadataResolver
       ?? new NotificationMetadataResolver({ codexDir: dirname(options.sessionIndexPath) });
     this.monitor = options.dependencies?.createMonitor?.(
-      (event, filePath) => this.handleRolloutEvent(event, filePath),
+      (event, filePath, delivery) => this.handleRolloutEvent(event, filePath, delivery),
     ) ?? new CodexEventMonitor({
       sessionsDir: options.sessionsDir,
       store: options.store,
-      onEvent: (event, filePath) => this.handleRolloutEvent(event, filePath),
+      onEvent: (event, filePath, delivery) => this.handleRolloutEvent(event, filePath, delivery),
     });
     this.socket = options.dependencies?.createSocket?.(
       (event) => this.handleApprovalEvent(event),
@@ -200,7 +201,11 @@ export class CodexNotificationService {
     await this.store.bindNotificationTarget({ ...input, updatedAt: this.now() });
   }
 
-  private async handleRolloutEvent(event: ParsedRolloutLine, filePath: string): Promise<void> {
+  private async handleRolloutEvent(
+    event: ParsedRolloutLine,
+    filePath: string,
+    delivery?: CodexMonitorDelivery,
+  ): Promise<void> {
     let context = this.contextsByFile.get(filePath);
     if (!context) {
       context = createRolloutContext();
@@ -210,9 +215,15 @@ export class CodexNotificationService {
     if (event.type !== 'session_meta' && !context.sessionId && !this.hydratedFiles.has(filePath)) {
       await this.hydrateContext(filePath, context);
     }
-    this.applyContextEvent(context, event, 'live');
+    this.applyContextEvent(
+      context,
+      event,
+      delivery?.mode === 'startup-catchup' ? 'gap-free' : 'live',
+    );
+    const notificationAllowed = delivery?.notificationAllowed ?? true;
 
     if (event.type === 'question') {
+      if (!notificationAllowed) return;
       const turnId = event.turnId ?? this.singleActiveTurnId(context);
       if (!turnId) return;
       await this.routeRolloutNotification(context, { ...event, turnId }, {
@@ -228,12 +239,14 @@ export class CodexNotificationService {
         occurredAt: event.occurredAt ?? this.now(),
       });
     } else if (event.type === 'completed') {
-      await this.routeRolloutNotification(context, event, {
-        eventKey: (sessionId) => eventKey([sessionId, event.turnId, 'completed']),
-        kind: 'completed',
-        occurredAt: event.occurredAt,
-        durationMs: event.durationMs,
-      });
+      if (notificationAllowed) {
+        await this.routeRolloutNotification(context, event, {
+          eventKey: (sessionId) => eventKey([sessionId, event.turnId, 'completed']),
+          kind: 'completed',
+          occurredAt: event.occurredAt,
+          durationMs: event.durationMs,
+        });
+      }
       this.releaseTurnContext(filePath, context, event.turnId);
     } else if (event.type === 'aborted') {
       this.releaseTurnContext(filePath, context, event.turnId);
@@ -252,7 +265,7 @@ export class CodexNotificationService {
   private applyContextEvent(
     context: RolloutContext,
     event: ParsedRolloutLine,
-    origin: 'live' | 'hydrated',
+    origin: 'live' | 'gap-free' | 'hydrated',
   ): void {
     if (event.type === 'session_meta') {
       context.sessionId = event.sessionId;
@@ -263,7 +276,7 @@ export class CodexNotificationService {
     }
 
     if (event.type === 'turn_context') {
-      if (origin === 'live' && !context.activeTurnStateTrusted) {
+      if (origin !== 'hydrated' && !context.activeTurnStateTrusted) {
         context.turns.clear();
         context.activeTurnIds.clear();
         context.activeTurnStateTrusted = true;

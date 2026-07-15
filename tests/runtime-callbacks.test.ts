@@ -3,6 +3,7 @@ import {
   createCallbackHandler,
   sendAgentMessageOrNotify,
 } from '../src/index.js';
+import { FeishuAdapter } from '../src/platforms/feishu/adapter.js';
 import {
   handlePermissionCallback,
   isCallbackAuthorized,
@@ -34,6 +35,51 @@ describe('parsePermissionCallbackData', () => {
 });
 
 describe('createCallbackHandler', () => {
+  it('logs only fixed callback summaries across the Feishu adapter and ignored pipeline path', () => {
+    const secrets = {
+      chatId: 'oc_callback_secret_7f3c',
+      userId: 'ou_callback_secret_91ad',
+      messageId: 'om_callback_secret_25be',
+      action: 'callback_action_secret_c842',
+      sessionId: 'callback_session_secret_d109',
+    };
+    const log = vi.spyOn(console, 'log').mockImplementation(() => undefined);
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    const error = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+
+    try {
+      const adapter = new FeishuAdapter({ appId: 'app', appSecret: 'secret', botName: 'ccbot' });
+      adapter.onCallback(createCallbackHandler(callbackDeps({ adapter })));
+
+      (adapter as unknown as { handleCardAction(data: unknown): unknown }).handleCardAction({
+        context: {
+          open_chat_id: secrets.chatId,
+          open_message_id: secrets.messageId,
+          chat_type: 'p2p',
+        },
+        operator: { open_id: secrets.userId },
+        action: { value: { action: secrets.action, sessionId: secrets.sessionId } },
+      });
+
+      expect(log).toHaveBeenCalledWith(
+        '[feishu] callback=card_action chat=p2p operator=present message=present valueKeys=2',
+      );
+      expect(log).toHaveBeenCalledWith(
+        '[pipeline] callback=ignored platform=feishu chat=p2p data=present',
+      );
+      const output = JSON.stringify([
+        ...log.mock.calls,
+        ...warn.mock.calls,
+        ...error.mock.calls,
+      ]);
+      for (const secret of Object.values(secrets)) expect(output).not.toContain(secret);
+    } finally {
+      log.mockRestore();
+      warn.mockRestore();
+      error.mockRestore();
+    }
+  });
+
   it('serializes session resume callbacks through the chat queue', async () => {
     const queue = {
       enqueue: vi.fn(() => Promise.resolve()),

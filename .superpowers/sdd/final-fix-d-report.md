@@ -186,3 +186,74 @@ git diff --check
 
 Result: 60 files passed, 884 tests passed, 0 failed; typecheck and build exited 0; build reported
 `Build complete`; diff check exited 0.
+
+## Fix Review 2
+
+### Findings addressed
+
+1. A cursorless startup catchup scanned from byte zero but filtered historical context and lifecycle
+   records before they reached the service. A current `request_user_input` without a turn ID therefore
+   could not use that otherwise gap-free history to identify its one active turn.
+2. The Feishu card-action adapter logged the serialized callback object, and the ignored-callback path
+   logged callback data. Those values can contain chat, user, message, session, and action identifiers.
+3. The session-resume failure log still serialized its transport error, which could repeat callback or
+   session values.
+
+### RED evidence
+
+Command:
+
+```text
+npm test -- --run tests/codex-notification-service.test.ts tests/runtime-callbacks.test.ts tests/feishu-adapter.test.ts
+```
+
+Observed before the review fix:
+
+- 3 files failed; 3 tests failed and 70 passed.
+- The real cursorless startup fixture produced zero notifications instead of the one current,
+  unambiguous no-ID question notification.
+- Both adapter and pipeline assertions observed synthetic callback secrets in console output instead
+  of fixed safe summaries.
+
+### Implementation
+
+- Startup catchup now forwards every parsed rollout record in file order with an explicit
+  `startup-catchup` delivery mode and `notificationAllowed` flag.
+- Only a timestamp-validated post-boundary question or completion is notification-eligible. Historical
+  questions and completions still reach the service for context/lifecycle processing but cannot route.
+- Gap-free catchup `turn_context` records establish trusted active-turn state. Historical completion and
+  abort records remove old active turns. A current no-ID question routes only when exactly one active
+  turn remains; ambiguous active turns are dropped.
+- Normal live callbacks and persisted-cursor replay retain their existing two-argument, notification-
+  allowed behavior.
+- Feishu card-action and ignored pipeline logs now contain only fixed callback category, normalized chat
+  category, presence flags, and action-value key count. They do not log callback objects or callback
+  values. Session-resume failures use a fixed category-only error line.
+- The startup integration uses real rollout files, a real monitor, and real cursor storage. It proves
+  correct current task/turn association, no historical replay, ambiguous drop, EOF cursors, and no
+  replay after restart.
+- The callback integration exercises the actual Feishu adapter-to-pipeline handler with unique chat,
+  user, message, action, session, and callback-data secrets, spies all console methods, and proves none
+  of those values are logged while both safe summaries are present.
+
+### Verification evidence
+
+Focused:
+
+```text
+npm test -- --run tests/codex-notification-monitor-startup.test.ts tests/codex-notification-service.test.ts tests/runtime-callbacks.test.ts tests/feishu-adapter.test.ts
+```
+
+Result: 4 files passed, 78 tests passed, 0 failed.
+
+Full verification:
+
+```text
+npm test -- --run
+npm run typecheck
+npm run build
+git diff --check
+```
+
+Result: 60 files passed, 886 tests passed, 0 failed; typecheck and build exited 0; build reported
+`Build complete`; diff check exited 0.

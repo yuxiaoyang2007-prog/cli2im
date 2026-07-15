@@ -969,7 +969,7 @@ export function createCallbackHandler(params: {
           tgStreamController,
         })
       ).catch((err) => {
-        console.error('[pipeline] CLI session resume failed:', scrubLog(err));
+        console.error('[pipeline] callback=session_resume_failed');
         void adapter.send(callback.chatId, {
           text: `Resume failed: ${err instanceof Error ? err.message : String(err)}`,
         });
@@ -977,8 +977,22 @@ export function createCallbackHandler(params: {
       return;
     }
 
-    console.log(`[pipeline] Ignored callback: ${scrubLog(callback.data)}`);
+    console.log(
+      `[pipeline] callback=ignored platform=${callbackPlatformCategory(callback.platform)}`
+      + ` chat=${callbackChatCategory(callback.chatType)}`
+      + ` data=${callback.data.length > 0 ? 'present' : 'absent'}`,
+    );
   };
+}
+
+function callbackPlatformCategory(value: unknown): string {
+  return value === 'feishu' || value === 'telegram' ? value : 'unknown';
+}
+
+function callbackChatCategory(value: unknown): string {
+  return value === 'p2p' || value === 'group' || value === 'supergroup' || value === 'channel'
+    ? value
+    : 'unknown';
 }
 
 export async function sendAgentMessageOrNotify(params: {

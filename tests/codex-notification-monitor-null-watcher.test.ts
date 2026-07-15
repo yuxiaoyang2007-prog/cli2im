@@ -3,7 +3,10 @@ import { appendFile, mkdir, rm, stat, utimes, writeFile } from 'node:fs/promises
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { CodexEventMonitor } from '../src/notifications/monitor.js';
+import {
+  CodexEventMonitor,
+  type CodexMonitorDelivery,
+} from '../src/notifications/monitor.js';
 import type { ParsedRolloutLine } from '../src/notifications/codex-events.js';
 import { SessionStore } from '../src/session/store.js';
 
@@ -84,14 +87,21 @@ describe('CodexEventMonitor null-filename startup fallback', () => {
     gate.release();
     await starting;
 
-    expect(onEvent).toHaveBeenCalledTimes(1);
-    expect(onEvent).toHaveBeenCalledWith(
-      expect.objectContaining({
-        type: 'completed', turnId: 'null-before-listing', occurredAt: currentTime,
-        durationMs: 2_500,
-      }),
-      file,
-    );
+    expect(onEvent.mock.calls).toEqual([
+      [
+        expect.objectContaining({ type: 'completed', turnId: 'historical' }),
+        file,
+        { mode: 'startup-catchup', notificationAllowed: false },
+      ],
+      [
+        expect.objectContaining({
+          type: 'completed', turnId: 'null-before-listing', occurredAt: currentTime,
+          durationMs: 2_500,
+        }),
+        file,
+        { mode: 'startup-catchup', notificationAllowed: true },
+      ],
+    ]);
     await expectEofWithoutReplay(monitor, store, file, onEvent);
   });
 
@@ -119,14 +129,21 @@ describe('CodexEventMonitor null-filename startup fallback', () => {
     inspection.release();
     await starting;
 
-    expect(onEvent).toHaveBeenCalledTimes(1);
-    expect(onEvent).toHaveBeenCalledWith(
-      expect.objectContaining({
-        type: 'completed', turnId: 'null-before-inspection', occurredAt: currentTime,
-        durationMs: 2_500,
-      }),
-      file,
-    );
+    expect(onEvent.mock.calls).toEqual([
+      [
+        expect.objectContaining({ type: 'completed', turnId: 'historical' }),
+        file,
+        { mode: 'startup-catchup', notificationAllowed: false },
+      ],
+      [
+        expect.objectContaining({
+          type: 'completed', turnId: 'null-before-inspection', occurredAt: currentTime,
+          durationMs: 2_500,
+        }),
+        file,
+        { mode: 'startup-catchup', notificationAllowed: true },
+      ],
+    ]);
     await expectEofWithoutReplay(monitor, store, file, onEvent);
   });
 
@@ -145,7 +162,11 @@ describe('CodexEventMonitor null-filename startup fallback', () => {
   async function setup(): Promise<{
     file: string;
     monitor: CodexEventMonitor;
-    onEvent: ReturnType<typeof vi.fn<(event: ParsedRolloutLine, filePath: string) => void>>;
+    onEvent: ReturnType<typeof vi.fn<(
+      event: ParsedRolloutLine,
+      filePath: string,
+      delivery?: CodexMonitorDelivery,
+    ) => void>>;
     sessionsDir: string;
     store: SessionStore;
   }> {
@@ -156,7 +177,11 @@ describe('CodexEventMonitor null-filename startup fallback', () => {
     const file = join(nestedDir, 'rollout-null-watch.jsonl');
     const store = await SessionStore.create(':memory:');
     stores.push(store);
-    const onEvent = vi.fn<(event: ParsedRolloutLine, filePath: string) => void>();
+    const onEvent = vi.fn<(
+      event: ParsedRolloutLine,
+      filePath: string,
+      delivery?: CodexMonitorDelivery,
+    ) => void>();
     const monitor = new CodexEventMonitor({ sessionsDir, store, onEvent });
     monitors.push(monitor);
     return { file, monitor, onEvent, sessionsDir, store };
@@ -221,7 +246,11 @@ async function expectEofWithoutReplay(
   monitor: CodexEventMonitor,
   store: SessionStore,
   file: string,
-  onEvent: ReturnType<typeof vi.fn<(event: ParsedRolloutLine, filePath: string) => void>>,
+  onEvent: ReturnType<typeof vi.fn<(
+    event: ParsedRolloutLine,
+    filePath: string,
+    delivery?: CodexMonitorDelivery,
+  ) => void>>,
 ): Promise<void> {
   expect((await store.getNotificationCursor(file))?.byteOffset).toBe((await stat(file)).size);
   const calls = onEvent.mock.calls.length;

@@ -3,7 +3,10 @@ import { mkdir, rm, stat, writeFile, appendFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { CodexEventMonitor } from '../src/notifications/monitor.js';
+import {
+  CodexEventMonitor,
+  type CodexMonitorDelivery,
+} from '../src/notifications/monitor.js';
 import type { ParsedRolloutLine } from '../src/notifications/codex-events.js';
 import { SessionStore } from '../src/session/store.js';
 
@@ -73,12 +76,25 @@ describe('CodexEventMonitor startup classification', () => {
     }
     await starting;
 
-    expect(onEvent.mock.calls.map(([event]) => event.type)).toEqual(['question', 'completed']);
+    expect(onEvent.mock.calls.map(([event]) => event.type)).toEqual([
+      'completed',
+      'question',
+      'question',
+      'completed',
+    ]);
     expect(onEvent.mock.calls.map(([event]) => (
       'turnId' in event ? event.turnId : undefined
     ))).toEqual([
+      'old-completion',
+      'turn_old-question-without-time',
       'turn_current-question',
       'current-completion',
+    ]);
+    expect(onEvent.mock.calls.map(([, , delivery]) => delivery)).toEqual([
+      { mode: 'startup-catchup', notificationAllowed: false },
+      { mode: 'startup-catchup', notificationAllowed: false },
+      { mode: 'startup-catchup', notificationAllowed: true },
+      { mode: 'startup-catchup', notificationAllowed: true },
     ]);
     await expectEofWithoutReplay(monitor, store, file, onEvent);
   });
@@ -108,11 +124,19 @@ describe('CodexEventMonitor startup classification', () => {
     }
     await starting;
 
-    expect(onEvent).toHaveBeenCalledTimes(1);
-    expect(onEvent).toHaveBeenCalledWith(
-      expect.objectContaining({ type: 'question', requestId: 'current-after-listing' }),
-      file,
-    );
+    const fileCalls = onEvent.mock.calls.filter(([, filePath]) => filePath === file);
+    expect(fileCalls).toEqual([
+      [
+        expect.objectContaining({ type: 'completed', turnId: 'old-completion' }),
+        file,
+        { mode: 'startup-catchup', notificationAllowed: false },
+      ],
+      [
+        expect.objectContaining({ type: 'question', requestId: 'current-after-listing' }),
+        file,
+        { mode: 'startup-catchup', notificationAllowed: true },
+      ],
+    ]);
     await expectEofWithoutReplay(monitor, store, file, onEvent);
   });
 
@@ -153,11 +177,11 @@ describe('CodexEventMonitor startup classification', () => {
     }
     await starting;
 
-    expect(onEvent).toHaveBeenCalledTimes(1);
-    expect(onEvent).toHaveBeenCalledWith(
+    const liveCalls = onEvent.mock.calls.filter(([, filePath]) => filePath === liveFile);
+    expect(liveCalls).toEqual([[
       expect.objectContaining({ type: 'completed', turnId: 'live-with-old-timestamp' }),
       liveFile,
-    );
+    ]]);
     await expectEofWithoutReplay(monitor, store, liveFile, onEvent);
   });
 
@@ -184,7 +208,11 @@ describe('CodexEventMonitor startup classification', () => {
   async function setup(): Promise<{
     file: string;
     monitor: CodexEventMonitor;
-    onEvent: ReturnType<typeof vi.fn<(event: ParsedRolloutLine, filePath: string) => void>>;
+    onEvent: ReturnType<typeof vi.fn<(
+      event: ParsedRolloutLine,
+      filePath: string,
+      delivery?: CodexMonitorDelivery,
+    ) => void>>;
     sessionsDir: string;
     store: SessionStore;
   }> {
@@ -195,7 +223,11 @@ describe('CodexEventMonitor startup classification', () => {
     const file = join(nestedDir, 'rollout-startup.jsonl');
     const store = await SessionStore.create(':memory:');
     stores.push(store);
-    const onEvent = vi.fn<(event: ParsedRolloutLine, filePath: string) => void>();
+    const onEvent = vi.fn<(
+      event: ParsedRolloutLine,
+      filePath: string,
+      delivery?: CodexMonitorDelivery,
+    ) => void>();
     const monitor = new CodexEventMonitor({ sessionsDir, store, onEvent });
     monitors.push(monitor);
     return { file, monitor, onEvent, sessionsDir, store };
@@ -262,7 +294,11 @@ async function expectEofWithoutReplay(
   monitor: CodexEventMonitor,
   store: SessionStore,
   file: string,
-  onEvent: ReturnType<typeof vi.fn<(event: ParsedRolloutLine, filePath: string) => void>>,
+  onEvent: ReturnType<typeof vi.fn<(
+    event: ParsedRolloutLine,
+    filePath: string,
+    delivery?: CodexMonitorDelivery,
+  ) => void>>,
 ): Promise<void> {
   expect((await store.getNotificationCursor(file))?.byteOffset).toBe((await stat(file)).size);
   const calls = onEvent.mock.calls.length;

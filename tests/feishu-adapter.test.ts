@@ -365,20 +365,32 @@ describe('FeishuAdapter file handling', () => {
     await expect(adapter.downloadFile('om_1', 'file_1', 'file')).rejects.toThrow(/download limit/);
   });
 
-  it('scrubs card action trigger logs before callback handling', () => {
+  it('logs a fixed card action summary without serializing the callback object', () => {
     const adapter = new FeishuAdapter({ appId: 'app', appSecret: 'secret', botName: 'bot' });
     const consoleSpy = vi.spyOn(console, 'log').mockImplementation(() => undefined);
-    const circular: Record<string, unknown> = {};
-    circular.self = circular;
+    const callback = vi.fn();
+    adapter.onCallback(callback);
 
     expect(() =>
-      (adapter as unknown as { handleCardAction(data: unknown): unknown }).handleCardAction(circular),
+      (adapter as unknown as { handleCardAction(data: unknown): unknown }).handleCardAction({
+        context: {
+          open_chat_id: 'oc_private_secret',
+          open_message_id: 'om_private_secret',
+          chat_type: 'group',
+        },
+        operator: { open_id: 'ou_private_secret' },
+        action: { value: { action: 'private_action', sessionId: 'private_session' } },
+      }),
     ).not.toThrow();
 
     expect(consoleSpy).toHaveBeenCalledWith(
-      '[feishu] card.action.trigger received:',
-      '[object Object]',
+      '[feishu] callback=card_action chat=group operator=present message=present valueKeys=2',
     );
+    expect(JSON.stringify(consoleSpy.mock.calls)).not.toContain('private_secret');
+    expect(JSON.stringify(consoleSpy.mock.calls)).not.toContain('private_action');
+    expect(JSON.stringify(consoleSpy.mock.calls)).not.toContain('private_session');
+    expect(callback).toHaveBeenCalledTimes(1);
+    consoleSpy.mockRestore();
   });
 
   it('uses raw card elements directly when provided', async () => {

@@ -13,7 +13,6 @@ import type { AbortableOptions } from '../../abort.js';
 import { throwIfAborted } from '../../abort.js';
 import { openVerifiedOutboundFile } from '../../security/outbound-file.js';
 import { assertWithinAttachmentDownloadLimit } from '../../security/download-limits.js';
-import { scrubLog } from '../../security/logging.js';
 
 export interface FeishuAdapterConfig {
   appId: string;
@@ -498,21 +497,26 @@ export class FeishuAdapter implements PlatformAdapter {
   }
 
   private handleCardAction(data: unknown): unknown {
-    console.log('[feishu] card.action.trigger received:', scrubLog(data, 300));
+    const raw = asCallbackRecord(data);
+    const ctx = asCallbackRecord(raw.context ?? raw);
+    const operator = asCallbackRecord(raw.operator);
+    const action = asCallbackRecord(raw.action);
+    const actionValue = asCallbackRecord(action.value);
+    const messageId = readCallbackString(ctx.open_message_id) ?? readCallbackString(raw.open_message_id);
+    console.log(
+      `[feishu] callback=card_action chat=${callbackChatCategory(ctx.chat_type ?? raw.chat_type)}`
+      + ` operator=${readCallbackString(operator.open_id) || readCallbackString(raw.open_id) ? 'present' : 'absent'}`
+      + ` message=${messageId ? 'present' : 'absent'} valueKeys=${Object.keys(actionValue).length}`,
+    );
     if (!this.callbackHandler) return undefined;
-
-    const raw = data as Record<string, unknown>;
-    const ctx = (raw.context ?? raw) as Record<string, unknown>;
-    const operator = raw.operator as Record<string, unknown> | undefined;
-    const action = raw.action as Record<string, unknown> | undefined;
 
     this.callbackHandler({
       platform: 'feishu',
-      chatId: (ctx.open_chat_id as string) ?? '',
-      userId: (operator?.open_id as string) ?? (raw.open_id as string) ?? '',
-      chatType: (ctx.chat_type as string) ?? (raw.chat_type as string) ?? undefined,
-      data: JSON.stringify(action?.value ?? {}),
-      messageId: (ctx.open_message_id as string) ?? (raw.open_message_id as string) ?? '',
+      chatId: readCallbackString(ctx.open_chat_id) ?? '',
+      userId: readCallbackString(operator.open_id) ?? readCallbackString(raw.open_id) ?? '',
+      chatType: readCallbackString(ctx.chat_type) ?? readCallbackString(raw.chat_type),
+      data: JSON.stringify(action.value ?? {}),
+      messageId: messageId ?? '',
     });
 
     return undefined;
@@ -548,6 +552,22 @@ export class FeishuAdapter implements PlatformAdapter {
         : undefined,
     };
   }
+}
+
+function asCallbackRecord(value: unknown): Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : {};
+}
+
+function readCallbackString(value: unknown): string | undefined {
+  return typeof value === 'string' && value.length > 0 ? value : undefined;
+}
+
+function callbackChatCategory(value: unknown): string {
+  return value === 'p2p' || value === 'group' || value === 'supergroup' || value === 'channel'
+    ? value
+    : 'unknown';
 }
 
 function assertSuccessfulFeishuResponse(response: unknown, operation: string): void {

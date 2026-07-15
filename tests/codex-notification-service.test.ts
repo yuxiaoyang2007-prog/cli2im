@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm, stat, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -367,6 +367,111 @@ describe('CodexNotificationService', () => {
         turnId: 'turn_live_observed',
       }));
     } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it('reconstructs cursorless startup context gap-free while notifying only the current unambiguous no-id question', async () => {
+    vi.useRealTimers();
+    const directory = await mkdtemp(join(tmpdir(), 'cli2im-cursorless-catchup-'));
+    const sessionsDir = join(directory, 'sessions');
+    const validFile = join(sessionsDir, 'rollout-valid-catchup.jsonl');
+    const ambiguousFile = join(sessionsDir, 'rollout-ambiguous-catchup.jsonl');
+    const now = Date.now();
+    const oldTimestamp = now - 60_000;
+    const currentTimestamp = now + 60_000;
+    let service: CodexNotificationService | undefined;
+    let restartedService: CodexNotificationService | undefined;
+    let store: SessionStore | undefined;
+    const consoleLog = vi.spyOn(console, 'log').mockImplementation(() => undefined);
+
+    try {
+      await mkdir(sessionsDir, { recursive: true });
+      await Promise.all([
+        writeFile(validFile, startupCatchupRollout({
+          sessionId: 'session_valid_catchup',
+          currentTurnIds: ['turn_current_valid'],
+          currentTask: 'Implement Feishu notifications',
+          oldTimestamp,
+          currentTimestamp,
+          requestId: 'question_current_valid',
+        })),
+        writeFile(ambiguousFile, startupCatchupRollout({
+          sessionId: 'session_ambiguous_catchup',
+          currentTurnIds: ['turn_current_first', 'turn_current_second'],
+          currentTask: 'Review ambiguous notification',
+          oldTimestamp,
+          currentTimestamp,
+          requestId: 'question_current_ambiguous',
+        })),
+      ]);
+      const future = new Date(currentTimestamp);
+      await Promise.all([
+        utimes(validFile, future, future),
+        utimes(ambiguousFile, future, future),
+      ]);
+      store = await SessionStore.create(':memory:');
+      const router = {
+        resumePending: vi.fn().mockResolvedValue(undefined),
+        handle: vi.fn().mockResolvedValue('delivered'),
+        stop: vi.fn().mockResolvedValue(undefined),
+      } as unknown as NotificationRouter;
+      const dependencies = {
+        router,
+        metadataResolver: {
+          resolve: vi.fn(async (input) => ({
+            projectName: 'startup-project',
+            taskName: input.userText || 'unnamed',
+            surface: 'CLI' as const,
+            shortTaskId: input.sessionId.slice(0, 8),
+          })),
+        },
+        createSocket: () => ({ start: vi.fn(), stop: vi.fn() }),
+      };
+      const options = {
+        botName: 'codexbot',
+        workingDirectory: directory,
+        sessionsDir,
+        sessionIndexPath: join(directory, 'session_index.jsonl'),
+        socketPath: join(directory, 'notify.sock'),
+        store,
+        resolveAdapter: () => undefined,
+        timeZone: 'UTC',
+        dependencies,
+      };
+
+      service = new CodexNotificationService(options);
+      await service.start();
+
+      expect(router.handle).toHaveBeenCalledTimes(1);
+      expect(router.handle).toHaveBeenCalledWith(expect.objectContaining({
+        eventKey: eventKey([
+          'session_valid_catchup',
+          'turn_current_valid',
+          'question_current_valid',
+          'question',
+        ]),
+        sessionId: 'session_valid_catchup',
+        turnId: 'turn_current_valid',
+        requestId: 'question_current_valid',
+        projectName: 'startup-project',
+        taskName: 'Implement Feishu notifications',
+      }));
+      expect(JSON.stringify(vi.mocked(router.handle).mock.calls)).not.toContain('old_question');
+      expect(JSON.stringify(vi.mocked(router.handle).mock.calls)).not.toContain('question_current_ambiguous');
+      expect((await store.getNotificationCursor(validFile))?.byteOffset).toBe((await stat(validFile)).size);
+      expect((await store.getNotificationCursor(ambiguousFile))?.byteOffset).toBe((await stat(ambiguousFile)).size);
+
+      await service.stop();
+      service = undefined;
+      restartedService = new CodexNotificationService(options);
+      await restartedService.start();
+      expect(router.handle).toHaveBeenCalledTimes(1);
+    } finally {
+      await restartedService?.stop();
+      await service?.stop();
+      store?.close();
+      consoleLog.mockRestore();
       await rm(directory, { recursive: true, force: true });
     }
   });
@@ -1103,6 +1208,80 @@ describe('CodexNotificationService', () => {
     }));
   });
 });
+
+function startupCatchupRollout(input: {
+  sessionId: string;
+  currentTurnIds: string[];
+  currentTask: string;
+  oldTimestamp: number;
+  currentTimestamp: number;
+  requestId: string;
+}): string {
+  const oldTurnId = `${input.sessionId}_old_turn`;
+  const lines: object[] = [
+    {
+      type: 'session_meta',
+      payload: { id: input.sessionId, cwd: '/tmp/startup-project', source: 'cli' },
+    },
+    {
+      type: 'turn_context',
+      payload: { turn_id: oldTurnId, cwd: '/tmp/startup-project' },
+    },
+    {
+      type: 'response_item',
+      payload: {
+        type: 'message',
+        role: 'user',
+        content: [{ type: 'input_text', text: 'old task' }],
+        internal_chat_message_metadata_passthrough: { turn_id: oldTurnId },
+      },
+    },
+    {
+      timestamp: new Date(input.oldTimestamp).toISOString(),
+      type: 'response_item',
+      payload: {
+        type: 'function_call',
+        name: 'request_user_input',
+        call_id: `${input.sessionId}_old_question`,
+        arguments: '{"questions":[{"question":"old private question"}]}',
+        internal_chat_message_metadata_passthrough: { turn_id: oldTurnId },
+      },
+    },
+    {
+      timestamp: new Date(input.oldTimestamp).toISOString(),
+      type: 'event_msg',
+      payload: { type: 'task_complete', turn_id: oldTurnId },
+    },
+  ];
+  for (const turnId of input.currentTurnIds) {
+    lines.push(
+      {
+        type: 'turn_context',
+        payload: { turn_id: turnId, cwd: '/tmp/startup-project' },
+      },
+      {
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'user',
+          content: [{ type: 'input_text', text: input.currentTask }],
+          internal_chat_message_metadata_passthrough: { turn_id: turnId },
+        },
+      },
+    );
+  }
+  lines.push({
+    timestamp: new Date(input.currentTimestamp).toISOString(),
+    type: 'response_item',
+    payload: {
+      type: 'function_call',
+      name: 'request_user_input',
+      call_id: input.requestId,
+      arguments: '{"questions":[{"question":"current private question"}]}',
+    },
+  });
+  return `${lines.map((line) => JSON.stringify(line)).join('\n')}\n`;
+}
 
 function deferred<T>() {
   let resolve!: (value: T | PromiseLike<T>) => void;
