@@ -443,6 +443,81 @@ describe('NotificationRouter', () => {
     expect(await store.listPendingNotifications()).toEqual([]);
   });
 
+  it('replays only the same-message same-card patch after a crash before patch-state persistence', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'cli2im-router-patch-recovery-'));
+    temporaryDirectories.push(directory);
+    const dbPath = join(directory, 'sessions.db');
+    const firstStore = await SessionStore.create(dbPath);
+    await bindTarget(firstStore);
+    const event = attentionEvent({ eventKey: '777777777777777777777777' });
+    const firstSend = vi.fn<PlatformAdapter['send']>().mockImplementation(async () => {
+      vi.setSystemTime(STARTED_AT + 31_000);
+      return 'om_patch_recovery';
+    });
+    const firstReplaceCard = vi.fn<NonNullable<PlatformAdapter['replaceCard']>>()
+      .mockResolvedValue(undefined);
+    vi.spyOn(firstStore, 'markNotificationDelayedPatchCompleted')
+      .mockRejectedValue(new Error('sensitive local patch state failure'));
+    const firstLogs: NotificationLogEntry[] = [];
+    const firstRouter = new NotificationRouter({
+      store: firstStore,
+      botName: 'codexbot',
+      adapters: new Map([[
+        'codexbot',
+        adapterWith(firstSend, 'feishu', firstReplaceCard),
+      ]]),
+      timeZone: 'America/New_York',
+      log: (entry) => firstLogs.push(entry),
+      ...timerDependencies(),
+    });
+
+    await expect(firstRouter.handle(event)).resolves.toBe('pending');
+    expect(firstSend).toHaveBeenCalledTimes(1);
+    expect(firstReplaceCard).toHaveBeenCalledTimes(1);
+    firstRouter.stop();
+    firstStore.close();
+
+    vi.setSystemTime(STARTED_AT + 32_000);
+    const reloadedStore = await SessionStore.create(dbPath);
+    stores.push(reloadedStore);
+    const resumedSend = vi.fn<PlatformAdapter['send']>().mockResolvedValue('must_not_create');
+    const resumedReplaceCard = vi.fn<NonNullable<PlatformAdapter['replaceCard']>>()
+      .mockResolvedValue(undefined);
+    const resumedRouter = new NotificationRouter({
+      store: reloadedStore,
+      botName: 'codexbot',
+      adapters: new Map([[
+        'codexbot',
+        adapterWith(resumedSend, 'feishu', resumedReplaceCard),
+      ]]),
+      timeZone: 'America/New_York',
+      log: vi.fn(),
+      ...timerDependencies(),
+    });
+
+    await resumedRouter.resumePending();
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(resumedSend).not.toHaveBeenCalled();
+    expect(resumedReplaceCard).toHaveBeenCalledTimes(1);
+    expect(resumedReplaceCard.mock.calls[0]).toEqual(firstReplaceCard.mock.calls[0]);
+    expect(resumedReplaceCard).toHaveBeenCalledWith(
+      'om_patch_recovery',
+      buildNotificationCard(event, {
+        delayed: true,
+        timeZone: 'America/New_York',
+      }),
+    );
+    expect(firstLogs).toEqual([{
+      kind: 'needs_attention',
+      eventKey: '77777777',
+      attempt: 1,
+      errorClass: 'patch_state_error',
+    }]);
+    expect(JSON.stringify(firstLogs)).not.toContain('sensitive local patch state failure');
+    expect(await reloadedStore.listPendingNotifications()).toEqual([]);
+  });
+
   it('never re-enters the adapter in-process after external acceptance', async () => {
     const store = await SessionStore.create(':memory:');
     stores.push(store);

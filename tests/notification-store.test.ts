@@ -258,27 +258,47 @@ describe('notification persistence', () => {
     migratedDb.close();
   });
 
-  it('clears a delivered payload while retaining its dedupe key and timestamp', async () => {
+  it('clears all non-dedupe delivery metadata after retaining the key and delivered timestamp', async () => {
     const directory = mkdtempSync(join(tmpdir(), 'cli2im-notification-store-'));
     temporaryDirectories.push(directory);
     const dbPath = join(directory, 'sessions.db');
     const store = await SessionStore.create(dbPath);
     const delivered = completionEvent({ eventKey: 'evt_delivered' });
     await store.enqueueNotification(delivered);
-    await store.markNotificationDelivered(delivered.eventKey, 3000);
+    await store.markNotificationAttemptStarted(delivered.eventKey, 1500);
+    await store.recordNotificationReceipt(delivered.eventKey, 'om_delivered', 1800);
+    await store.markNotificationDelayedPatchCompleted(delivered.eventKey, 1900);
     store.close();
 
     const SQL = await initSqlJs({
       locateFile: (file: string) => join(sqlWasmDir, file),
     });
-    const db = new SQL.Database(readFileSync(dbPath)) as unknown as ReadOnlyTestDatabase;
-    const [result] = db.exec(
-      'SELECT event_key, event_json, status, next_retry_at, delivered_at FROM notification_deliveries',
+    const intermediateDb = new SQL.Database(readFileSync(dbPath));
+    intermediateDb.run(
+      'UPDATE notification_deliveries SET delayed = 1 WHERE event_key = ?',
+      [delivered.eventKey],
+    );
+    writeFileSync(dbPath, Buffer.from(intermediateDb.export()));
+    intermediateDb.close();
+
+    const reloadedStore = await SessionStore.create(dbPath);
+    await reloadedStore.markNotificationDelivered(delivered.eventKey, 3000);
+    reloadedStore.close();
+
+    const verifiedDb = new SQL.Database(readFileSync(dbPath)) as unknown as ReadOnlyTestDatabase;
+    const [result] = verifiedDb.exec(
+      `SELECT event_key, event_json, status, attempts, first_attempt_at,
+              last_attempt_at, next_retry_at, delivered_at, delayed,
+              transport_message_id, acknowledged_at, delayed_patch_completed_at
+       FROM notification_deliveries`,
     );
     expect(result.values).toEqual([
-      ['evt_delivered', '{}', 'delivered', null, 3000],
+      [
+        'evt_delivered', '{}', 'delivered', 0, null, null,
+        null, 3000, null, null, null, null,
+      ],
     ]);
-    db.close();
+    verifiedDb.close();
   });
 
   it('persists failed and discarded terminal statuses outside the pending queue', async () => {

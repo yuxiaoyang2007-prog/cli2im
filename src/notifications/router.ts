@@ -261,6 +261,9 @@ export class NotificationRouter {
           return this.handleLocalFailure(current, receipt, retryIndex, 'patch_adapter_unavailable');
         }
         try {
+          // If the process crashes before patch completion is persisted, replaying this
+          // same full card against the persisted message ID is effect-idempotent and
+          // cannot create a second notification. Pre-marking would risk omitting the marker.
           await adapter.replaceCard(
             receipt.messageId,
             buildNotificationCard(event, {

@@ -407,7 +407,17 @@ export class SessionStore {
   async markNotificationDelivered(eventKey: string, deliveredAt: number): Promise<void> {
     this.db.run(
       `UPDATE notification_deliveries
-       SET event_json = '{}', status = 'delivered', next_retry_at = NULL, delivered_at = ?
+       SET event_json = '{}',
+           status = 'delivered',
+           attempts = 0,
+           first_attempt_at = NULL,
+           last_attempt_at = NULL,
+           next_retry_at = NULL,
+           delivered_at = ?,
+           delayed = NULL,
+           transport_message_id = NULL,
+           acknowledged_at = NULL,
+           delayed_patch_completed_at = NULL
        WHERE event_key = ? AND status = 'pending'`,
       [deliveredAt, eventKey],
     );
