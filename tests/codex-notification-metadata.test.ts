@@ -178,6 +178,14 @@ const syntheticSecret = true;
     ['alternate-prompt-prefixed command', '❯ openclaw gateway status'],
     ['list-prefixed command', '- lark-cli auth scopes'],
     ['command with trailing CJK', 'env codex update 中文'],
+    ['percent-prefixed command', '% codex update'],
+    ['hash-prefixed command', '# openclaw gateway status'],
+    ['numbered-list command', '1. lark-cli auth scopes'],
+    ['checkbox-list command', '- [ ] codex update'],
+    ['percent-prefixed code', '% const value = true'],
+    ['percent-prefixed markup code', '% <Component />'],
+    ['percent-prefixed log', '% [2026-07-15T12:00:00Z] error synthetic failure'],
+    ['percent-prefixed executable path', '% /usr/bin/custom deploy'],
     ['non-allowlisted hyphenated head', 'review-tool run'],
     ['shell redirection', 'deploy > /tmp/private/output.log'],
     ['shell operator expression', 'build && deploy'],
@@ -251,10 +259,23 @@ const syntheticSecret = true;
     expect(sanitizeTaskTitle('请检查通知流程')).toBe('请检查通知流程');
   });
 
+  it.each([
+    ['% implement notification handling', 'implement notification handling'],
+    ['# explain why notifications fail', 'explain why notifications fail'],
+    ['1. summarize notification changes', 'summarize notification changes'],
+    ['- [ ] read the report', 'read the report'],
+  ])('normalizes arbitrary punctuation or list syntax in %s', (value, expected) => {
+    expect(sanitizeTaskTitle(value)).toBe(expected);
+  });
+
+  it('rejects a title with no Unicode letter', () => {
+    expect(sanitizeTaskTitle('1234 - [ ]')).toBe('');
+  });
+
   it('truncates CJK-heavy and Latin-heavy titles by Unicode code points', () => {
     expect(Array.from(sanitizeTaskTitle('测'.repeat(45)))).toHaveLength(40);
     expect(Array.from(sanitizeTaskTitle(`review ${'a'.repeat(90)}`))).toHaveLength(80);
-    expect(Array.from(sanitizeTaskTitle('😀'.repeat(90)))).toHaveLength(80);
+    expect(Array.from(sanitizeTaskTitle(`review ${'😀'.repeat(90)}`))).toHaveLength(80);
   });
 });
 

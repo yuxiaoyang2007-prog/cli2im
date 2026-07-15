@@ -14,7 +14,7 @@ const CJK = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hang
 const IMAGE_EXTENSION = /\.(?:avif|bmp|gif|heic|jpeg|jpg|png|tiff|webp)$/i;
 const CODE_LINE = /^(?:(?:async\s+)?function|const|let|var|class|interface|type|enum|namespace|import|export|def)\b|^(?:console\.log|print)\s*\(|^(?:[A-Za-z_$][\w$]*\.)+[A-Za-z_$][\w$]*\s*\([^)]*\)\s*;?$|^[A-Za-z_$][\w$]*(?:\.[\w$]+)*\s*=(?!=)\s*\S|^\{\s*"[^"]+"\s*:|^\[\s*(?:\{|\[|"|-?\d|true\b|false\b|null\b)|^<[/!]?[A-Za-z][^>]*>/;
 const DIFF_LINE = /^(?:diff --git\b|index [0-9a-f]+\.{2}[0-9a-f]+\b|---\s+\S+|\+\+\+\s+\S+|@@\s+-\d)/i;
-const LOG_LINE = /^(?:\[\d{4}-\d{2}-\d{2}[T ][^\]]*]\s*|\d{4}-\d{2}-\d{2}[T ]\S+\s+)(?:TRACE|DEBUG|INFO|WARN|WARNING|ERROR|FATAL)\b|^(?:TRACE|DEBUG|INFO|WARN|WARNING|ERROR|FATAL)\s+[\[:]/i;
+const LOG_LINE = /^[^\p{L}]*(?:\[\d{4}-\d{2}-\d{2}[T ][^\]]*\]\s*|\d{4}-\d{2}-\d{2}[T ]\S+\s+)(?:TRACE|DEBUG|INFO|WARN|WARNING|ERROR|FATAL)\b|^(?:TRACE|DEBUG|INFO|WARN|WARNING|ERROR|FATAL)\s+(?:\[|:)/iu;
 const RAW_COMMAND_HEADS = new Set([
   'awk', 'bash', 'brew', 'bun', 'cargo', 'cat', 'cd', 'cmake', 'codex', 'curl',
   'deno', 'deploy', 'docker', 'echo', 'gh', 'git', 'grep', 'kubectl', 'lark-cli',
@@ -41,7 +41,7 @@ const FIND_PATH_ARGUMENT = /(?:^|\s)\S*[\\/]\S*(?:\s|$)/;
 const MAKE_PROSE_DETERMINER = /^(?:the|a|an|this|that)\b/;
 const HTTP_URL_IN_TEXT = /\bhttps?:\/\/[^\s/]+(?:\/[^\s]*)?/gi;
 const CLAUSE_CONNECTOR = /^(?:and|then|but|or)\b/i;
-const LEADING_PROMPT_OR_LIST_PREFIX = /^(?:[$❯>*•-]\s+)+/u;
+const HTML_TAG = /<[/!]?[A-Za-z][^>]*>/;
 const SHELL_SYNTAX = /&&|\|\||(?:^|\s)\|(?!\|)|(?:^|\s)(?:>>?|<<?)|;(?=\s|$)/;
 const SQL_LINE = /^(?:SELECT|INSERT|UPDATE|DELETE|CREATE|ALTER|DROP|WITH)\b.*(?:\bFROM\b|\bINTO\b|\bTABLE\b|\bSET\b|\*)/;
 const CONTROL_FLOW_LINE = /^(?:if|for|while|switch|try|catch)\s*\(/;
@@ -105,9 +105,12 @@ export function sanitizeTaskTitle(value: string): string {
     .split(/\r?\n/)
     .map((line) => line.trim())
     .find(Boolean) ?? '';
-  const lexicalCandidate = firstMeaningfulLine
-    .replace(LEADING_PROMPT_OR_LIST_PREFIX, '')
-    .trimStart();
+  if (isHighConfidenceRawCommand(firstMeaningfulLine)
+    || hasUnsafePreLexicalStructure(firstMeaningfulLine)) {
+    return '';
+  }
+  const lexicalCandidate = normalizeLexicalStart(firstMeaningfulLine);
+  if (!lexicalCandidate) return '';
   if (isHighConfidenceRawCommand(lexicalCandidate)) return '';
   const pathSafe = sanitizeAbsolutePaths(lexicalCandidate);
   if (pathSafe === null) return '';
@@ -248,8 +251,15 @@ function resolveSurface(source: string): CodexSurface {
 }
 
 function isUnsafeTechnicalTitle(value: string): boolean {
-  if (SHELL_SYNTAX.test(value)
-    || CODE_LINE.test(value)
+  if (hasUnsafeTechnicalStructure(value)) {
+    return true;
+  }
+
+  return !isEligibleNaturalTitle(value);
+}
+
+function hasUnsafePreLexicalStructure(value: string): boolean {
+  return CODE_LINE.test(value)
     || DIFF_LINE.test(value)
     || LOG_LINE.test(value)
     || SQL_LINE.test(value)
@@ -257,11 +267,17 @@ function isUnsafeTechnicalTitle(value: string): boolean {
     || ERROR_OR_STACK_LINE.test(value)
     || PYTHON_STACK_FRAME.test(value)
     || TRACEBACK_HEADER.test(value)
-    || SIMPLE_CALL_LINE.test(value)) {
-    return true;
-  }
+    || SIMPLE_CALL_LINE.test(value)
+    || HTML_TAG.test(value);
+}
 
-  return !isEligibleNaturalTitle(value);
+function hasUnsafeTechnicalStructure(value: string): boolean {
+  return SHELL_SYNTAX.test(value) || hasUnsafePreLexicalStructure(value);
+}
+
+function normalizeLexicalStart(value: string): string {
+  const firstLetterIndex = value.search(/\p{L}/u);
+  return firstLetterIndex < 0 ? '' : value.slice(firstLetterIndex);
 }
 
 function isEligibleNaturalTitle(value: string): boolean {
