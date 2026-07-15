@@ -18,6 +18,9 @@ describe('sanitizeTaskTitle', () => {
     ['short Bearer credential', 'Bearer abc123', 'Review [REDACTED]'],
     ['Authorization credential', 'Authorization: Basic YWxhZGRpbjpvcGVuc2VzYW1l', 'Review [REDACTED]'],
     ['quoted auth credential', 'auth="Bearer abc123"', 'Review [REDACTED]'],
+    ['quoted arbitrary auth credential', 'auth="alpha beta secret"', 'Review [REDACTED]'],
+    ['short auth assignment', 'auth=abc123', 'Review [REDACTED]'],
+    ['quoted Authorization value', 'Authorization: "callback"', 'Review [REDACTED]'],
     ['short Basic credential', 'Basic YTpwYXNz', 'Review [REDACTED]'],
     ['signed URL', 'https://example.test/download?X-Amz-Credential=AKIAIOSFODNN7EXAMPLE&X-Amz-Signature=0123456789abcdef0123456789abcdef', 'Review https://example.test/download'],
     ['Slack webhook URL', 'https://hooks.slack.com/services/T00000000/B00000000/XXXXXXXXXXXXXXXXXXXXXXXX', 'Review https://hooks.slack.com/[REDACTED]'],
@@ -25,6 +28,8 @@ describe('sanitizeTaskTitle', () => {
     ['Teams-style webhook URL', 'https://example.test/api/webhookb2/short-secret-id', 'Review https://example.test/api/webhookb2/[REDACTED]'],
     ['labeled secret path URL', 'https://example.test/callback/token/short-secret-id', 'Review https://example.test/callback/token/[REDACTED]'],
     ['ambiguous high-entropy value', 'mF_9xQ7vK2pL8sN4dR6tY1wB3cE5hJ0z', 'Review [REDACTED]'],
+    ['alphabetic mixed-case high-entropy value', 'QzLmNpRtVxBcDfGhJkSwYuAeIo', 'Review [REDACTED]'],
+    ['alphabetic lowercase high-entropy value', 'qwertyuiopasdfghjklzxcvbnm', 'Review [REDACTED]'],
     ['ambiguous base64 credential', 'Abcdefghijklmnop/QR234567890+=', 'Review [REDACTED]'],
     ['ambiguous hex credential', '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef', 'Review [REDACTED]'],
   ] as const;
@@ -52,6 +57,8 @@ describe('sanitizeTaskTitle', () => {
 
   it.each([
     'CodexNotificationMetadataResolver',
+    'CodexNotificationMetadataResolverV2',
+    'NotificationDeliveryRetryHandler2026',
     'codex_notification_delivery_timeout',
     'notification-delivery-retry-handler',
   ])('preserves a common non-secret identifier as a task title: %s', (identifier) => {
@@ -70,6 +77,18 @@ describe('sanitizeTaskTitle', () => {
     'Review auth=ghp_1234567890abcdefghijklmnopqrstuvwxyzAB',
   ])('redacts an explicit or credential-shaped authorization value: %s', (title) => {
     expect(sanitizeTaskTitle(title)).toBe('Review [REDACTED]');
+  });
+
+  it.each([
+    'Review Basic YTpwYXNz.',
+    'Review "Basic YTpwYXNz"',
+    'Review [Basic YTpwYXNz]',
+    'Review (Basic YTpwYXNz)!',
+  ])('redacts a valid Basic credential before ordinary punctuation: %s', (title) => {
+    const sanitized = sanitizeTaskTitle(title);
+
+    expect(sanitized).toContain('[REDACTED]');
+    expect(sanitized).not.toContain('YTpwYXNz');
   });
 
   it('removes secrets URLs home paths and instruction wrappers from a task title', () => {
@@ -384,6 +403,8 @@ describe('NotificationMetadataResolver', () => {
     ['Bearer credential', 'Bearer mF_9xQ7vK2pL8sN4dR6tY1wB3cE5hJ0z'],
     ['webhook URL', 'https://hooks.slack.com/services/T00000000/B00000000/XXXXXXXXXXXXXXXXXXXXXXXX'],
     ['high-entropy credential', 'mF_9xQ7vK2pL8sN4dR6tY1wB3cE5hJ0z'],
+    ['alphabetic mixed-case credential', 'QzLmNpRtVxBcDfGhJkSwYuAeIo'],
+    ['alphabetic lowercase credential', 'qwertyuiopasdfghjklzxcvbnm'],
   ])('falls back instead of placing a bare %s in notification fields', async (_kind, credential) => {
     const codexDir = makeTemporaryDirectory();
     await writeFile(join(codexDir, 'session_index.jsonl'), JSON.stringify({
@@ -429,6 +450,8 @@ describe('NotificationMetadataResolver', () => {
 
   it.each([
     'CodexNotificationMetadataResolver',
+    'CodexNotificationMetadataResolverV2',
+    'NotificationDeliveryRetryHandler2026',
     'codex_notification_delivery_timeout',
     'notification-delivery-retry-handler',
   ])('preserves a common identifier as project and task metadata: %s', async (identifier) => {
@@ -467,6 +490,48 @@ describe('NotificationMetadataResolver', () => {
 
     expect(result.taskName).toBe('未命名任务 · basic-cr');
     expect(JSON.stringify(result)).not.toContain('YTpwYXNz');
+  });
+
+  it('redacts a short valid Basic credential before punctuation in resolved metadata', async () => {
+    const codexDir = makeTemporaryDirectory();
+    const resolver = new NotificationMetadataResolver({
+      codexDir,
+      resolveGitRoot: async () => '/workspace/safe-project',
+    });
+
+    const result = await resolver.resolve({
+      sessionId: 'basic-punctuation-session',
+      cwd: '/workspace/safe-project',
+      source: 'cli',
+      userText: 'Review Basic YTpwYXNz.',
+      attachmentName: undefined,
+    });
+
+    expect(result.taskName).toBe('Review [REDACTED].');
+    expect(JSON.stringify(result)).not.toContain('YTpwYXNz');
+  });
+
+  it.each([
+    'Review auth=abc123',
+    'Review auth="alpha beta secret"',
+  ])('fails closed for auth assignments in resolved task metadata: %s', async (title) => {
+    const codexDir = makeTemporaryDirectory();
+    const resolver = new NotificationMetadataResolver({
+      codexDir,
+      resolveGitRoot: async () => '/workspace/safe-project',
+    });
+
+    const result = await resolver.resolve({
+      sessionId: 'auth-assignment-session',
+      cwd: '/workspace/safe-project',
+      source: 'cli',
+      userText: title,
+      attachmentName: undefined,
+    });
+
+    expect(result.taskName).toBe('Review [REDACTED]');
+    expect(JSON.stringify(result)).not.toContain('abc123');
+    expect(JSON.stringify(result)).not.toContain('alpha beta secret');
   });
 
   it.each([

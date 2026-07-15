@@ -138,6 +138,37 @@ describe('Codex notification event parsing', () => {
     });
     expect(withContext('Basic YTpwYXNz')).toBeNull();
     expect(JSON.stringify(withContext('Review Basic YTpwYXNz'))).not.toContain('YTpwYXNz');
+    expect(withContext('Review Basic YTpwYXNz.')).toEqual({
+      type: 'user_message',
+      turnId: 'turn_basic',
+      userText: 'Review [REDACTED].',
+    });
+    expect(withContext('Review "Basic YTpwYXNz"')).toEqual({
+      type: 'user_message',
+      turnId: 'turn_basic',
+      userText: 'Review "[REDACTED]"',
+    });
+  });
+
+  it.each([
+    'Review auth=abc123',
+    'Review auth="alpha beta secret"',
+  ])('fails closed for an auth assignment in a parsed user event: %s', (text) => {
+    const parsed = parseRolloutLine(JSON.stringify({
+      type: 'response_item',
+      payload: {
+        type: 'message', role: 'user', content: [{ type: 'input_text', text }],
+        internal_chat_message_metadata_passthrough: { turn_id: 'turn_auth_assignment' },
+      },
+    }));
+
+    expect(parsed).toEqual({
+      type: 'user_message',
+      turnId: 'turn_auth_assignment',
+      userText: 'Review [REDACTED]',
+    });
+    expect(JSON.stringify(parsed)).not.toContain('abc123');
+    expect(JSON.stringify(parsed)).not.toContain('alpha beta secret');
   });
 
   it('keeps a sanitized technical-looking attachment basename', () => {

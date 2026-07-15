@@ -12,12 +12,13 @@ const OPENAI_STYLE_KEY = /\b(?:sk|sess)-[A-Za-z0-9_-]{12,}\b/g;
 const GITHUB_TOKEN = /\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})\b/gi;
 const AWS_ACCESS_KEY = /\b(?:A3T[A-Z0-9]|ABIA|ACCA|AGPA|AIDA|AIPA|AKIA|ANPA|ANVA|APKA|AROA|ASCA|ASIA)[A-Z0-9]{16}\b/g;
 const JWT = /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/g;
-const EXPLICIT_AUTHORIZATION_CREDENTIAL = /\b(?:authorization|proxy-authorization|auth)\s*[:=]\s*(?:"(?:bearer|basic)\s+(?:\\.|[^"\\])*(?:"|$)|'(?:bearer|basic)\s+(?:\\.|[^'\\])*(?:'|$)|(?:bearer|basic)\s+[^\s,;]+)/gi;
+const AUTHORIZATION_CREDENTIAL = /\b(?:authorization|proxy-authorization|auth)\s*(?:=\s*(?:"(?:\\.|[^"\\])*(?:"|$)|'(?:\\.|[^'\\])*(?:'|$)|[^\s,;]*)|:\s*(?:"(?:\\.|[^"\\])*(?:"|$)|'(?:\\.|[^'\\])*(?:'|$)|(?:bearer|basic)\s+[^\s,;]+))/gi;
 const REDACTED_AUTHORIZATION_ASSIGNMENT = /\b(?:authorization|proxy-authorization|auth)\s*[:=]\s*(?:"\[REDACTED\]"|'\[REDACTED\]'|\[REDACTED\])/gi;
 const BEARER_CREDENTIAL = /\bbearer\s+[^\s,;]+/gi;
-const BASIC_CREDENTIAL = /\bbasic\s+([A-Za-z0-9+/]+={0,2})(?=$|[\s,;)])/gi;
+const BASIC_CREDENTIAL = /\bbasic\s+([A-Za-z0-9+/]+={0,2})(?![A-Za-z0-9+/=])/gi;
 const REDACTION = '[REDACTED]';
-const SAFE_STANDALONE_IDENTIFIER = /^(?:[A-Z][A-Za-z0-9]+|[A-Za-z][A-Za-z0-9]*(?:[_-][A-Za-z0-9]+)+)$/;
+const STRUCTURED_PASCAL_IDENTIFIER = /^(?:[A-Z][a-z]{2,}){2,}(?:(?:[A-Z]\d+)|\d+)?$/;
+const STRUCTURED_SEPARATED_IDENTIFIER = /^[a-z][a-z0-9]*(?:[_-][a-z][a-z0-9]*)+$/;
 const MARKDOWN_LINK = /\[([^\]]+)]\([^\s)]+\)/g;
 const CODE_FENCE = /```[\s\S]*?```/g;
 const CJK = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/u;
@@ -303,7 +304,7 @@ function normalizeLexicalStart(value: string): string {
 }
 
 function isEligibleNaturalTitle(value: string): boolean {
-  if (SAFE_STANDALONE_IDENTIFIER.test(value)) return true;
+  if (isStructuredIdentifier(value)) return true;
   const firstToken = /^(\S+)/.exec(value)?.[1];
   if (!firstToken || !/^[a-z]/.test(firstToken)) return true;
   if (!/^[a-z]+$/.test(firstToken)) return false;
@@ -388,7 +389,7 @@ function redactNamedSecrets(value: string): string {
 
 function redactCredentialTokens(value: string): string {
   let redacted = value
-    .replace(EXPLICIT_AUTHORIZATION_CREDENTIAL, REDACTION)
+    .replace(AUTHORIZATION_CREDENTIAL, REDACTION)
     .replace(BEARER_CREDENTIAL, REDACTION)
     .replace(GITHUB_TOKEN, REDACTION)
     .replace(AWS_ACCESS_KEY, REDACTION)
@@ -430,7 +431,9 @@ function redactAmbiguousCredentialTokens(value: string): string {
 
 function isAmbiguousCredentialToken(value: string): boolean {
   if (value.length < 24) return false;
+  if (isStructuredIdentifier(value)) return false;
   if (/^[A-Fa-f0-9]{48,}$/.test(value) && shannonEntropy(value) >= 3.5) return true;
+  if (/^[A-Za-z]{24,}$/.test(value)) return shannonEntropy(value) >= 4;
   if (value.includes('/')) {
     if (/^(?:\/|\.{1,2}\/|~\/)/.test(value) || value.includes('://')) return false;
     if (!/[+=]/.test(value)) return false;
@@ -441,6 +444,11 @@ function isAmbiguousCredentialToken(value: string): boolean {
     && /[a-z]/.test(value)
     && /[A-Z]/.test(value)
     && shannonEntropy(value) >= 3.5;
+}
+
+function isStructuredIdentifier(value: string): boolean {
+  return STRUCTURED_PASCAL_IDENTIFIER.test(value)
+    || STRUCTURED_SEPARATED_IDENTIFIER.test(value);
 }
 
 function shannonEntropy(value: string): number {
