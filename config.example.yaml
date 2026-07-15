@@ -47,16 +47,17 @@ bots:
     #   enabled: true                # opt-in: both sender and receiver must enable
     #   maxConsecutiveRounds: 10     # safety cap for bot-to-bot turns without human input
 
-  # --- Example: Codex on Telegram ---
-  # codexbot:
-  #   agent: codex
-  #   platform: telegram
-  #   telegram:
-  #     token: ${CODEX_TG_BOT_TOKEN}    # @BotFather → /newbot → token
-  #   workingDirectory: ~/projects
-  #   allowFrom:
-  #     - "123456789"                    # Telegram: numeric user ID (send /start, check logs)
-  #   permissionMode: blacklist
+  # --- Example: Codex on Feishu ---
+  codexbot:
+    agent: codex
+    platform: feishu
+    feishu:
+      appId: ${CODEXBOT_FEISHU_APP_ID}
+      appSecret: ${CODEXBOT_FEISHU_APP_SECRET}
+    workingDirectory: ~/projects
+    allowFrom:
+      - ou_xxxxxxxxxxxx
+    permissionMode: blacklist
 
   # --- Example: Gemini on Telegram ---
   # geminibot:
@@ -93,8 +94,8 @@ agents:
     env:
       DISABLE_AUTOUPDATER: "1"           # recommended for daemon use
 
-  # codex:
-  #   binary: ~/.codex/bin/codex
+  codex:
+    binary: ~/.codex/bin/codex
 
   # gemini:
   #   binary: /opt/homebrew/bin/gemini   # or: /usr/local/bin/gemini

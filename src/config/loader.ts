@@ -115,8 +115,11 @@ function validateConfig(config: AppConfig): void {
   if (!config.agents || typeof config.agents !== 'object') {
     throw new Error('Config error: "agents" section is required');
   }
-  if (config.notifications?.codex) {
-    const codex = config.notifications.codex;
+  if (config.notifications !== undefined) {
+    const codex = config.notifications?.codex;
+    if (typeof codex !== 'object' || codex === null || Array.isArray(codex)) {
+      throw new Error('Config error: notifications.codex must be an object');
+    }
     if (typeof codex.enabled !== 'boolean') {
       throw new Error('Config error: notifications.codex.enabled must be a boolean');
     }

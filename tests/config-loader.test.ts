@@ -36,6 +36,13 @@ bots:
     workingDirectory: /tmp/project
     allowFrom: [ou_user]
     permissionMode: blacklist
+  telegrambot:
+    agent: codex
+    platform: telegram
+    telegram: { token: telegram-test-token }
+    workingDirectory: /tmp/project
+    allowFrom: [test-user]
+    permissionMode: blacklist
 agents:
   codex: { binary: /opt/homebrew/bin/codex }
 session: { maxActive: 64, idleResetMinutes: 120, dbPath: /tmp/cli2im.db }
@@ -66,6 +73,20 @@ notifications:
     expect(config.notifications?.codex).toEqual({ enabled: true, botName: 'codexbot' });
   });
 
+  it('keeps the sample config internally valid for Codex notifications', () => {
+    const config = loadConfig(join(process.cwd(), 'config.example.yaml'), {
+      CCBOT_FEISHU_APP_ID: 'cc-app',
+      CCBOT_FEISHU_APP_SECRET: 'cc-secret',
+      CODEXBOT_FEISHU_APP_ID: 'codex-app',
+      CODEXBOT_FEISHU_APP_SECRET: 'codex-secret',
+      CLI2IM_WEB_TOKEN: 'server-token',
+      PATH: '/usr/bin',
+    });
+
+    expect(config.notifications?.codex.botName).toBe('codexbot');
+    expect(config.bots.codexbot.platform).toBe('feishu');
+  });
+
   it.each([
     ['enabled', 'yes'],
     ['botName', ''],
@@ -76,6 +97,33 @@ notifications:
     enabled: ${field === 'enabled' ? value : 'true'}
     botName: ${field === 'botName' ? JSON.stringify(value) : 'codexbot'}
 `)).toThrow('Config error: notifications.codex');
+  });
+
+  it('rejects a Codex notification bot name that does not exist', () => {
+    expect(() => loadNotificationFixture(`
+notifications:
+  codex:
+    enabled: true
+    botName: missingbot
+`)).toThrow('Config error: notifications.codex.botName must name an existing bot');
+  });
+
+  it('rejects a Codex notification bot that does not use Feishu', () => {
+    expect(() => loadNotificationFixture(`
+notifications:
+  codex:
+    enabled: true
+    botName: telegrambot
+`)).toThrow('Config error: notifications.codex.botName must use the feishu platform');
+  });
+
+  it.each([
+    ['an empty notifications object', 'notifications: {}'],
+    ['a null notifications.codex value', 'notifications:\n  codex: null'],
+  ])('rejects %s', (_case, notificationYaml) => {
+    expect(() => loadNotificationFixture(notificationYaml)).toThrow(
+      'Config error: notifications.codex must be an object',
+    );
   });
 
   it('loads and parses yaml config with env substitution', () => {
