@@ -9,6 +9,7 @@ import type {
 const RETRY_DELAYS_MS = [1_000, 5_000, 20_000] as const;
 const MAX_ATTEMPTS = RETRY_DELAYS_MS.length + 1;
 const DELAYED_AFTER_MS = 30_000;
+const UUID_SAFETY_WINDOW_MS = 55 * 60_000;
 const SHORT_EVENT_KEY_LENGTH = 8;
 
 type Timer = ReturnType<typeof globalThis.setTimeout>;
@@ -17,9 +18,11 @@ type NotificationStore = Pick<SessionStore,
   | 'enqueueNotification'
   | 'getNotificationBinding'
   | 'listPendingNotifications'
-  | 'markNotificationAttempt'
+  | 'markNotificationAttemptStarted'
   | 'markNotificationDelivered'
   | 'markNotificationFailed'
+  | 'setNotificationDelayed'
+  | 'setNotificationNextRetry'
 >;
 
 export interface NotificationLogEntry {
@@ -57,6 +60,7 @@ export class NotificationRouter {
   private readonly logger: (entry: NotificationLogEntry) => void;
   private readonly timers = new Map<string, Timer>();
   private readonly inFlight = new Map<string, Promise<NotificationHandleResult>>();
+  private readonly acceptedInProcess = new Set<string>();
   private stopped = false;
 
   constructor(options: NotificationRouterOptions) {
@@ -77,7 +81,8 @@ export class NotificationRouter {
   }
 
   private async handleNew(event: CodexNotificationEvent): Promise<NotificationHandleResult> {
-    if (!await this.store.enqueueNotification(event)) return 'duplicate';
+    const delayed = this.isDelayed(event);
+    if (!await this.store.enqueueNotification(event, delayed)) return 'duplicate';
 
     const binding = await this.store.getNotificationBinding(this.botName);
     if (!binding) {
@@ -93,21 +98,31 @@ export class NotificationRouter {
       return 'pending';
     }
 
-    return this.attemptDelivery(event, 0, binding.chatId, adapter);
+    return this.attemptDelivery({
+      event,
+      status: 'pending',
+      attempts: 0,
+      lastAttemptAt: null,
+      nextRetryAt: null,
+      deliveredAt: null,
+      delayed,
+    }, binding.chatId, adapter);
   }
 
   async resumePending(): Promise<void> {
     if (this.stopped) return;
     const deliveries = await this.store.listPendingNotifications();
-    for (const delivery of deliveries) {
-      if (this.inFlight.has(delivery.event.eventKey)) continue;
-      if (delivery.attempts >= MAX_ATTEMPTS) {
-        await this.store.markNotificationFailed(delivery.event.eventKey);
-        continue;
-      }
+    for (const storedDelivery of deliveries) {
+      if (this.inFlight.has(storedDelivery.event.eventKey)) continue;
+      const delivery = await this.preparePendingDelivery(storedDelivery);
+      if (!delivery) continue;
       const delayMs = delivery.nextRetryAt === null
         ? 0
         : Math.max(0, delivery.nextRetryAt - this.now());
+      if (this.acceptedInProcess.has(delivery.event.eventKey)) {
+        this.scheduleFinalization(delivery, 0, delayMs);
+        continue;
+      }
       this.scheduleDelivery(delivery, delayMs);
     }
   }
@@ -119,12 +134,12 @@ export class NotificationRouter {
   }
 
   private async attemptDelivery(
-    event: CodexNotificationEvent,
-    previousAttempts: number,
+    delivery: StoredNotificationDelivery,
     knownChatId?: string,
     knownAdapter?: PlatformAdapter,
   ): Promise<NotificationHandleResult> {
-    const attempt = previousAttempts + 1;
+    const { event } = delivery;
+    const attempt = delivery.attempts + 1;
     const binding = knownChatId === undefined
       ? await this.store.getNotificationBinding(this.botName)
       : null;
@@ -144,48 +159,92 @@ export class NotificationRouter {
       return 'pending';
     }
 
-    const delayed = this.now() - event.occurredAt > DELAYED_AFTER_MS;
-    try {
-      await adapter.send(chatId, {
-        card: buildNotificationCard(event, { delayed, timeZone: this.timeZone }),
-      }, { idempotencyKey: event.eventKey });
-    } catch (error) {
-      return this.handleAttemptFailure(event, previousAttempts, classifyError(error));
-    }
-
-    try {
-      await this.store.markNotificationDelivered(event.eventKey, this.now());
-      return 'delivered';
-    } catch {
-      return this.handleAttemptFailure(event, previousAttempts, 'delivery_state_error');
-    }
-  }
-
-  private async handleAttemptFailure(
-    event: CodexNotificationEvent,
-    previousAttempts: number,
-    errorClass: string,
-  ): Promise<NotificationHandleResult> {
-    const attempt = previousAttempts + 1;
-    if (attempt >= MAX_ATTEMPTS) {
-      await this.store.markNotificationAttempt(event.eventKey, null);
+    if (delivery.delayed === null) {
       await this.store.markNotificationFailed(event.eventKey);
-      this.logFailure(event, attempt, errorClass);
+      this.logFailure(event, attempt, 'card_variant_unverifiable');
       return 'pending';
     }
 
-    const retryDelayMs = RETRY_DELAYS_MS[previousAttempts];
-    const nextRetryAt = this.now() + retryDelayMs;
-    await this.store.markNotificationAttempt(event.eventKey, nextRetryAt);
-    this.logFailure(event, attempt, errorClass);
-    this.scheduleDelivery({
-      event,
-      status: 'pending',
+    const attemptedAt = this.now();
+    await this.store.markNotificationAttemptStarted(event.eventKey, attemptedAt);
+    const attemptedDelivery: StoredNotificationDelivery = {
+      ...delivery,
       attempts: attempt,
+      lastAttemptAt: attemptedAt,
+      nextRetryAt: null,
+    };
+    try {
+      await adapter.send(chatId, {
+        card: buildNotificationCard(event, {
+          delayed: delivery.delayed,
+          timeZone: this.timeZone,
+        }),
+      }, { idempotencyKey: event.eventKey });
+    } catch (error) {
+      return this.handleExternalFailure(attemptedDelivery, classifyError(error));
+    }
+
+    this.acceptedInProcess.add(event.eventKey);
+    try {
+      await this.store.markNotificationDelivered(event.eventKey, this.now());
+      this.acceptedInProcess.delete(event.eventKey);
+      return 'delivered';
+    } catch {
+      return this.handleDeliveryStateFailure(attemptedDelivery, 0);
+    }
+  }
+
+  private async handleExternalFailure(
+    delivery: StoredNotificationDelivery,
+    errorClass: string,
+  ): Promise<NotificationHandleResult> {
+    const { event, attempts } = delivery;
+    if (attempts >= MAX_ATTEMPTS) {
+      await this.store.markNotificationFailed(event.eventKey);
+      this.logFailure(event, attempts, errorClass);
+      return 'pending';
+    }
+
+    const retryDelayMs = RETRY_DELAYS_MS[attempts - 1];
+    const nextRetryAt = this.now() + retryDelayMs;
+    await this.store.setNotificationNextRetry(event.eventKey, nextRetryAt);
+    this.logFailure(event, attempts, errorClass);
+    this.scheduleDelivery({
+      ...delivery,
       nextRetryAt,
-      deliveredAt: null,
     }, retryDelayMs);
     return 'pending';
+  }
+
+  private async handleDeliveryStateFailure(
+    delivery: StoredNotificationDelivery,
+    retryIndex: number,
+  ): Promise<NotificationHandleResult> {
+    const { event, attempts } = delivery;
+    this.logFailure(event, attempts, 'delivery_state_error');
+    if (retryIndex >= RETRY_DELAYS_MS.length) {
+      await this.store.setNotificationNextRetry(event.eventKey, null);
+      return 'pending';
+    }
+
+    const retryDelayMs = RETRY_DELAYS_MS[retryIndex];
+    const nextRetryAt = this.now() + retryDelayMs;
+    await this.store.setNotificationNextRetry(event.eventKey, nextRetryAt);
+    this.scheduleFinalization({ ...delivery, nextRetryAt }, retryIndex, retryDelayMs);
+    return 'pending';
+  }
+
+  private async finalizeDelivery(
+    delivery: StoredNotificationDelivery,
+    retryIndex: number,
+  ): Promise<NotificationHandleResult> {
+    try {
+      await this.store.markNotificationDelivered(delivery.event.eventKey, this.now());
+      this.acceptedInProcess.delete(delivery.event.eventKey);
+      return 'delivered';
+    } catch {
+      return this.handleDeliveryStateFailure(delivery, retryIndex + 1);
+    }
   }
 
   private scheduleDelivery(delivery: StoredNotificationDelivery, delayMs: number): void {
@@ -196,9 +255,10 @@ export class NotificationRouter {
         this.timers.delete(eventKey);
         return;
       }
-      const operation = this.beginInFlight(eventKey, () => (
-        this.attemptDelivery(delivery.event, delivery.attempts)
-      ));
+      const operation = this.beginInFlight(eventKey, async () => {
+        const prepared = await this.preparePendingDelivery(delivery);
+        return prepared ? this.attemptDelivery(prepared) : 'pending';
+      });
       this.timers.delete(eventKey);
       if (!operation) {
         this.resumeAfterInFlight(eventKey);
@@ -209,6 +269,37 @@ export class NotificationRouter {
       });
     }, delayMs);
     this.timers.set(delivery.event.eventKey, timer);
+  }
+
+  private scheduleFinalization(
+    delivery: StoredNotificationDelivery,
+    retryIndex: number,
+    delayMs: number,
+  ): void {
+    const eventKey = delivery.event.eventKey;
+    if (this.stopped || this.timers.has(eventKey)) return;
+    const timer = this.scheduleTimeout(() => {
+      if (this.stopped) {
+        this.timers.delete(eventKey);
+        return;
+      }
+      const operation = this.beginInFlight(eventKey, () => (
+        this.finalizeDelivery(delivery, retryIndex)
+      ));
+      this.timers.delete(eventKey);
+      if (!operation) {
+        const active = this.inFlight.get(eventKey);
+        void active?.then(
+          () => this.scheduleFinalization(delivery, retryIndex, 0),
+          () => this.scheduleFinalization(delivery, retryIndex, 0),
+        );
+        return;
+      }
+      void operation.catch(() => {
+        this.logFailure(delivery.event, delivery.attempts, 'router_state_error');
+      });
+    }, delayMs);
+    this.timers.set(eventKey, timer);
   }
 
   private beginInFlight(
@@ -240,13 +331,57 @@ export class NotificationRouter {
 
   private async schedulePersistedEvent(eventKey: string): Promise<void> {
     if (this.stopped) return;
-    const delivery = (await this.store.listPendingNotifications())
+    const storedDelivery = (await this.store.listPendingNotifications())
       .find((candidate) => candidate.event.eventKey === eventKey);
-    if (!delivery || this.inFlight.has(eventKey)) return;
+    if (!storedDelivery || this.inFlight.has(eventKey)) return;
+    const delivery = await this.preparePendingDelivery(storedDelivery);
+    if (!delivery) return;
     const delayMs = delivery.nextRetryAt === null
       ? 0
       : Math.max(0, delivery.nextRetryAt - this.now());
+    if (this.acceptedInProcess.has(eventKey)) {
+      this.scheduleFinalization(delivery, 0, delayMs);
+      return;
+    }
     this.scheduleDelivery(delivery, delayMs);
+  }
+
+  private async preparePendingDelivery(
+    delivery: StoredNotificationDelivery,
+  ): Promise<StoredNotificationDelivery | null> {
+    const { event, attempts, lastAttemptAt } = delivery;
+    if (attempts >= MAX_ATTEMPTS) {
+      await this.store.markNotificationFailed(event.eventKey);
+      return null;
+    }
+
+    if (attempts > 0) {
+      if (
+        delivery.delayed === null
+        || lastAttemptAt === null
+        || !Number.isFinite(lastAttemptAt)
+        || lastAttemptAt > this.now()
+      ) {
+        await this.store.markNotificationFailed(event.eventKey);
+        this.logFailure(event, attempts, 'idempotency_unverifiable');
+        return null;
+      }
+      if (this.now() - lastAttemptAt >= UUID_SAFETY_WINDOW_MS) {
+        await this.store.markNotificationFailed(event.eventKey);
+        this.logFailure(event, attempts, 'idempotency_expired');
+        return null;
+      }
+      return delivery;
+    }
+
+    if (delivery.delayed !== null) return delivery;
+    const delayed = this.isDelayed(event);
+    await this.store.setNotificationDelayed(event.eventKey, delayed);
+    return { ...delivery, delayed };
+  }
+
+  private isDelayed(event: CodexNotificationEvent): boolean {
+    return this.now() - event.occurredAt > DELAYED_AFTER_MS;
   }
 
   private resolveFeishuAdapter(

@@ -82,13 +82,16 @@ export class SessionStore {
         event_json TEXT NOT NULL,
         status TEXT NOT NULL,
         attempts INTEGER NOT NULL,
+        last_attempt_at INTEGER,
         next_retry_at INTEGER,
-        delivered_at INTEGER
+        delivered_at INTEGER,
+        delayed INTEGER
       )
     `);
+    const deliverySchemaMigrated = ensureNotificationDeliveryColumns(db);
 
     const store = new SessionStore(db, dbPath);
-    if (cursorSchemaMigrated) store.save();
+    if (cursorSchemaMigrated || deliverySchemaMigrated) store.save();
     return store;
   }
 
@@ -289,12 +292,16 @@ export class SessionStore {
     this.save();
   }
 
-  async enqueueNotification(event: CodexNotificationEvent): Promise<boolean> {
+  async enqueueNotification(
+    event: CodexNotificationEvent,
+    delayed?: boolean,
+  ): Promise<boolean> {
     this.db.run(
       `INSERT OR IGNORE INTO notification_deliveries
-         (event_key, event_json, status, attempts, next_retry_at, delivered_at)
-       VALUES (?, ?, 'pending', 0, NULL, NULL)`,
-      [event.eventKey, JSON.stringify(event)],
+         (event_key, event_json, status, attempts, last_attempt_at,
+          next_retry_at, delivered_at, delayed)
+       VALUES (?, ?, 'pending', 0, NULL, NULL, NULL, ?)`,
+      [event.eventKey, JSON.stringify(event), delayed === undefined ? null : Number(delayed)],
     );
     const inserted =
       (this.db as Database & { getRowsModified(): number }).getRowsModified() === 1;
@@ -304,7 +311,8 @@ export class SessionStore {
 
   async listPendingNotifications(): Promise<StoredNotificationDelivery[]> {
     const stmt = this.db.prepare(
-      `SELECT event_json, status, attempts, next_retry_at, delivered_at
+      `SELECT event_json, status, attempts, last_attempt_at, next_retry_at,
+              delivered_at, delayed
        FROM notification_deliveries
        WHERE status = 'pending'
        ORDER BY rowid`,
@@ -317,20 +325,44 @@ export class SessionStore {
         event: JSON.parse(row.event_json as string) as CodexNotificationEvent,
         status: row.status as StoredNotificationDelivery['status'],
         attempts: row.attempts as number,
+        lastAttemptAt: row.last_attempt_at === null
+          ? null
+          : (row.last_attempt_at as number),
         nextRetryAt: row.next_retry_at === null ? null : (row.next_retry_at as number),
         deliveredAt: row.delivered_at === null ? null : (row.delivered_at as number),
+        delayed: row.delayed === 1 ? true : row.delayed === 0 ? false : null,
       });
     }
     stmt.free();
     return deliveries;
   }
 
-  async markNotificationAttempt(eventKey: string, nextRetryAt: number | null): Promise<void> {
+  async markNotificationAttemptStarted(eventKey: string, attemptedAt: number): Promise<void> {
     this.db.run(
       `UPDATE notification_deliveries
-       SET attempts = attempts + 1, next_retry_at = ?
+       SET attempts = attempts + 1, last_attempt_at = ?, next_retry_at = NULL
+       WHERE event_key = ? AND status = 'pending'`,
+      [attemptedAt, eventKey],
+    );
+    this.save();
+  }
+
+  async setNotificationNextRetry(eventKey: string, nextRetryAt: number | null): Promise<void> {
+    this.db.run(
+      `UPDATE notification_deliveries
+       SET next_retry_at = ?
        WHERE event_key = ? AND status = 'pending'`,
       [nextRetryAt, eventKey],
+    );
+    this.save();
+  }
+
+  async setNotificationDelayed(eventKey: string, delayed: boolean): Promise<void> {
+    this.db.run(
+      `UPDATE notification_deliveries
+       SET delayed = COALESCE(delayed, ?)
+       WHERE event_key = ? AND status = 'pending'`,
+      [Number(delayed), eventKey],
     );
     this.save();
   }
@@ -396,4 +428,25 @@ function ensureNotificationCursorContinuityColumn(db: Database): boolean {
   if (found) return false;
   db.run('ALTER TABLE notification_cursors ADD COLUMN continuity_hash TEXT');
   return true;
+}
+
+function ensureNotificationDeliveryColumns(db: Database): boolean {
+  const stmt = db.prepare('PRAGMA table_info(notification_deliveries)');
+  const columns = new Set<string>();
+  while (stmt.step()) {
+    const name = stmt.getAsObject().name;
+    if (typeof name === 'string') columns.add(name);
+  }
+  stmt.free();
+
+  let migrated = false;
+  if (!columns.has('last_attempt_at')) {
+    db.run('ALTER TABLE notification_deliveries ADD COLUMN last_attempt_at INTEGER');
+    migrated = true;
+  }
+  if (!columns.has('delayed')) {
+    db.run('ALTER TABLE notification_deliveries ADD COLUMN delayed INTEGER');
+    migrated = true;
+  }
+  return migrated;
 }

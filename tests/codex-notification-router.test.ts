@@ -1,6 +1,8 @@
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import initSqlJs from 'sql.js';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { NotificationRouter, type NotificationLogEntry } from '../src/notifications/router.js';
 import type { CodexNotificationEvent } from '../src/notifications/types.js';
@@ -8,6 +10,8 @@ import { SessionStore } from '../src/session/store.js';
 import type { PlatformAdapter } from '../src/types.js';
 
 const STARTED_AT = new Date('2026-07-15T14:32:00-04:00').getTime();
+const require = createRequire(import.meta.url);
+const sqlWasmDir = dirname(require.resolve('sql.js/dist/sql-wasm.wasm'));
 
 function attentionEvent(
   overrides: Partial<CodexNotificationEvent> = {},
@@ -151,7 +155,8 @@ describe('NotificationRouter', () => {
       if (sendTimes.length < 4) throw new TypeError('sensitive remote response');
       return 'om_success';
     });
-    const markAttempt = vi.spyOn(store, 'markNotificationAttempt');
+    const markAttemptStarted = vi.spyOn(store, 'markNotificationAttemptStarted');
+    const setNextRetry = vi.spyOn(store, 'setNotificationNextRetry');
     const logs: NotificationLogEntry[] = [];
     const router = new NotificationRouter({
       store,
@@ -168,25 +173,43 @@ describe('NotificationRouter', () => {
       output: 'RAW_SECRET_OUTPUT',
     });
     await expect(router.handle(event)).resolves.toBe('pending');
-    expect(markAttempt).toHaveBeenLastCalledWith(
+    expect(markAttemptStarted).toHaveBeenLastCalledWith(
+      'evt_attention_0123456789abcdef',
+      STARTED_AT,
+    );
+    expect(setNextRetry).toHaveBeenLastCalledWith(
       'evt_attention_0123456789abcdef',
       STARTED_AT + 1_000,
     );
     expect(JSON.stringify(await store.listPendingNotifications())).not.toMatch(/RAW_|SECRET/);
 
     await vi.advanceTimersByTimeAsync(1_000);
-    expect(markAttempt).toHaveBeenLastCalledWith(
+    expect(markAttemptStarted).toHaveBeenLastCalledWith(
+      'evt_attention_0123456789abcdef',
+      STARTED_AT + 1_000,
+    );
+    expect(setNextRetry).toHaveBeenLastCalledWith(
       'evt_attention_0123456789abcdef',
       STARTED_AT + 6_000,
     );
 
     await vi.advanceTimersByTimeAsync(5_000);
-    expect(markAttempt).toHaveBeenLastCalledWith(
+    expect(markAttemptStarted).toHaveBeenLastCalledWith(
+      'evt_attention_0123456789abcdef',
+      STARTED_AT + 6_000,
+    );
+    expect(setNextRetry).toHaveBeenLastCalledWith(
       'evt_attention_0123456789abcdef',
       STARTED_AT + 26_000,
     );
 
     await vi.advanceTimersByTimeAsync(20_000);
+    expect(markAttemptStarted).toHaveBeenLastCalledWith(
+      'evt_attention_0123456789abcdef',
+      STARTED_AT + 26_000,
+    );
+    expect(markAttemptStarted).toHaveBeenCalledTimes(4);
+    expect(setNextRetry).toHaveBeenCalledTimes(3);
     expect(sendTimes).toEqual([
       STARTED_AT,
       STARTED_AT + 1_000,
@@ -213,7 +236,8 @@ describe('NotificationRouter', () => {
     stores.push(store);
     await bindTarget(store);
     const send = vi.fn<PlatformAdapter['send']>().mockRejectedValue(new Error('secret output'));
-    const markAttempt = vi.spyOn(store, 'markNotificationAttempt');
+    const markAttemptStarted = vi.spyOn(store, 'markNotificationAttemptStarted');
+    const setNextRetry = vi.spyOn(store, 'setNotificationNextRetry');
     const markFailed = vi.spyOn(store, 'markNotificationFailed');
     const router = new NotificationRouter({
       store,
@@ -228,10 +252,8 @@ describe('NotificationRouter', () => {
     await vi.advanceTimersByTimeAsync(1_000 + 5_000 + 20_000);
 
     expect(send).toHaveBeenCalledTimes(4);
-    expect(markAttempt).toHaveBeenLastCalledWith(
-      'evt_attention_0123456789abcdef',
-      null,
-    );
+    expect(markAttemptStarted).toHaveBeenCalledTimes(4);
+    expect(setNextRetry).toHaveBeenCalledTimes(3);
     expect(markFailed).toHaveBeenCalledWith('evt_attention_0123456789abcdef');
     expect(await store.listPendingNotifications()).toEqual([]);
 
@@ -239,7 +261,7 @@ describe('NotificationRouter', () => {
     expect(send).toHaveBeenCalledTimes(4);
   });
 
-  it('retries a delivered-state failure with one transport idempotency key', async () => {
+  it('retries only local finalization after a delivered-state failure', async () => {
     const store = await SessionStore.create(':memory:');
     stores.push(store);
     await bindTarget(store);
@@ -270,11 +292,10 @@ describe('NotificationRouter', () => {
     await expect(router.handle(event)).resolves.toBe('pending');
     await vi.advanceTimersByTimeAsync(1_000);
 
-    expect(send).toHaveBeenCalledTimes(2);
+    expect(send).toHaveBeenCalledTimes(1);
     expect(markDelivered).toHaveBeenCalledTimes(2);
     expect(transportDeliveries).toEqual(new Set([event.eventKey]));
     expect(send.mock.calls.map(([, , options]) => options?.idempotencyKey)).toEqual([
-      event.eventKey,
       event.eventKey,
     ]);
     expect(logs).toEqual([
@@ -288,12 +309,38 @@ describe('NotificationRouter', () => {
     expect(await store.listPendingNotifications()).toEqual([]);
   });
 
+  it('never re-enters the adapter in-process after external acceptance', async () => {
+    const store = await SessionStore.create(':memory:');
+    stores.push(store);
+    await bindTarget(store);
+    const send = vi.fn<PlatformAdapter['send']>().mockResolvedValue('om_accepted');
+    vi.spyOn(store, 'markNotificationDelivered')
+      .mockRejectedValue(new Error('local state remains unavailable'));
+    const router = new NotificationRouter({
+      store,
+      botName: 'codexbot',
+      adapters: new Map([['codexbot', adapterWith(send)]]),
+      timeZone: 'America/New_York',
+      log: vi.fn(),
+      ...timerDependencies(),
+    });
+
+    await expect(router.handle(attentionEvent())).resolves.toBe('pending');
+    await vi.runAllTimersAsync();
+    expect(send).toHaveBeenCalledTimes(1);
+
+    await router.resumePending();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(send).toHaveBeenCalledTimes(1);
+  });
+
   it('does not overlap resumePending with an in-flight immediate delivery', async () => {
     const store = await SessionStore.create(':memory:');
     stores.push(store);
     await bindTarget(store);
     const gate = deferred<string>();
     const send = vi.fn<PlatformAdapter['send']>().mockImplementation(() => gate.promise);
+    const markAttemptStarted = vi.spyOn(store, 'markNotificationAttemptStarted');
     const router = new NotificationRouter({
       store,
       botName: 'codexbot',
@@ -305,6 +352,23 @@ describe('NotificationRouter', () => {
     const handling = router.handle(attentionEvent());
     await vi.advanceTimersByTimeAsync(0);
     expect(send).toHaveBeenCalledTimes(1);
+    expect(markAttemptStarted).toHaveBeenCalledWith(
+      'evt_attention_0123456789abcdef',
+      STARTED_AT,
+    );
+    expect(markAttemptStarted.mock.invocationCallOrder[0])
+      .toBeLessThan(send.mock.invocationCallOrder[0]);
+    expect(await store.listPendingNotifications()).toEqual([
+      {
+        event: attentionEvent(),
+        status: 'pending',
+        attempts: 1,
+        lastAttemptAt: STARTED_AT,
+        nextRetryAt: null,
+        deliveredAt: null,
+        delayed: false,
+      },
+    ]);
 
     await router.resumePending();
     await vi.advanceTimersByTimeAsync(0);
@@ -315,12 +379,13 @@ describe('NotificationRouter', () => {
     expect(await store.listPendingNotifications()).toEqual([]);
   });
 
-  it('resumes a persisted retry at its due time after a simulated restart', async () => {
+  it('restarts within 55 minutes with the same uuid and frozen card variant', async () => {
     const directory = mkdtempSync(join(tmpdir(), 'cli2im-router-restart-'));
     temporaryDirectories.push(directory);
     const dbPath = join(directory, 'sessions.db');
     const firstStore = await SessionStore.create(dbPath);
     await bindTarget(firstStore);
+    const event = attentionEvent({ occurredAt: STARTED_AT - 29_500 });
     const firstSend = vi.fn<PlatformAdapter['send']>().mockRejectedValue(new Error('offline'));
     const firstRouter = new NotificationRouter({
       store: firstStore,
@@ -331,11 +396,11 @@ describe('NotificationRouter', () => {
       ...timerDependencies(),
     });
 
-    await expect(firstRouter.handle(attentionEvent())).resolves.toBe('pending');
+    await expect(firstRouter.handle(event)).resolves.toBe('pending');
     firstRouter.stop();
     firstStore.close();
 
-    vi.setSystemTime(STARTED_AT + 250);
+    vi.setSystemTime(STARTED_AT + 2_000);
     const reloadedStore = await SessionStore.create(dbPath);
     stores.push(reloadedStore);
     const resumedSend = vi.fn<PlatformAdapter['send']>().mockResolvedValue('om_resumed');
@@ -348,12 +413,137 @@ describe('NotificationRouter', () => {
     });
 
     await resumedRouter.resumePending();
-    await vi.advanceTimersByTimeAsync(749);
-    expect(resumedSend).not.toHaveBeenCalled();
-
-    await vi.advanceTimersByTimeAsync(1);
+    await vi.advanceTimersByTimeAsync(0);
     expect(resumedSend).toHaveBeenCalledTimes(1);
+    expect(firstSend.mock.calls[0]?.[2]?.idempotencyKey).toBe(event.eventKey);
+    expect(resumedSend.mock.calls[0]?.[2]?.idempotencyKey).toBe(event.eventKey);
+    expect(resumedSend.mock.calls[0]?.[1]).toEqual(firstSend.mock.calls[0]?.[1]);
+    expect(JSON.stringify(resumedSend.mock.calls[0]?.[1])).not.toContain('⚠️ 延迟送达');
     expect(await reloadedStore.listPendingNotifications()).toEqual([]);
+  });
+
+  it('expires a persisted attempted delivery after the 55-minute uuid safety window', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'cli2im-router-expiry-'));
+    temporaryDirectories.push(directory);
+    const dbPath = join(directory, 'sessions.db');
+    const firstStore = await SessionStore.create(dbPath);
+    await bindTarget(firstStore);
+    const event = attentionEvent({ eventKey: '111111111111111111111111' });
+    const firstRouter = new NotificationRouter({
+      store: firstStore,
+      botName: 'codexbot',
+      adapters: new Map([[
+        'codexbot',
+        adapterWith(vi.fn<PlatformAdapter['send']>().mockRejectedValue(new Error('offline'))),
+      ]]),
+      timeZone: 'America/New_York',
+      log: vi.fn(),
+      ...timerDependencies(),
+    });
+    await expect(firstRouter.handle(event)).resolves.toBe('pending');
+    firstRouter.stop();
+    firstStore.close();
+
+    vi.setSystemTime(STARTED_AT + 55 * 60_000);
+    const reloadedStore = await SessionStore.create(dbPath);
+    stores.push(reloadedStore);
+    const send = vi.fn<PlatformAdapter['send']>().mockResolvedValue('must_not_send');
+    const markFailed = vi.spyOn(reloadedStore, 'markNotificationFailed');
+    const router = new NotificationRouter({
+      store: reloadedStore,
+      botName: 'codexbot',
+      adapters: new Map([['codexbot', adapterWith(send)]]),
+      timeZone: 'America/New_York',
+      log: vi.fn(),
+      ...timerDependencies(),
+    });
+
+    await router.resumePending();
+    await vi.runAllTimersAsync();
+
+    expect(send).not.toHaveBeenCalled();
+    expect(markFailed).toHaveBeenCalledWith(event.eventKey);
+    expect(await reloadedStore.listPendingNotifications()).toEqual([]);
+  });
+
+  it('expires an in-process external retry whose timer fires after the safety window', async () => {
+    const store = await SessionStore.create(':memory:');
+    stores.push(store);
+    await bindTarget(store);
+    const event = attentionEvent({ eventKey: '444444444444444444444444' });
+    const send = vi.fn<PlatformAdapter['send']>().mockRejectedValue(new Error('offline'));
+    const markFailed = vi.spyOn(store, 'markNotificationFailed');
+    const router = new NotificationRouter({
+      store,
+      botName: 'codexbot',
+      adapters: new Map([['codexbot', adapterWith(send)]]),
+      timeZone: 'America/New_York',
+      log: vi.fn(),
+      ...timerDependencies(),
+    });
+
+    await expect(router.handle(event)).resolves.toBe('pending');
+    vi.setSystemTime(STARTED_AT + 55 * 60_000);
+    await vi.runOnlyPendingTimersAsync();
+
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(markFailed).toHaveBeenCalledWith(event.eventKey);
+    expect(await store.listPendingNotifications()).toEqual([]);
+  });
+
+  it('fails a migrated attempted row whose last attempt time is unverifiable', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'cli2im-router-legacy-expiry-'));
+    temporaryDirectories.push(directory);
+    const dbPath = join(directory, 'sessions.db');
+    const event = attentionEvent({ eventKey: '222222222222222222222222' });
+    await createLegacyNotificationDatabase(dbPath, event, 1);
+    const store = await SessionStore.create(dbPath);
+    stores.push(store);
+    await bindTarget(store);
+    const send = vi.fn<PlatformAdapter['send']>().mockResolvedValue('must_not_send');
+    const markFailed = vi.spyOn(store, 'markNotificationFailed');
+    const router = new NotificationRouter({
+      store,
+      botName: 'codexbot',
+      adapters: new Map([['codexbot', adapterWith(send)]]),
+      timeZone: 'America/New_York',
+      log: vi.fn(),
+      ...timerDependencies(),
+    });
+
+    await router.resumePending();
+    await vi.runAllTimersAsync();
+
+    expect(send).not.toHaveBeenCalled();
+    expect(markFailed).toHaveBeenCalledWith(event.eventKey);
+    expect(await store.listPendingNotifications()).toEqual([]);
+  });
+
+  it('safely sends an old attempts-zero row and freezes it as delayed', async () => {
+    const store = await SessionStore.create(':memory:');
+    stores.push(store);
+    await bindTarget(store);
+    const event = attentionEvent({
+      eventKey: '333333333333333333333333',
+      occurredAt: STARTED_AT - 60 * 60_000,
+    });
+    await store.enqueueNotification(event);
+    const send = vi.fn<PlatformAdapter['send']>().mockResolvedValue('om_old_first_attempt');
+    const router = new NotificationRouter({
+      store,
+      botName: 'codexbot',
+      adapters: new Map([['codexbot', adapterWith(send)]]),
+      timeZone: 'America/New_York',
+      ...timerDependencies(),
+    });
+
+    await router.resumePending();
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(send.mock.calls[0]?.[2]?.idempotencyKey).toBe(event.eventKey);
+    expect(JSON.stringify(send.mock.calls[0]?.[1])).toContain('⚠️ 延迟送达');
+    expect(await store.listPendingNotifications()).toEqual([]);
   });
 
   it('fails closed when the configured adapter is missing or not Feishu', async () => {
@@ -410,4 +600,33 @@ function deferred<T>() {
     reject = rejectPromise;
   });
   return { promise, resolve, reject };
+}
+
+async function createLegacyNotificationDatabase(
+  dbPath: string,
+  event: CodexNotificationEvent,
+  attempts: number,
+): Promise<void> {
+  const SQL = await initSqlJs({
+    locateFile: (file: string) => join(sqlWasmDir, file),
+  });
+  const db = new SQL.Database();
+  db.run(`
+    CREATE TABLE notification_deliveries (
+      event_key TEXT PRIMARY KEY,
+      event_json TEXT NOT NULL,
+      status TEXT NOT NULL,
+      attempts INTEGER NOT NULL,
+      next_retry_at INTEGER,
+      delivered_at INTEGER
+    )
+  `);
+  db.run(
+    `INSERT INTO notification_deliveries
+       (event_key, event_json, status, attempts, next_retry_at, delivered_at)
+     VALUES (?, ?, 'pending', ?, NULL, NULL)`,
+    [event.eventKey, JSON.stringify(event), attempts],
+  );
+  writeFileSync(dbPath, Buffer.from(db.export()));
+  db.close();
 }

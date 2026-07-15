@@ -154,8 +154,10 @@ describe('notification persistence', () => {
         event,
         status: 'pending',
         attempts: 0,
+        lastAttemptAt: null,
         nextRetryAt: null,
         deliveredAt: null,
+        delayed: null,
       },
     ]);
     store.close();
@@ -168,8 +170,9 @@ describe('notification persistence', () => {
     const event = completionEvent({ eventKey: 'evt_retry' });
 
     const firstStore = await SessionStore.create(dbPath);
-    await firstStore.enqueueNotification(event);
-    await firstStore.markNotificationAttempt(event.eventKey, 2000);
+    await firstStore.enqueueNotification(event, true);
+    await firstStore.markNotificationAttemptStarted(event.eventKey, 1500);
+    await firstStore.setNotificationNextRetry(event.eventKey, 2000);
     firstStore.close();
 
     const reloadedStore = await SessionStore.create(dbPath);
@@ -178,11 +181,64 @@ describe('notification persistence', () => {
         event,
         status: 'pending',
         attempts: 1,
+        lastAttemptAt: 1500,
         nextRetryAt: 2000,
         deliveredAt: null,
+        delayed: true,
       },
     ]);
     reloadedStore.close();
+  });
+
+  it('migrates old delivery rows with unverifiable attempt and card state', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'cli2im-notification-store-'));
+    temporaryDirectories.push(directory);
+    const dbPath = join(directory, 'sessions.db');
+    const event = completionEvent({ eventKey: 'evt_legacy_delivery' });
+    const SQL = await initSqlJs({
+      locateFile: (file: string) => join(sqlWasmDir, file),
+    });
+    const legacyDb = new SQL.Database();
+    legacyDb.run(`
+      CREATE TABLE notification_deliveries (
+        event_key TEXT PRIMARY KEY,
+        event_json TEXT NOT NULL,
+        status TEXT NOT NULL,
+        attempts INTEGER NOT NULL,
+        next_retry_at INTEGER,
+        delivered_at INTEGER
+      )
+    `);
+    legacyDb.run(
+      `INSERT INTO notification_deliveries
+         (event_key, event_json, status, attempts, next_retry_at, delivered_at)
+       VALUES (?, ?, 'pending', 1, 2000, NULL)`,
+      [event.eventKey, JSON.stringify(event)],
+    );
+    writeFileSync(dbPath, Buffer.from(legacyDb.export()));
+    legacyDb.close();
+
+    const store = await SessionStore.create(dbPath);
+    expect(await store.listPendingNotifications()).toEqual([
+      {
+        event,
+        status: 'pending',
+        attempts: 1,
+        lastAttemptAt: null,
+        nextRetryAt: 2000,
+        deliveredAt: null,
+        delayed: null,
+      },
+    ]);
+    store.close();
+
+    const migratedDb = new SQL.Database(readFileSync(dbPath)) as unknown as ReadOnlyTestDatabase;
+    const [columns] = migratedDb.exec('PRAGMA table_info(notification_deliveries)');
+    expect(columns.values.map((column) => column[1])).toEqual(expect.arrayContaining([
+      'last_attempt_at',
+      'delayed',
+    ]));
+    migratedDb.close();
   });
 
   it('clears a delivered payload while retaining its dedupe key and timestamp', async () => {
