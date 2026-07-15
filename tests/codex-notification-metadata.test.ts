@@ -66,6 +66,17 @@ const syntheticSecret = true;
     )).toBe('Open https://example.test/private/report.csv');
   });
 
+  it('removes HTTP userinfo together with query and fragment data', () => {
+    const title = sanitizeTaskTitle(
+      'Open https://alice:synthetic-password@example.test/private/report?token=x',
+    );
+
+    expect(title).toBe('Open https://example.test/private/report');
+    expect(title).not.toContain('alice');
+    expect(title).not.toContain('synthetic-password');
+    expect(title).not.toContain('token=x');
+  });
+
   it.each([
     'Analyze /tmp/private folder/report.csv and summarize',
     'Analyze /tmp/private with spaces/report.csv',
@@ -90,6 +101,12 @@ const syntheticSecret = true;
     expect(title).toBe('Analyze report.csv and compare https://example.test/a');
     expect(title).not.toContain('/tmp/');
     expect(title).not.toContain('?token=x');
+  });
+
+  it('treats separators after a clause connector as unrelated prose', () => {
+    expect(sanitizeTaskTitle('Analyze /tmp/report.csv and compare A/B')).toBe(
+      'Analyze report.csv and compare A/B',
+    );
   });
 
   it('consumes complete quoted named-secret values including spaces', () => {
@@ -149,9 +166,15 @@ const syntheticSecret = true;
     ['absolute executable command', '/usr/bin/custom deploy'],
     ['find command', 'find ./src -name notification'],
     ['find relative-path command', 'find src/notifications'],
+    ['find bare argument', 'find src'],
     ['Go subcommand', 'go test ./...'],
     ['Go flag command', 'go --version'],
+    ['Go help command', 'go help'],
     ['Make target', 'make release'],
+    ['env command', 'env codex update'],
+    ['Hermes command', 'hermes chat'],
+    ['VS Code command', 'code .'],
+    ['non-allowlisted hyphenated head', 'review-tool run'],
     ['shell redirection', 'deploy > /tmp/private/output.log'],
     ['shell operator expression', 'build && deploy'],
   ])('rejects a task title that is principally a %s', (_kind, value) => {
@@ -195,9 +218,25 @@ const syntheticSecret = true;
     expect(sanitizeTaskTitle(value)).toBe(value);
   });
 
+  it.each([
+    'please', 'fix', 'explain', 'summarize', 'implement', 'read', 'review', 'analyze',
+    'investigate', 'diagnose', 'design', 'create', 'build', 'update', 'add', 'remove',
+    'improve', 'verify', 'check', 'prepare', 'write', 'translate', 'compare', 'inspect',
+    'audit', 'document', 'refactor', 'optimize', 'debug', 'troubleshoot', 'research',
+    'assess', 'evaluate',
+  ])('accepts the centralized natural request head: %s', (head) => {
+    expect(sanitizeTaskTitle(`${head} notification handling`)).toBe(
+      `${head} notification handling`,
+    );
+  });
+
+  it('accepts an allowlisted natural request head as a single-word title', () => {
+    expect(sanitizeTaskTitle('review')).toBe('review');
+  });
+
   it('truncates CJK-heavy and Latin-heavy titles by Unicode code points', () => {
     expect(Array.from(sanitizeTaskTitle('测'.repeat(45)))).toHaveLength(40);
-    expect(Array.from(sanitizeTaskTitle('a'.repeat(90)))).toHaveLength(80);
+    expect(Array.from(sanitizeTaskTitle(`review ${'a'.repeat(90)}`))).toHaveLength(80);
     expect(Array.from(sanitizeTaskTitle('😀'.repeat(90)))).toHaveLength(80);
   });
 });

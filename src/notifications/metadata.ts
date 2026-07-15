@@ -22,9 +22,17 @@ const RAW_COMMAND_HEADS = new Set([
   'python3', 'rg', 'rm', 'rsync', 'scp', 'sed', 'sh', 'sqlite3', 'ssh', 'wget',
   'yarn', 'zsh',
 ]);
+const NATURAL_REQUEST_HEADS = new Set([
+  'add', 'analyze', 'assess', 'audit', 'build', 'check', 'compare', 'create',
+  'debug', 'design', 'diagnose', 'document', 'evaluate', 'explain', 'fix',
+  'implement', 'improve', 'inspect', 'investigate', 'optimize', 'please', 'prepare',
+  'read', 'refactor', 'remove', 'research', 'review', 'summarize', 'translate',
+  'troubleshoot', 'update', 'verify', 'write',
+]);
 const GO_SUBCOMMANDS = new Set([
-  'bug', 'build', 'clean', 'doc', 'env', 'fix', 'fmt', 'generate', 'get', 'install',
-  'list', 'mod', 'run', 'telemetry', 'test', 'tool', 'version', 'vet', 'work',
+  'bug', 'build', 'clean', 'doc', 'env', 'fix', 'fmt', 'generate', 'get', 'help',
+  'install', 'list', 'mod', 'run', 'telemetry', 'test', 'tool', 'version', 'vet',
+  'work',
 ]);
 const COMMAND_SHAPED_ARGUMENT = /(?:^|\s)(?:--?[A-Za-z0-9][A-Za-z0-9_-]*(?:=\S*)?|(?:\.{1,2}|~)?[\\/]\S+)/;
 const EXECUTABLE_PATH = /^(?:\/(?!\/)|(?:\.{1,2}|~)[\\/])\S+/;
@@ -32,6 +40,7 @@ const FIND_EXPRESSION_ARGUMENT = /(?:^|\s)(?:\.|!|\(|\))(?:\s|$)/;
 const FIND_PATH_ARGUMENT = /(?:^|\s)\S*[\\/]\S*(?:\s|$)/;
 const MAKE_PROSE_DETERMINER = /^(?:the|a|an|this|that)\b/;
 const HTTP_URL_IN_TEXT = /\bhttps?:\/\/[^\s/]+(?:\/[^\s]*)?/gi;
+const CLAUSE_CONNECTOR = /^(?:and|then|but|or)\b/i;
 const SHELL_SYNTAX = /&&|\|\||(?:^|\s)\|(?!\|)|(?:^|\s)(?:>>?|<<?)|;(?=\s|$)/;
 const SQL_LINE = /^(?:SELECT|INSERT|UPDATE|DELETE|CREATE|ALTER|DROP|WITH)\b.*(?:\bFROM\b|\bINTO\b|\bTABLE\b|\bSET\b|\*)/;
 const CONTROL_FLOW_LINE = /^(?:if|for|while|switch|try|catch)\s*\(/;
@@ -248,6 +257,28 @@ function isUnsafeTechnicalTitle(value: string): boolean {
     return true;
   }
 
+  return !isEligibleNaturalTitle(value);
+}
+
+function isEligibleNaturalTitle(value: string): boolean {
+  if (CJK.test(value)) return true;
+  const firstToken = /^(\S+)/.exec(value)?.[1];
+  if (!firstToken || !/^[a-z]/.test(firstToken)) return true;
+  if (!/^[a-z]+$/.test(firstToken)) return false;
+  const head = firstToken;
+  if (NATURAL_REQUEST_HEADS.has(head)) return true;
+
+  const remainder = value.slice(head.length).trimStart();
+  if (head === 'find' || head === 'make') {
+    return MAKE_PROSE_DETERMINER.test(remainder)
+      && !COMMAND_SHAPED_ARGUMENT.test(value)
+      && !FIND_PATH_ARGUMENT.test(remainder);
+  }
+  if (head === 'go') {
+    const nextHead = /^([a-z]+)/.exec(remainder)?.[1];
+    return nextHead !== undefined && NATURAL_REQUEST_HEADS.has(nextHead);
+  }
+
   return false;
 }
 
@@ -325,7 +356,7 @@ function sanitizeUris(value: string): string | null {
     const full = match[0];
 
     if (scheme === 'http' || scheme === 'https') {
-      result += full.replace(/[?#].*$/, '');
+      result += sanitizeHttpUrl(full);
     } else {
       const { core, suffix } = splitTrailingPunctuation(match[3].split(/[?#]/, 1)[0]);
       if (hasAmbiguousPathContinuation(value.slice(pattern.lastIndex))) return null;
@@ -362,7 +393,20 @@ function sanitizeAbsolutePaths(value: string): string | null {
 
 function hasAmbiguousPathContinuation(remainder: string): boolean {
   if (!/^\s/.test(remainder)) return false;
-  return /[\\/]/.test(remainder.replace(HTTP_URL_IN_TEXT, ''));
+  const immediateRemainder = remainder.replace(HTTP_URL_IN_TEXT, '').trimStart();
+  if (CLAUSE_CONNECTOR.test(immediateRemainder)) return false;
+  return immediateRemainder
+    .split(/\s+/, 2)
+    .some((token) => /[\\/]/.test(token));
+}
+
+function sanitizeHttpUrl(value: string): string {
+  try {
+    const parsed = new URL(value);
+    return `${parsed.protocol}//${parsed.host}${parsed.pathname}`;
+  } catch {
+    return '[REDACTED]';
+  }
 }
 
 function splitTrailingPunctuation(value: string): { core: string; suffix: string } {
