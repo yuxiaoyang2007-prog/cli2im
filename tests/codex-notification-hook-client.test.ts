@@ -44,6 +44,7 @@ describe('runHookClient', () => {
       session_id: 'session_synthetic',
       turn_id: 'turn_synthetic',
       approval_id: 'approval_synthetic',
+      tool_name: 'SyntheticPrivateTool',
       tool_input: { command: 'print synthetic-secret' },
       command: 'print synthetic-secret',
       arguments: ['--token', 'synthetic-token'],
@@ -63,6 +64,7 @@ describe('runHookClient', () => {
     expect(serialized).not.toContain('synthetic-secret');
     expect(serialized).not.toContain('arguments');
     expect(serialized).not.toContain('synthetic-token');
+    expect(serialized).not.toContain('SyntheticPrivateTool');
   });
 
   it('resolves silently for invalid input and a missing socket', async () => {
@@ -91,6 +93,7 @@ describe('runHookClient', () => {
       session_id: 'session_synthetic',
       turn_id: 'turn_synthetic',
       approval_id: 'approval_synthetic',
+      tool_name: 'SyntheticPrivateTool',
       tool_input: { command: 'print synthetic-secret' },
       command: 'print synthetic-secret',
       arguments: ['--token', 'synthetic-token'],
@@ -114,6 +117,7 @@ describe('runHookClient', () => {
     expect(received).not.toContain('arguments');
     expect(received).not.toContain('synthetic-secret');
     expect(received).not.toContain('synthetic-token');
+    expect(received).not.toContain('SyntheticPrivateTool');
   });
 });
 

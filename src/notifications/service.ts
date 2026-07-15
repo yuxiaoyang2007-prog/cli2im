@@ -71,6 +71,7 @@ interface TurnMetadata {
   cwd?: string;
   userText?: string;
   attachmentName?: string;
+  hasUserMessage?: boolean;
 }
 
 interface RolloutContext {
@@ -178,7 +179,7 @@ export class CodexNotificationService {
         kind: 'needs_attention',
         reason: 'question',
         requestId: event.requestId,
-        occurredAt: this.now(),
+        occurredAt: event.occurredAt ?? this.now(),
       });
     } else if (event.type === 'completed') {
       await this.routeRolloutNotification(context, event, {
@@ -220,8 +221,10 @@ export class CodexNotificationService {
 
     if (event.type === 'user_message') {
       const turn = context.turns.get(event.turnId) ?? {};
+      if (turn.hasUserMessage) return;
       turn.userText = event.userText;
       turn.attachmentName = event.attachmentName;
+      turn.hasUserMessage = true;
       context.turns.set(event.turnId, turn);
     }
   }

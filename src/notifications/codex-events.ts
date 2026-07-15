@@ -6,7 +6,7 @@ export type ParsedRolloutLine =
   | { type: 'session_meta'; sessionId: string; cwd: string; source: string }
   | { type: 'turn_context'; turnId: string; cwd: string }
   | { type: 'user_message'; turnId: string; userText?: string; attachmentName?: string }
-  | { type: 'question'; turnId: string; requestId: string }
+  | { type: 'question'; turnId: string; requestId: string; occurredAt?: number }
   | { type: 'completed'; turnId: string; occurredAt: number; durationMs?: number }
   | { type: 'aborted'; turnId: string };
 
@@ -35,7 +35,7 @@ export function parseRolloutLine(line: string): ParsedRolloutLine | null {
     case 'turn_context':
       return parseTurnContext(payload);
     case 'response_item':
-      return parseResponseItem(payload);
+      return parseResponseItem(payload, parseIsoTimestamp(outer.timestamp));
     case 'event_msg':
       return parseEventMessage(payload);
     default:
@@ -52,10 +52,13 @@ export function normalizePermissionHook(input: unknown, now: number): Permission
   const turnId = asString(input.turn_id);
   if (!sessionId || !turnId) return null;
 
+  const toolName = normalizeToolName(input.tool_name);
   const requestId = asString(input.approval_id)
     ?? asString(input.request_id)
     ?? asString(input.tool_use_id)
-    ?? eventKey(['approval', sessionId, turnId, String(Math.floor(now / 10_000))]);
+    ?? eventKey([
+      'approval', sessionId, turnId, toolName, String(Math.floor(now / 10_000)),
+    ]);
 
   return {
     type: 'approval',
@@ -85,13 +88,21 @@ function parseTurnContext(payload: Record<string, unknown>): ParsedRolloutLine |
   return { type: 'turn_context', turnId, cwd };
 }
 
-function parseResponseItem(payload: Record<string, unknown>): ParsedRolloutLine | null {
+function parseResponseItem(
+  payload: Record<string, unknown>,
+  occurredAt: number | undefined,
+): ParsedRolloutLine | null {
   const turnId = passthroughTurnId(payload.internal_chat_message_metadata_passthrough);
   if (!turnId) return null;
 
   if (payload.type === 'function_call' && payload.name === 'request_user_input') {
     const requestId = asString(payload.call_id);
-    return requestId ? { type: 'question', turnId, requestId } : null;
+    return requestId ? {
+      type: 'question',
+      turnId,
+      requestId,
+      ...(occurredAt === undefined ? {} : { occurredAt }),
+    } : null;
   }
 
   if (payload.type !== 'message' || payload.role !== 'user' || !Array.isArray(payload.content)) {
@@ -219,6 +230,36 @@ function asString(value: unknown): string | undefined {
 
 function asFiniteNumber(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
+}
+
+function normalizeToolName(value: unknown): string {
+  return typeof value === 'string'
+    ? value.trim().toLowerCase().replace(/\s+/g, ' ')
+    : '';
+}
+
+function parseIsoTimestamp(value: unknown): number | undefined {
+  if (typeof value !== 'string') return undefined;
+  const match = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d{1,9})?(?:Z|([+-])(\d{2}):(\d{2}))$/.exec(value);
+  if (!match) return undefined;
+
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  const hour = Number(match[4]);
+  const minute = Number(match[5]);
+  const second = Number(match[6]);
+  const offsetHour = match[8] === undefined ? 0 : Number(match[8]);
+  const offsetMinute = match[9] === undefined ? 0 : Number(match[9]);
+  if (
+    month < 1 || month > 12
+    || day < 1 || day > new Date(Date.UTC(year, month, 0)).getUTCDate()
+    || hour > 23 || minute > 59 || second > 59
+    || offsetHour > 23 || offsetMinute > 59
+  ) return undefined;
+
+  const timestamp = Date.parse(value);
+  return Number.isFinite(timestamp) ? timestamp : undefined;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

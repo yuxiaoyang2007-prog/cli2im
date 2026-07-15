@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import {
   eventKey,
   normalizePermissionHook,
@@ -154,6 +154,90 @@ describe('Codex notification event parsing', () => {
     expect(JSON.stringify(parseRolloutLine(line))).not.toContain('secret question');
   });
 
+  it('parses a valid outer ISO timestamp for request_user_input', () => {
+    const timestamp = '2026-07-15T14:32:10.250-04:00';
+    const parsed = parseRolloutLine(JSON.stringify({
+      timestamp,
+      type: 'response_item',
+      payload: {
+        type: 'function_call', name: 'request_user_input', call_id: 'call_timestamped',
+        internal_chat_message_metadata_passthrough: { turn_id: 'turn_1' },
+      },
+    }));
+
+    expect(parsed).toEqual({
+      type: 'question',
+      turnId: 'turn_1',
+      requestId: 'call_timestamped',
+      occurredAt: Date.parse(timestamp),
+    });
+  });
+
+  it.each([
+    '2026-07-15 14:32:10',
+    '2026-07-15T14:32:10',
+    'not-a-timestamp',
+    '2026-13-99T99:99:99Z',
+  ])('omits an invalid outer request_user_input timestamp: %s', (timestamp) => {
+    expect(parseRolloutLine(JSON.stringify({
+      timestamp,
+      type: 'response_item',
+      payload: {
+        type: 'function_call', name: 'request_user_input', call_id: 'call_invalid_time',
+        internal_chat_message_metadata_passthrough: { turn_id: 'turn_1' },
+      },
+    }))).toEqual({
+      type: 'question', turnId: 'turn_1', requestId: 'call_invalid_time',
+    });
+  });
+
+  it.each([
+    ['GitHub PAT', 'ghp_1234567890abcdefghijklmnopqrstuvwxyzAB'],
+    ['AWS access key', 'AKIAIOSFODNN7EXAMPLE'],
+    ['JWT', 'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c'],
+    ['Bearer credential', 'Bearer mF_9xQ7vK2pL8sN4dR6tY1wB3cE5hJ0z'],
+    ['Authorization credential', 'Authorization: Basic YWxhZGRpbjpvcGVuc2VzYW1l'],
+    ['signed URL credential', 'https://example.test/a?X-Amz-Signature=0123456789abcdef0123456789abcdef'],
+    ['webhook secret', 'https://hooks.slack.com/services/T00000000/B00000000/XXXXXXXXXXXXXXXXXXXXXXXX'],
+    ['high-entropy credential', 'mF_9xQ7vK2pL8sN4dR6tY1wB3cE5hJ0z'],
+  ])('never retains a %s in a parsed user event', (_kind, credential) => {
+    const parsed = parseRolloutLine(JSON.stringify({
+      type: 'response_item',
+      payload: {
+        type: 'message', role: 'user',
+        content: [{ type: 'input_text', text: `Review ${credential}` }],
+        internal_chat_message_metadata_passthrough: { turn_id: 'turn_secret' },
+      },
+    }));
+
+    expect(JSON.stringify(parsed)).not.toContain(credential);
+  });
+
+  it('does not write credential-bearing rollout content to logs', () => {
+    const credential = 'ghp_1234567890abcdefghijklmnopqrstuvwxyzAB';
+    const spies = [
+      vi.spyOn(console, 'log').mockImplementation(() => undefined),
+      vi.spyOn(console, 'warn').mockImplementation(() => undefined),
+      vi.spyOn(console, 'error').mockImplementation(() => undefined),
+    ];
+    try {
+      const parsed = parseRolloutLine(JSON.stringify({
+        type: 'response_item',
+        payload: {
+          type: 'message', role: 'user',
+          content: [{ type: 'input_text', text: `Review ${credential}` }],
+          internal_chat_message_metadata_passthrough: { turn_id: 'turn_secret_log' },
+        },
+      }));
+
+      expect(JSON.stringify(parsed)).not.toContain(credential);
+      expect(spies.every((spy) => spy.mock.calls.length === 0)).toBe(true);
+      expect(JSON.stringify(spies.map((spy) => spy.mock.calls))).not.toContain(credential);
+    } finally {
+      for (const spy of spies) spy.mockRestore();
+    }
+  });
+
   it('parses task_complete and turn_aborted separately', () => {
     expect(parseRolloutLine(JSON.stringify({
       type: 'event_msg', payload: { type: 'task_complete', turn_id: 'turn_1', completed_at: 1000, duration_ms: 2500 },
@@ -216,6 +300,26 @@ describe('Codex permission hook normalization', () => {
     expect(JSON.stringify(first)).not.toContain('command');
     expect(JSON.stringify(first)).not.toContain('arguments');
     expect(normalizePermissionHook(withoutIds, 20_000)?.requestId).not.toBe(first?.requestId);
+  });
+
+  it('uses normalized tool_name only inside the id-less approval digest', () => {
+    const withoutIds = {
+      ...base,
+      approval_id: undefined,
+      request_id: undefined,
+      tool_use_id: undefined,
+    };
+    const shell = normalizePermissionHook({ ...withoutIds, tool_name: '  Shell  ' }, 15_000);
+    const normalizedShell = normalizePermissionHook({ ...withoutIds, tool_name: 'shell' }, 15_000);
+    const fileWrite = normalizePermissionHook({ ...withoutIds, tool_name: 'FileWrite' }, 15_000);
+
+    expect(shell?.requestId).toBe(normalizedShell?.requestId);
+    expect(shell?.requestId).not.toBe(fileWrite?.requestId);
+    expect(Object.keys(shell ?? {}).sort()).toEqual([
+      'occurredAt', 'requestId', 'sessionId', 'turnId', 'type',
+    ]);
+    expect(JSON.stringify([shell, fileWrite])).not.toContain('Shell');
+    expect(JSON.stringify([shell, fileWrite])).not.toContain('FileWrite');
   });
 
   it('rejects unrelated or incomplete hook payloads', () => {

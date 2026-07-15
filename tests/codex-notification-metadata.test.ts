@@ -9,6 +9,46 @@ import {
 } from '../src/notifications/metadata.js';
 
 describe('sanitizeTaskTitle', () => {
+  const credentialCases = [
+    ['GitHub classic PAT', 'ghp_1234567890abcdefghijklmnopqrstuvwxyzAB', 'Review [REDACTED]'],
+    ['GitHub fine-grained PAT', 'github_pat_11AA0abcdefghijklmnopqrstuvwxyz_1234567890', 'Review [REDACTED]'],
+    ['AWS access key', 'AKIAIOSFODNN7EXAMPLE', 'Review [REDACTED]'],
+    ['JWT', 'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c', 'Review [REDACTED]'],
+    ['Bearer credential', 'Bearer mF_9xQ7vK2pL8sN4dR6tY1wB3cE5hJ0z', 'Review [REDACTED]'],
+    ['short Bearer credential', 'Bearer abc123', 'Review [REDACTED]'],
+    ['Authorization credential', 'Authorization: Basic YWxhZGRpbjpvcGVuc2VzYW1l', 'Review [REDACTED]'],
+    ['quoted auth credential', 'auth="alpha beta secret"', 'Review [REDACTED]'],
+    ['signed URL', 'https://example.test/download?X-Amz-Credential=AKIAIOSFODNN7EXAMPLE&X-Amz-Signature=0123456789abcdef0123456789abcdef', 'Review https://example.test/download'],
+    ['Slack webhook URL', 'https://hooks.slack.com/services/T00000000/B00000000/XXXXXXXXXXXXXXXXXXXXXXXX', 'Review https://hooks.slack.com/[REDACTED]'],
+    ['generic secret-bearing webhook URL', 'https://example.test/api/webhook/mF_9xQ7vK2pL8sN4dR6tY1wB3cE5hJ0z', 'Review https://example.test/api/webhook/[REDACTED]'],
+    ['Teams-style webhook URL', 'https://example.test/api/webhookb2/short-secret-id', 'Review https://example.test/api/webhookb2/[REDACTED]'],
+    ['labeled secret path URL', 'https://example.test/callback/token/short-secret-id', 'Review https://example.test/callback/token/[REDACTED]'],
+    ['ambiguous high-entropy value', 'mF_9xQ7vK2pL8sN4dR6tY1wB3cE5hJ0z', 'Review [REDACTED]'],
+    ['ambiguous base64 credential', 'Abcdefghijklmnop/QR234567890+=', 'Review [REDACTED]'],
+    ['ambiguous hex credential', '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef', 'Review [REDACTED]'],
+  ] as const;
+
+  it.each(credentialCases)('redacts a bare %s from a natural title', (_kind, credential, expected) => {
+    const title = sanitizeTaskTitle(`Review ${credential}`);
+
+    expect(title).toBe(expected);
+    expect(title).not.toContain(credential);
+  });
+
+  it.each(credentialCases)('rejects a bare %s as the entire title', (_kind, credential) => {
+    expect(sanitizeTaskTitle(credential)).toBe('');
+  });
+
+  it.each([
+    'gho_1234567890abcdefghijklmnopqrstuvwxyzAB',
+    'ghu_1234567890abcdefghijklmnopqrstuvwxyzAB',
+    'ghs_1234567890abcdefghijklmnopqrstuvwxyzAB',
+    'ghr_1234567890abcdefghijklmnopqrstuvwxyzAB',
+    'ASIAIOSFODNN7EXAMPLE',
+  ])('redacts an additional PAT or temporary AWS credential family: %s', (credential) => {
+    expect(sanitizeTaskTitle(`Review ${credential}`)).toBe('Review [REDACTED]');
+  });
+
   it('removes secrets URLs home paths and instruction wrappers from a task title', () => {
     const title = sanitizeTaskTitle(`
 <environment_context>ignored</environment_context>
@@ -213,6 +253,9 @@ const syntheticSecret = true;
     expect(sanitizeTaskTitle('Go review the deployment flow')).toBe('Go review the deployment flow');
     expect(sanitizeTaskTitle('Make the release safer')).toBe('Make the release safer');
     expect(sanitizeTaskTitle('Find the notification bug')).toBe('Find the notification bug');
+    expect(sanitizeTaskTitle('Review basic authentication behavior')).toBe(
+      'Review basic authentication behavior',
+    );
   });
 
   it.each([
@@ -309,6 +352,56 @@ describe('NotificationMetadataResolver', () => {
     expect(result).toMatchObject({
       projectName: 'project', taskName: '未命名任务 · abcdefgh', surface: 'Codex', shortTaskId: 'abcdefgh',
     });
+  });
+
+  it.each([
+    ['GitHub PAT', 'ghp_1234567890abcdefghijklmnopqrstuvwxyzAB'],
+    ['AWS access key', 'AKIAIOSFODNN7EXAMPLE'],
+    ['JWT', 'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c'],
+    ['Bearer credential', 'Bearer mF_9xQ7vK2pL8sN4dR6tY1wB3cE5hJ0z'],
+    ['webhook URL', 'https://hooks.slack.com/services/T00000000/B00000000/XXXXXXXXXXXXXXXXXXXXXXXX'],
+    ['high-entropy credential', 'mF_9xQ7vK2pL8sN4dR6tY1wB3cE5hJ0z'],
+  ])('falls back instead of placing a bare %s in notification fields', async (_kind, credential) => {
+    const codexDir = makeTemporaryDirectory();
+    await writeFile(join(codexDir, 'session_index.jsonl'), JSON.stringify({
+      id: 'credential-session',
+      thread_name: credential,
+    }), 'utf8');
+    const resolver = new NotificationMetadataResolver({
+      codexDir,
+      resolveGitRoot: async () => null,
+    });
+
+    const result = await resolver.resolve({
+      sessionId: 'credential-session',
+      cwd: '/workspace/safe-project',
+      source: 'cli',
+      userText: credential,
+      attachmentName: undefined,
+    });
+
+    expect(result.taskName).toBe('未命名任务 · credenti');
+    expect(JSON.stringify(result)).not.toContain(credential);
+  });
+
+  it('rejects a credential-like repository basename as the project field', async () => {
+    const codexDir = makeTemporaryDirectory();
+    const credential = 'mF_9xQ7vK2pL8sN4dR6tY1wB3cE5hJ0z';
+    const resolver = new NotificationMetadataResolver({
+      codexDir,
+      resolveGitRoot: async () => `/workspace/${credential}`,
+    });
+
+    const result = await resolver.resolve({
+      sessionId: 'project-secret',
+      cwd: `/workspace/${credential}`,
+      source: 'cli',
+      userText: 'Review notification privacy',
+      attachmentName: undefined,
+    });
+
+    expect(result.projectName).toBe('未识别项目');
+    expect(JSON.stringify(result)).not.toContain(credential);
   });
 
   it('uses bounded session-index titles before user text and attachments', async () => {

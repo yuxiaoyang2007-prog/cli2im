@@ -145,6 +145,159 @@ describe('CodexNotificationService', () => {
     ]);
   });
 
+  it('preserves a queued question timestamp so delayed delivery uses event time', async () => {
+    let onRollout: ((event: ParsedRolloutLine, filePath: string) => void | Promise<void>) | undefined;
+    const eventTime = Date.parse('2026-07-15T14:32:10.250-04:00');
+    const router = {
+      resumePending: vi.fn(),
+      handle: vi.fn().mockResolvedValue('delivered'),
+      stop: vi.fn(),
+    } as unknown as NotificationRouter;
+    const service = new CodexNotificationService({
+      botName: 'codexbot',
+      workingDirectory: '/tmp/project',
+      sessionsDir: '/tmp/codex/sessions',
+      sessionIndexPath: '/tmp/codex/session_index.jsonl',
+      socketPath: '/tmp/cli2im/codex-notify.sock',
+      store: { bindNotificationTarget: vi.fn() } as unknown as SessionStore,
+      resolveAdapter: () => undefined,
+      timeZone: 'UTC',
+      now: () => eventTime + 31_000,
+      dependencies: {
+        router,
+        metadataResolver: {
+          resolve: vi.fn().mockResolvedValue({
+            projectName: 'cli2im', taskName: '排队问题', surface: 'CLI', shortTaskId: 'session_',
+          }),
+        },
+        createMonitor: (handler) => {
+          onRollout = handler;
+          return { start: vi.fn(), stop: vi.fn() };
+        },
+        createSocket: () => ({ start: vi.fn(), stop: vi.fn() }),
+      },
+    });
+    const filePath = '/tmp/codex/sessions/rollout-question-time.jsonl';
+
+    await onRollout?.({ type: 'session_meta', sessionId: 'session_time', cwd: '/tmp/project', source: 'cli' }, filePath);
+    await onRollout?.({ type: 'turn_context', turnId: 'turn_time', cwd: '/tmp/project' }, filePath);
+    await onRollout?.({
+      type: 'question', turnId: 'turn_time', requestId: 'question_time', occurredAt: eventTime,
+    }, filePath);
+
+    expect(router.handle).toHaveBeenCalledWith(expect.objectContaining({
+      requestId: 'question_time',
+      occurredAt: eventTime,
+    }));
+    expect(eventTime + 31_000 - vi.mocked(router.handle).mock.calls[0][0].occurredAt).toBeGreaterThan(30_000);
+  });
+
+  it('uses now only when a question timestamp is missing', async () => {
+    let onRollout: ((event: ParsedRolloutLine, filePath: string) => void | Promise<void>) | undefined;
+    const router = {
+      resumePending: vi.fn(), handle: vi.fn().mockResolvedValue('delivered'), stop: vi.fn(),
+    } as unknown as NotificationRouter;
+    const service = new CodexNotificationService({
+      botName: 'codexbot', workingDirectory: '/tmp/project', sessionsDir: '/tmp/codex/sessions',
+      sessionIndexPath: '/tmp/codex/session_index.jsonl', socketPath: '/tmp/cli2im/codex-notify.sock',
+      store: { bindNotificationTarget: vi.fn() } as unknown as SessionStore,
+      resolveAdapter: () => undefined, timeZone: 'UTC', now: () => 44_000,
+      dependencies: {
+        router,
+        metadataResolver: { resolve: vi.fn().mockResolvedValue({
+          projectName: 'cli2im', taskName: '无时间问题', surface: 'CLI', shortTaskId: 'session_',
+        }) },
+        createMonitor: (handler) => {
+          onRollout = handler;
+          return { start: vi.fn(), stop: vi.fn() };
+        },
+        createSocket: () => ({ start: vi.fn(), stop: vi.fn() }),
+      },
+    });
+    const filePath = '/tmp/codex/sessions/rollout-question-fallback.jsonl';
+
+    await onRollout?.({ type: 'session_meta', sessionId: 'session_fallback', cwd: '/tmp/project', source: 'cli' }, filePath);
+    await onRollout?.({ type: 'question', turnId: 'turn_fallback', requestId: 'question_fallback' }, filePath);
+
+    expect(router.handle).toHaveBeenCalledWith(expect.objectContaining({ occurredAt: 44_000 }));
+  });
+
+  it('keeps the first valid user message metadata for a turn', async () => {
+    let onRollout: ((event: ParsedRolloutLine, filePath: string) => void | Promise<void>) | undefined;
+    const router = {
+      resumePending: vi.fn(), handle: vi.fn().mockResolvedValue('delivered'), stop: vi.fn(),
+    } as unknown as NotificationRouter;
+    const metadataResolver = {
+      resolve: vi.fn(async (input) => ({
+        projectName: 'cli2im', taskName: input.userText || `处理文件：${input.attachmentName}`,
+        surface: 'CLI' as const, shortTaskId: 'session_',
+      })),
+    } as unknown as NotificationMetadataResolver;
+    const service = new CodexNotificationService({
+      botName: 'codexbot', workingDirectory: '/tmp/project', sessionsDir: '/tmp/codex/sessions',
+      sessionIndexPath: '/tmp/codex/session_index.jsonl', socketPath: '/tmp/cli2im/codex-notify.sock',
+      store: { bindNotificationTarget: vi.fn() } as unknown as SessionStore,
+      resolveAdapter: () => undefined, timeZone: 'UTC', now: () => 5_000,
+      dependencies: {
+        router, metadataResolver,
+        createMonitor: (handler) => {
+          onRollout = handler;
+          return { start: vi.fn(), stop: vi.fn() };
+        },
+        createSocket: () => ({ start: vi.fn(), stop: vi.fn() }),
+      },
+    });
+    const filePath = '/tmp/codex/sessions/rollout-first-message.jsonl';
+
+    await onRollout?.({ type: 'session_meta', sessionId: 'session_first', cwd: '/tmp/project', source: 'cli' }, filePath);
+    await onRollout?.({ type: 'user_message', turnId: 'turn_first', userText: '第一条任务' }, filePath);
+    await onRollout?.({ type: 'user_message', turnId: 'turn_first', userText: '后续消息', attachmentName: 'later.pdf' }, filePath);
+    await onRollout?.({ type: 'question', turnId: 'turn_first', requestId: 'question_first' }, filePath);
+
+    expect(metadataResolver.resolve).toHaveBeenCalledWith(expect.objectContaining({
+      userText: '第一条任务',
+      attachmentName: undefined,
+    }));
+  });
+
+  it('keeps a first attachment-only message ahead of later text', async () => {
+    let onRollout: ((event: ParsedRolloutLine, filePath: string) => void | Promise<void>) | undefined;
+    const router = {
+      resumePending: vi.fn(), handle: vi.fn().mockResolvedValue('delivered'), stop: vi.fn(),
+    } as unknown as NotificationRouter;
+    const metadataResolver = {
+      resolve: vi.fn(async (input) => ({
+        projectName: 'cli2im', taskName: input.userText || `处理文件：${input.attachmentName}`,
+        surface: 'CLI' as const, shortTaskId: 'session_',
+      })),
+    } as unknown as NotificationMetadataResolver;
+    const service = new CodexNotificationService({
+      botName: 'codexbot', workingDirectory: '/tmp/project', sessionsDir: '/tmp/codex/sessions',
+      sessionIndexPath: '/tmp/codex/session_index.jsonl', socketPath: '/tmp/cli2im/codex-notify.sock',
+      store: { bindNotificationTarget: vi.fn() } as unknown as SessionStore,
+      resolveAdapter: () => undefined, timeZone: 'UTC', now: () => 5_000,
+      dependencies: {
+        router, metadataResolver,
+        createMonitor: (handler) => {
+          onRollout = handler;
+          return { start: vi.fn(), stop: vi.fn() };
+        },
+        createSocket: () => ({ start: vi.fn(), stop: vi.fn() }),
+      },
+    });
+    const filePath = '/tmp/codex/sessions/rollout-first-attachment.jsonl';
+
+    await onRollout?.({ type: 'session_meta', sessionId: 'session_attach', cwd: '/tmp/project', source: 'cli' }, filePath);
+    await onRollout?.({ type: 'user_message', turnId: 'turn_attach', attachmentName: 'first.pdf' }, filePath);
+    await onRollout?.({ type: 'user_message', turnId: 'turn_attach', userText: '后续文本' }, filePath);
+    await onRollout?.({ type: 'question', turnId: 'turn_attach', requestId: 'question_attach' }, filePath);
+
+    expect(metadataResolver.resolve).toHaveBeenCalledWith(expect.objectContaining({
+      userText: '',
+      attachmentName: 'first.pdf',
+    }));
+  });
+
   it('persists only a matching Feishu binding', async () => {
     const store = {
       bindNotificationTarget: vi.fn().mockResolvedValue(undefined),

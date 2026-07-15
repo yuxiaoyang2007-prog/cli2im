@@ -8,6 +8,13 @@ const execFileAsync = promisify(execFile);
 
 const PRIVATE_KEY = /-----BEGIN [A-Z ]*PRIVATE KEY-----/gi;
 const OPENAI_STYLE_KEY = /\b(?:sk|sess)-[A-Za-z0-9_-]{12,}\b/g;
+const GITHUB_TOKEN = /\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})\b/gi;
+const AWS_ACCESS_KEY = /\b(?:A3T[A-Z0-9]|ABIA|ACCA|AGPA|AIDA|AIPA|AKIA|ANPA|ANVA|APKA|AROA|ASCA|ASIA)[A-Z0-9]{16}\b/g;
+const JWT = /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/g;
+const AUTHORIZATION_CREDENTIAL = /\b(?:authorization|proxy-authorization|auth)\s*[:=]\s*(?:"(?:\\.|[^"\\])*(?:"|$)|'(?:\\.|[^'\\])*(?:'|$)|(?:(?:bearer|basic)\s+)?[^\s,;]+)/gi;
+const BEARER_CREDENTIAL = /\bbearer\s+[^\s,;]+/gi;
+const BASIC_CREDENTIAL = /\bbasic\s+[A-Za-z0-9+/=]{8,}/gi;
+const REDACTION = '[REDACTED]';
 const MARKDOWN_LINK = /\[([^\]]+)]\([^\s)]+\)/g;
 const CODE_FENCE = /```[\s\S]*?```/g;
 const CJK = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/u;
@@ -96,9 +103,10 @@ export function sanitizeTaskTitle(value: string): string {
     .replace(/^\s*#\s*AGENTS\.md instructions\s*$/gim, '\n')
     .replace(CODE_FENCE, '\n')
     .replace(MARKDOWN_LINK, '$1')
-    .replace(PRIVATE_KEY, '[REDACTED]')
-    .replace(OPENAI_STYLE_KEY, '[REDACTED]');
+    .replace(PRIVATE_KEY, REDACTION)
+    .replace(OPENAI_STYLE_KEY, REDACTION);
 
+  sanitized = redactCredentialTokens(sanitized);
   sanitized = redactNamedSecrets(sanitized);
   const uriSafe = sanitizeUris(sanitized);
   if (uriSafe === null) return '';
@@ -107,6 +115,7 @@ export function sanitizeTaskTitle(value: string): string {
     .split(/\r?\n/)
     .map((line) => line.trim())
     .find(Boolean) ?? '';
+  if (!hasMeaningfulSafeText(firstMeaningfulLine)) return '';
   if (isHighConfidenceRawCommand(firstMeaningfulLine)
     || hasUnsafePreLexicalStructure(firstMeaningfulLine)) {
     return '';
@@ -117,6 +126,7 @@ export function sanitizeTaskTitle(value: string): string {
   const pathSafe = sanitizeAbsolutePaths(lexicalCandidate);
   if (pathSafe === null) return '';
   const normalized = pathSafe.replace(/[ \t]+/g, ' ').trim();
+  if (!hasMeaningfulSafeText(normalized)) return '';
 
   return isUnsafeTechnicalTitle(normalized)
     ? ''
@@ -125,12 +135,12 @@ export function sanitizeTaskTitle(value: string): string {
 
 export function sanitizeMetadataBasename(value: string): string {
   const name = basename(value.replaceAll('\\', '/'));
-  const redacted = redactNamedSecrets(name)
-    .replace(PRIVATE_KEY, '[REDACTED]')
-    .replace(OPENAI_STYLE_KEY, '[REDACTED]')
+  const redacted = redactNamedSecrets(redactCredentialTokens(name))
+    .replace(PRIVATE_KEY, REDACTION)
+    .replace(OPENAI_STYLE_KEY, REDACTION)
     .replace(/[ \t]+/g, ' ')
     .trim();
-  return truncateTitle(redacted);
+  return hasMeaningfulSafeText(redacted) ? truncateTitle(redacted) : '';
 }
 
 export class NotificationMetadataResolver {
@@ -334,14 +344,14 @@ function isHighConfidenceRawCommand(value: string): boolean {
 }
 
 function redactNamedSecrets(value: string): string {
-  const pattern = /\b(token|password|passwd|secret|cookie|api[_-]?key)\s*[:=]\s*/gi;
+  const pattern = /\b(token|password|passwd|secret|cookie|api[_-]?key|credential)\s*[:=]\s*/gi;
   let result = '';
   let cursor = 0;
   let match: RegExpExecArray | null;
 
   while ((match = pattern.exec(value)) !== null) {
     result += value.slice(cursor, match.index);
-    result += `${match[1]}=[REDACTED]`;
+    result += `${match[1]}=${REDACTION}`;
 
     let valueEnd = pattern.lastIndex;
     const quote = value[valueEnd];
@@ -370,6 +380,72 @@ function redactNamedSecrets(value: string): string {
   }
 
   return result + value.slice(cursor);
+}
+
+function redactCredentialTokens(value: string): string {
+  return redactAmbiguousCredentialTokens(redactBasicCredentialForms(value
+    .replace(AUTHORIZATION_CREDENTIAL, REDACTION)
+    .replace(BEARER_CREDENTIAL, REDACTION)
+    .replace(GITHUB_TOKEN, REDACTION)
+    .replace(AWS_ACCESS_KEY, REDACTION)
+    .replace(JWT, REDACTION)));
+}
+
+function redactBasicCredentialForms(value: string): string {
+  return value.replace(BASIC_CREDENTIAL, (match, token: string) => (
+    /[A-Z]/.test(token)
+      && /[a-z]/.test(token)
+      && (token.length >= 20 || /[\d+/=]/.test(token))
+      ? REDACTION
+      : match
+  ));
+}
+
+function redactAmbiguousCredentialTokens(value: string): string {
+  const withoutSlashTokens = value.replace(/[A-Za-z0-9_~+=-]{24,}/g, (candidate) => (
+    isAmbiguousCredentialToken(candidate) ? REDACTION : candidate
+  ));
+  return withoutSlashTokens.replace(
+    /(^|[\s("'`])([A-Za-z0-9_~+/=-]{24,})(?=$|[\s)"'`,.;!?])/g,
+    (_match, prefix: string, candidate: string) => (
+      `${prefix}${isAmbiguousCredentialToken(candidate) ? REDACTION : candidate}`
+    ),
+  );
+}
+
+function isAmbiguousCredentialToken(value: string): boolean {
+  if (value.length < 24) return false;
+  if (/^[A-Fa-f0-9]{48,}$/.test(value) && shannonEntropy(value) >= 3.5) return true;
+  if (value.includes('/')) {
+    if (/^(?:\/|\.{1,2}\/|~\/)/.test(value) || value.includes('://')) return false;
+    if (!/[+=]/.test(value)) return false;
+  }
+  const classes = [/[a-z]/, /[A-Z]/, /\d/, /[_~+/=-]/]
+    .filter((pattern) => pattern.test(value)).length;
+  const uniqueRatio = new Set(value).size / value.length;
+  if (classes >= 3) return uniqueRatio >= 0.35;
+  return value.length >= 32 && classes >= 2 && uniqueRatio >= 0.4;
+}
+
+function shannonEntropy(value: string): number {
+  const counts = new Map<string, number>();
+  for (const character of value.toLowerCase()) {
+    counts.set(character, (counts.get(character) ?? 0) + 1);
+  }
+  let entropy = 0;
+  for (const count of counts.values()) {
+    const probability = count / value.length;
+    entropy -= probability * Math.log2(probability);
+  }
+  return entropy;
+}
+
+function hasMeaningfulSafeText(value: string): boolean {
+  const remainder = value
+    .replaceAll(REDACTION, ' ')
+    .replace(/\b(?:authorization|proxy-authorization|auth|bearer|basic|token|password|passwd|secret|cookie|api[_-]?key|credential)\b/gi, ' ')
+    .replace(/[^\p{L}\p{N}]+/gu, '');
+  return /[\p{L}\p{N}]/u.test(remainder);
 }
 
 function sanitizeUris(value: string): string | null {
@@ -431,10 +507,37 @@ function hasAmbiguousPathContinuation(remainder: string): boolean {
 function sanitizeHttpUrl(value: string): string {
   try {
     const parsed = new URL(value);
-    return `${parsed.protocol}//${parsed.host}${parsed.pathname}`;
+    return `${parsed.protocol}//${parsed.host}${sanitizeHttpPath(parsed.hostname, parsed.pathname)}`;
   } catch {
-    return '[REDACTED]';
+    return REDACTION;
   }
+}
+
+function sanitizeHttpPath(hostname: string, pathname: string): string {
+  const segments = pathname.split('/');
+  const lowerSegments = segments.map((segment) => segment.toLowerCase());
+  const isKnownWebhookHost = hostname.toLowerCase() === 'hooks.slack.com'
+    || (hostname.toLowerCase().endsWith('discord.com') && lowerSegments.includes('webhooks'));
+  if (isKnownWebhookHost) return `/${REDACTION}`;
+
+  const sensitiveIndex = lowerSegments.findIndex((segment) => (
+    segment === 'hook'
+    || segment === 'hooks'
+    || segment.includes('webhook')
+    || segment === 'token'
+    || segment === 'secret'
+    || segment === 'credential'
+    || segment === 'auth'
+    || segment === 'api-key'
+    || segment === 'apikey'
+  ));
+  if (sensitiveIndex >= 0 && sensitiveIndex < segments.length - 1) {
+    return `${segments.slice(0, sensitiveIndex + 1).join('/')}/${REDACTION}`;
+  }
+
+  return segments.map((segment) => (
+    isAmbiguousCredentialToken(segment) ? REDACTION : segment
+  )).join('/');
 }
 
 function splitTrailingPunctuation(value: string): { core: string; suffix: string } {
