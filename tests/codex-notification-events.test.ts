@@ -75,6 +75,7 @@ describe('Codex notification event parsing', () => {
 
     expect(session('exec', 'Codex Desktop')).toMatchObject({ source: 'codex-desktop' });
     expect(session('exec', 'codex_exec')).toMatchObject({ source: 'cli' });
+    expect(session('cli', 'codex-tui')).toMatchObject({ source: 'cli' });
     expect(session('vscode', 'codex_chrome_sidepanel')).toMatchObject({ source: 'codex' });
     expect(session('exec')).toMatchObject({ source: 'cli' });
     expect(session('vscode')).toMatchObject({ source: 'vscode' });

@@ -73,6 +73,13 @@ const syntheticSecret = true;
     expect(sanitizeTaskTitle(value)).toBe('');
   });
 
+  it.each([
+    ['absolute path', 'Analyze /tmp/private/report.csv and summarize'],
+    ['file URI', 'Analyze file:///tmp/private/report.csv and summarize'],
+  ])('uses a clear filename as the whitespace boundary for an %s', (_kind, value) => {
+    expect(sanitizeTaskTitle(value)).toBe('Analyze report.csv and summarize');
+  });
+
   it('consumes complete quoted named-secret values including spaces', () => {
     const title = sanitizeTaskTitle(
       'Rotate password="alpha beta" and token=\'gamma delta\' now',
@@ -107,12 +114,18 @@ const syntheticSecret = true;
     ['unfenced JSON', '{"command":"synthetic","ok":true}'],
     ['diff', 'diff --git a/src/old.ts b/src/new.ts'],
     ['log line', '[2026-07-15T12:00:00.000Z] ERROR synthetic failure'],
+    ['lowercase log line', '[2026-07-15T12:00:00.000Z] error synthetic failure'],
     ['lowercase command', 'brew install package'],
     ['lowercase CLI command', 'gh pr view 1'],
     ['SQL', 'SELECT * FROM users;'],
     ['control-flow code', 'if (ready) deploy();'],
     ['error line', 'Error: failed'],
+    ['lowercase error line', 'error: failed'],
     ['stack line', 'at deploy (/tmp/private/app.js:10:2)'],
+    ['Python stack frame', '  File "/tmp/private/app.py", line 12, in deploy'],
+    ['single-word command', 'ls'],
+    ['simple call', 'deploy()'],
+    ['ambiguous lowercase command', 'deploy production'],
     ['shell redirection', 'deploy > /tmp/private/output.log'],
     ['shell operator expression', 'build && deploy'],
   ])('rejects a task title that is principally a %s', (_kind, value) => {
@@ -127,6 +140,10 @@ const syntheticSecret = true;
     expect(sanitizeTaskTitle('Go review the deployment flow')).toBe('Go review the deployment flow');
     expect(sanitizeTaskTitle('Make the release safer')).toBe('Make the release safer');
     expect(sanitizeTaskTitle('Find the notification bug')).toBe('Find the notification bug');
+    expect(sanitizeTaskTitle('please review the notification report')).toBe(
+      'please review the notification report',
+    );
+    expect(sanitizeTaskTitle('fix the notification bug')).toBe('fix the notification bug');
   });
 
   it('truncates CJK-heavy and Latin-heavy titles by Unicode code points', () => {

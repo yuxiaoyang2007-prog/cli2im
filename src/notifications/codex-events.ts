@@ -166,6 +166,7 @@ function normalizeSessionSource(source: unknown, originator: unknown): string {
         return 'codex-desktop';
       case 'codex_exec':
       case 'codex exec':
+      case 'codex-tui':
         return 'cli';
       case 'codex_chrome_sidepanel':
       case 'codex chrome sidepanel':
