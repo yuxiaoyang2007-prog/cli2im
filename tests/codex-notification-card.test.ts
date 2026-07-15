@@ -78,6 +78,15 @@ describe('buildNotificationCard', () => {
     });
   });
 
+  it('always renders the completion duration with an exact unknown fallback', () => {
+    const card = buildNotificationCard(completionEvent({ durationMs: undefined }), {
+      delayed: false,
+      timeZone: 'America/New_York',
+    });
+
+    expect(card.content.split('\n')).toContain('**耗时：** 未知');
+  });
+
   it('adds the delayed marker as the final line', () => {
     const card = buildNotificationCard(attentionEvent({ reason: 'question' }), {
       delayed: true,
@@ -117,5 +126,34 @@ describe('buildNotificationCard', () => {
     expect(card).not.toHaveProperty('rawElements');
     expect(card).not.toHaveProperty('buttons');
     expect(JSON.stringify(card)).not.toMatch(/RAW_|\/Users\/private/);
+  });
+
+  it('normalizes adversarial dynamic values into one safe plain-text line each', () => {
+    const attack = [
+      'first\r\n\tsecond\u0000',
+      '~~strike~~ <at id=ou_secret>mention</at>',
+      '[click](https://example.test?q=secret) `code` *bold* _em_',
+      '\\path | # heading',
+    ].join('');
+    const card = buildNotificationCard(attentionEvent({
+      projectName: attack,
+      taskName: attack,
+      surface: attack as CodexNotificationEvent['surface'],
+      shortTaskId: attack,
+    }), {
+      delayed: false,
+      timeZone: 'America/New_York',
+    });
+
+    expect(card.content.split('\n')).toHaveLength(6);
+    expect(card.content).not.toMatch(/[\r\t\u0000]/u);
+    expect(card.content).not.toContain('~~');
+    expect(card.content).not.toContain('<at');
+    expect(card.content).not.toContain('[click](');
+    expect(card.content).not.toContain('`code`');
+    expect(card.content).not.toContain('*bold*');
+    expect(card.content).not.toContain('_em_');
+    expect(card.content).not.toMatch(/(?<!\\)[|#]/u);
+    expect(card.content).toContain('first second');
   });
 });

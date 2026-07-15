@@ -109,6 +109,24 @@ describe('FeishuAdapter file handling', () => {
     });
   });
 
+  it('serializes the same optional idempotency key for text and card sends', async () => {
+    const adapter = new FeishuAdapter({ appId: 'app', appSecret: 'secret', botName: 'bot' });
+    const client = larkMocks.clients[0];
+    const idempotencyKey = '0123456789abcdef01234567';
+
+    await adapter.send('oc_1', { text: 'hello' }, { idempotencyKey });
+    await adapter.sendCard('oc_1', {
+      type: 'final',
+      content: 'safe card',
+    }, { idempotencyKey });
+
+    const createMock = client.im.message.create as ReturnType<typeof vi.fn>;
+    expect(createMock.mock.calls.map(([request]) => request.data.uuid)).toEqual([
+      idempotencyKey,
+      idempotencyKey,
+    ]);
+  });
+
   it('parses image and file receive events into inbound attachments', () => {
     const adapter = new FeishuAdapter({ appId: 'app', appSecret: 'secret', botName: 'bot' });
     const received: InboundMessage[] = [];

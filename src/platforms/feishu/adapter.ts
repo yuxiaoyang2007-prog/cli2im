@@ -86,6 +86,7 @@ export class FeishuAdapter implements PlatformAdapter {
         receive_id: chatId,
         msg_type: 'text',
         content: JSON.stringify({ text: content.text ?? '' }),
+        ...(options.idempotencyKey ? { uuid: options.idempotencyKey } : {}),
       },
     }, options.signal));
     throwIfAborted(options.signal);
@@ -281,6 +282,7 @@ export class FeishuAdapter implements PlatformAdapter {
         receive_id: chatId,
         msg_type: 'interactive',
         content: JSON.stringify(cardJson),
+        ...(options.idempotencyKey ? { uuid: options.idempotencyKey } : {}),
       },
     }, options.signal));
     throwIfAborted(options.signal);

@@ -10,7 +10,7 @@ export function buildNotificationCard(
   event: CodexNotificationEvent,
   options: NotificationCardOptions,
 ): CardPayload {
-  const value = (input: string) => escapeFeishuMarkdown(input);
+  const value = (input: string) => normalizeFeishuPlainText(input);
   const commonLines = [
     `**项目：** ${value(event.projectName)}`,
     `**任务：** ${value(event.taskName)}`,
@@ -37,9 +37,9 @@ export function buildNotificationCard(
           ...commonLines,
           `**位置：** ${value(event.surface)}`,
           `**完成：** ${value(formatTime(event.occurredAt, options.timeZone))}`,
-          ...(event.durationMs === undefined
-            ? []
-            : [`**耗时：** ${value(formatDuration(event.durationMs))}`]),
+          `**耗时：** ${value(
+            event.durationMs === undefined ? '未知' : formatDuration(event.durationMs)
+          )}`,
           `**任务 ID：** ${value(event.shortTaskId)}`,
         ],
       };
@@ -68,6 +68,11 @@ function formatDuration(durationMs: number): string {
   return minutes > 0 ? `${minutes} 分 ${seconds} 秒` : `${seconds} 秒`;
 }
 
-function escapeFeishuMarkdown(input: string): string {
-  return input.replace(/([\\*_`[\]])/g, '\\$1');
+function normalizeFeishuPlainText(input: string): string {
+  return input
+    .replace(/[\p{C}\p{Z}\s]+/gu, ' ')
+    .trim()
+    .replaceAll('<', '＜')
+    .replaceAll('>', '＞')
+    .replace(/([\\`*_{}[\]()#+\-.!|~])/g, '\\$1');
 }

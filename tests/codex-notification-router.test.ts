@@ -136,7 +136,7 @@ describe('NotificationRouter', () => {
         title: '🟠 待你处理',
         headerTemplate: 'orange',
       }),
-    });
+    }, { idempotencyKey: 'evt_attention_0123456789abcdef' });
     expect(unrelatedSend).not.toHaveBeenCalled();
     expect(await store.listPendingNotifications()).toEqual([]);
   });
@@ -193,6 +193,12 @@ describe('NotificationRouter', () => {
       STARTED_AT + 6_000,
       STARTED_AT + 26_000,
     ]);
+    expect(send.mock.calls.map(([, , options]) => options?.idempotencyKey)).toEqual([
+      event.eventKey,
+      event.eventKey,
+      event.eventKey,
+      event.eventKey,
+    ]);
     expect(await store.listPendingNotifications()).toEqual([]);
     expect(logs).toEqual([
       expect.objectContaining({ attempt: 1, errorClass: 'TypeError' }),
@@ -231,6 +237,82 @@ describe('NotificationRouter', () => {
 
     await vi.runAllTimersAsync();
     expect(send).toHaveBeenCalledTimes(4);
+  });
+
+  it('retries a delivered-state failure with one transport idempotency key', async () => {
+    const store = await SessionStore.create(':memory:');
+    stores.push(store);
+    await bindTarget(store);
+    const event = attentionEvent({ eventKey: '0123456789abcdef01234567' });
+    const transportDeliveries = new Set<string>();
+    const send = vi.fn<PlatformAdapter['send']>().mockImplementation(async (
+      _chatId,
+      _content,
+      options,
+    ) => {
+      transportDeliveries.add(options?.idempotencyKey ?? `missing-${transportDeliveries.size}`);
+      return 'om_transport_delivery';
+    });
+    const originalMarkDelivered = store.markNotificationDelivered.bind(store);
+    const markDelivered = vi.spyOn(store, 'markNotificationDelivered')
+      .mockRejectedValueOnce(new Error('local state write failed'))
+      .mockImplementation(originalMarkDelivered);
+    const logs: NotificationLogEntry[] = [];
+    const router = new NotificationRouter({
+      store,
+      botName: 'codexbot',
+      adapters: new Map([['codexbot', adapterWith(send)]]),
+      timeZone: 'America/New_York',
+      log: (entry) => logs.push(entry),
+      ...timerDependencies(),
+    });
+
+    await expect(router.handle(event)).resolves.toBe('pending');
+    await vi.advanceTimersByTimeAsync(1_000);
+
+    expect(send).toHaveBeenCalledTimes(2);
+    expect(markDelivered).toHaveBeenCalledTimes(2);
+    expect(transportDeliveries).toEqual(new Set([event.eventKey]));
+    expect(send.mock.calls.map(([, , options]) => options?.idempotencyKey)).toEqual([
+      event.eventKey,
+      event.eventKey,
+    ]);
+    expect(logs).toEqual([
+      {
+        kind: 'needs_attention',
+        eventKey: '01234567',
+        attempt: 1,
+        errorClass: 'delivery_state_error',
+      },
+    ]);
+    expect(await store.listPendingNotifications()).toEqual([]);
+  });
+
+  it('does not overlap resumePending with an in-flight immediate delivery', async () => {
+    const store = await SessionStore.create(':memory:');
+    stores.push(store);
+    await bindTarget(store);
+    const gate = deferred<string>();
+    const send = vi.fn<PlatformAdapter['send']>().mockImplementation(() => gate.promise);
+    const router = new NotificationRouter({
+      store,
+      botName: 'codexbot',
+      adapters: new Map([['codexbot', adapterWith(send)]]),
+      timeZone: 'America/New_York',
+      ...timerDependencies(),
+    });
+
+    const handling = router.handle(attentionEvent());
+    await vi.advanceTimersByTimeAsync(0);
+    expect(send).toHaveBeenCalledTimes(1);
+
+    await router.resumePending();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(send).toHaveBeenCalledTimes(1);
+
+    gate.resolve('om_1');
+    await expect(handling).resolves.toBe('delivered');
+    expect(await store.listPendingNotifications()).toEqual([]);
   });
 
   it('resumes a persisted retry at its due time after a simulated restart', async () => {
@@ -319,3 +401,13 @@ describe('NotificationRouter', () => {
     ]);
   });
 });
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (error: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
