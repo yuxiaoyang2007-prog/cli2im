@@ -21,6 +21,11 @@ interface TrackedGeneration {
   lastChangeAt: number;
 }
 
+interface DiscoveredFileInspection {
+  baseline?: NotificationCursor;
+  hasUnreadBytes: boolean;
+}
+
 const CONTINUITY_WINDOW_BYTES = 64;
 const MAX_IDENTITY_RECHECKS = 4;
 const READ_CHUNK_BYTES = 64 * 1024;
@@ -38,10 +43,12 @@ export class CodexEventMonitor {
   private readonly sessionsDir: string;
   private readonly store: NotificationCursorStore;
   private readonly onEvent: CodexEventMonitorOptions['onEvent'];
-  private readonly pending = new Map<string, Promise<void>>();
+  private readonly pending = new Map<string, Promise<unknown>>();
   private readonly watcherTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private readonly replacementTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private readonly generations = new Map<string, TrackedGeneration>();
+  private readonly liveWatcherPaths = new Set<string>();
+  private readonly startupHistoricalPaths = new Set<string>();
   private watcher: FSWatcher | null = null;
   private state: MonitorState = 'stopped';
   private startPromise: Promise<void> | null = null;
@@ -49,6 +56,7 @@ export class CodexEventMonitor {
   private stopRequested = false;
   private rediscoverRequested = false;
   private discoveryPromise: Promise<void> | null = null;
+  private startupListingCaptured = false;
 
   constructor(options: CodexEventMonitorOptions) {
     this.sessionsDir = options.sessionsDir;
@@ -96,9 +104,18 @@ export class CodexEventMonitor {
   private async startInternal(): Promise<void> {
     let watcher: FSWatcher | null = null;
     try {
+      this.liveWatcherPaths.clear();
+      this.startupHistoricalPaths.clear();
+      this.startupListingCaptured = false;
       watcher = watch(this.sessionsDir, { recursive: true }, (_eventType, filename) => {
         if (this.state === 'stopped' || this.state === 'stopping') return;
         if (this.state === 'starting') {
+          if (filename) {
+            const filePath = join(this.sessionsDir, filename.toString());
+            if (!this.startupHistoricalPaths.has(filePath)) {
+              this.liveWatcherPaths.add(filePath);
+            }
+          }
           this.rediscoverRequested = true;
           return;
         }
@@ -184,14 +201,24 @@ export class CodexEventMonitor {
   }
 
   private async queueFile(filePath: string, origin: ProcessingOrigin): Promise<void> {
+    await this.queuePathOperation(
+      filePath,
+      () => this.processFileOnce(filePath, origin),
+    );
+  }
+
+  private async queuePathOperation<T>(
+    filePath: string,
+    operation: () => Promise<T>,
+  ): Promise<T> {
     const previous = this.pending.get(filePath) ?? Promise.resolve();
     const current = previous
       .catch(() => undefined)
-      .then(() => this.processFileOnce(filePath, origin));
+      .then(operation);
     this.pending.set(filePath, current);
 
     try {
-      await current;
+      return await current;
     } finally {
       if (this.pending.get(filePath) === current) this.pending.delete(filePath);
     }
@@ -219,39 +246,87 @@ export class CodexEventMonitor {
 
   private async discoverFilesOnce(): Promise<void> {
     const files = await discoverRolloutFiles(this.sessionsDir);
-    const baselines: NotificationCursor[] = [];
-    const processAfterBaseline: string[] = [];
-
-    for (const filePath of files) {
-      const inspection = await this.inspectDiscoveredFile(filePath);
-      if (inspection?.baseline) {
-        baselines.push(inspection.baseline);
-        processAfterBaseline.push(filePath);
-      } else if (inspection?.hasUnreadBytes) {
-        processAfterBaseline.push(filePath);
-      }
-    }
-
-    if (baselines.length > 0) {
-      if (this.store.upsertNotificationCursors) {
-        await this.store.upsertNotificationCursors(baselines);
+    if (this.state === 'starting') {
+      if (!this.startupListingCaptured) {
+        for (const filePath of files) this.startupHistoricalPaths.add(filePath);
+        this.startupListingCaptured = true;
       } else {
-        for (const cursor of baselines) {
-          await this.store.upsertNotificationCursor(cursor);
+        for (const filePath of files) {
+          if (!this.startupHistoricalPaths.has(filePath)) this.liveWatcherPaths.add(filePath);
         }
       }
     }
+    const baselines: NotificationCursor[] = [];
+    const reservations: Array<{
+      completion: Promise<void>;
+      release: (committed: boolean) => void;
+    }> = [];
 
-    for (const filePath of processAfterBaseline) {
-      await this.queueFile(filePath, 'discovery');
-      this.scheduleReplacementSettle(filePath);
+    try {
+      for (const filePath of files) {
+        const reservation = this.reserveDiscoveryPath(filePath);
+        reservations.push(reservation);
+        const inspection = await reservation.ready;
+        if (inspection?.baseline) baselines.push(inspection.baseline);
+      }
+
+      if (baselines.length > 0) {
+        if (this.store.upsertNotificationCursors) {
+          await this.store.upsertNotificationCursors(baselines);
+        } else {
+          for (const cursor of baselines) {
+            await this.store.upsertNotificationCursor(cursor);
+          }
+        }
+      }
+
+      for (const reservation of reservations) {
+        reservation.release(true);
+        await reservation.completion;
+      }
+    } catch (error) {
+      for (const reservation of reservations) reservation.release(false);
+      await Promise.allSettled(reservations.map((reservation) => reservation.completion));
+      throw error;
     }
   }
 
-  private async inspectDiscoveredFile(filePath: string): Promise<{
-    baseline?: NotificationCursor;
-    hasUnreadBytes: boolean;
-  } | null> {
+  private reserveDiscoveryPath(filePath: string): {
+    ready: Promise<DiscoveredFileInspection | null>;
+    completion: Promise<void>;
+    release: (committed: boolean) => void;
+  } {
+    const ready = deferred<DiscoveredFileInspection | null>();
+    const commit = deferred<boolean>();
+    const completion = this.queuePathOperation(filePath, async () => {
+      try {
+        const inspection = await this.inspectDiscoveredFile(filePath);
+        ready.resolve(inspection);
+        const committed = await commit.promise;
+        if (
+          committed
+          && inspection
+          && (inspection.baseline || inspection.hasUnreadBytes)
+        ) {
+          await this.processFileOnce(filePath, 'discovery');
+          this.scheduleReplacementSettle(filePath);
+        }
+        if (committed) this.liveWatcherPaths.delete(filePath);
+      } catch (error) {
+        ready.reject(error);
+        throw error;
+      }
+    });
+    return {
+      ready: ready.promise,
+      completion,
+      release: commit.resolve,
+    };
+  }
+
+  private async inspectDiscoveredFile(
+    filePath: string,
+  ): Promise<DiscoveredFileInspection | null> {
     const handle = await openIfPresent(filePath);
     if (!handle) return null;
     try {
@@ -260,7 +335,9 @@ export class CodexEventMonitor {
       const fileId = `${fileStat.dev}:${fileStat.ino}`;
       const cursor = await this.store.getNotificationCursor(filePath);
       const generation = this.generations.get(filePath);
-      const isLiveNew = this.state === 'started' && !cursor && !generation;
+      const isLiveNew = !cursor
+        && !generation
+        && (this.state === 'started' || this.liveWatcherPaths.has(filePath));
       const precedingBytes = await readPrecedingBytes(handle, cursor?.byteOffset ?? fileStat.size);
       const hasValidCursor = cursor
         && cursor.fileId === fileId
@@ -572,4 +649,18 @@ function appendContinuityTail(anchor: Buffer, appended: Buffer): Buffer {
 
 function hashBytes(bytes: Buffer): string {
   return createHash('sha256').update(bytes).digest('hex').slice(0, 24);
+}
+
+function deferred<T>(): {
+  promise: Promise<T>;
+  resolve: (value: T) => void;
+  reject: (error: unknown) => void;
+} {
+  let resolve!: (value: T) => void;
+  let reject!: (error: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
 }

@@ -88,6 +88,54 @@ describe('CodexEventMonitor', () => {
     );
   });
 
+  it('serializes initial discovery with a recorded live watcher origin without losing its event', async () => {
+    const { file, onEvent, sessionsDir, store } = await setup();
+    await monitors.pop()?.stop();
+    await writeFile(file, `${historicalCompletion}\n`);
+    const liveFile = join(dirname(file), 'rollout-created-during-scan.jsonl');
+    const liveQuestion = makeQuestionLine('created-during-scan');
+    let enteredResolve!: () => void;
+    let releaseResolve!: () => void;
+    const entered = new Promise<void>((resolve) => { enteredResolve = resolve; });
+    const release = new Promise<void>((resolve) => { releaseResolve = resolve; });
+    let blocked = false;
+    const monitor = new CodexEventMonitor({
+      sessionsDir,
+      store: {
+        getNotificationCursor: async (filePath: string) => {
+          if (filePath === file && !blocked) {
+            blocked = true;
+            enteredResolve();
+            await release;
+          }
+          return store.getNotificationCursor(filePath);
+        },
+        upsertNotificationCursor: store.upsertNotificationCursor.bind(store),
+        upsertNotificationCursors: store.upsertNotificationCursors.bind(store),
+      },
+      onEvent,
+    });
+    monitors.push(monitor);
+
+    const starting = monitor.start();
+    await entered;
+    await writeFile(liveFile, `${liveQuestion}\n`);
+    await waitFor(() => (
+      monitor as unknown as { liveWatcherPaths: Set<string> }
+    ).liveWatcherPaths.has(liveFile));
+    releaseResolve();
+    await starting;
+    await waitFor(() => onEvent.mock.calls.length === 1);
+
+    expect(onEvent).toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'question', requestId: 'created-during-scan' }),
+      liveFile,
+    );
+    expect((await store.getNotificationCursor(liveFile))?.byteOffset).toBe(
+      (await stat(liveFile)).size,
+    );
+  });
+
   it('suppresses slow non-atomic replacement history and resumes a later append', async () => {
     const { file, monitor, onEvent } = await setup();
     await writeFile(file, `${historicalCompletion}\n`);

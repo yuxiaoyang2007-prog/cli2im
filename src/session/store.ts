@@ -43,6 +43,7 @@ const EXPECTED_SESSION_COLUMNS = new Set([
 export class SessionStore {
   private db: Database;
   private dbPath: string;
+  private privacyPublicationPending = false;
 
   private constructor(db: Database, dbPath: string) {
     this.db = db;
@@ -476,6 +477,7 @@ export class SessionStore {
   }
 
   async markNotificationDelivered(eventKey: string, deliveredAt: number): Promise<void> {
+    if (this.dbPath !== ':memory:') this.privacyPublicationPending = true;
     this.db.run('PRAGMA secure_delete = ON');
     this.db.run(
       `UPDATE notification_deliveries
@@ -501,6 +503,7 @@ export class SessionStore {
     eventKey: string,
     status: 'failed' | 'discarded' = 'failed',
   ): Promise<void> {
+    if (this.dbPath !== ':memory:') this.privacyPublicationPending = true;
     this.db.run('PRAGMA secure_delete = ON');
     this.db.run(
       `UPDATE notification_deliveries
@@ -525,13 +528,16 @@ export class SessionStore {
   save(): void {
     if (this.dbPath === ':memory:') return;
     const data = this.db.export();
-    saveDatabaseSnapshot(this.dbPath, Buffer.from(data));
+    if (this.privacyPublicationPending) {
+      saveDatabaseSnapshotPair(this.dbPath, Buffer.from(data));
+      this.privacyPublicationPending = false;
+    } else {
+      saveDatabaseSnapshot(this.dbPath, Buffer.from(data));
+    }
   }
 
   private saveTerminalSnapshot(): void {
-    if (this.dbPath === ':memory:') return;
-    const data = this.db.export();
-    saveDatabaseSnapshotPair(this.dbPath, Buffer.from(data));
+    this.save();
   }
 
   close(): void {
