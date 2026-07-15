@@ -35,6 +35,7 @@ describe('isBridgeCommand', () => {
     expect(isBridgeCommand('/fast')).toBe(true);
     expect(isBridgeCommand('/perm allow req_123')).toBe(true);
     expect(isBridgeCommand('/sessions')).toBe(true);
+    expect(isBridgeCommand('/notify-me')).toBe(true);
   });
 
   it('does not recognize CLI passthrough commands', () => {
@@ -79,6 +80,10 @@ describe('parseBridgeCommand', () => {
   it('parses /perm with decision and request id', () => {
     const cmd = parseBridgeCommand('/perm allow req_123');
     expect(cmd).toEqual({ command: 'perm', args: ['allow', 'req_123'] });
+  });
+
+  it('parses /notify-me', () => {
+    expect(parseBridgeCommand('/notify-me')).toEqual({ command: 'notify-me', args: [] });
   });
 
   it('returns null for non-bridge commands', () => {

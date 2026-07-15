@@ -50,6 +50,7 @@ const BRIDGE_COMMANDS = new Set([
   'fast',
   'perm',
   'sessions',
+  'notify-me',
 ]);
 
 export interface BridgeCommand {

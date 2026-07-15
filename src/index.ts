@@ -70,12 +70,19 @@ import { join, relative, isAbsolute } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { mkdirSync } from 'node:fs';
 import { readFile, realpath, stat, lstat } from 'node:fs/promises';
+import { CodexNotificationService } from './notifications/service.js';
 
 const CONFIG_PATH = process.env.CLI2IM_CONFIG ?? join(homedir(), '.cli2im', 'config.yaml');
 const startedAt = Date.now();
 
 interface RuntimeCommandState {
   fastModeBySession: Map<SessionKey, boolean>;
+}
+
+export interface BridgeCommandSender {
+  platform: string;
+  chatType?: string;
+  userId: string;
 }
 
 async function main(): Promise<void> {
@@ -106,6 +113,7 @@ async function main(): Promise<void> {
   const runtimeState: RuntimeCommandState = {
     fastModeBySession: new Map(),
   };
+  let notificationService: CodexNotificationService | undefined;
   const agentManager = new AgentManager(toolGate, (signal, sessionKey) => {
     const botName = sessionKey.split(':')[2];
     bindSessionScopedBufferCleanup(signal, sessionKey, {
@@ -167,6 +175,22 @@ async function main(): Promise<void> {
       adapters.set(botName, adapter);
       telegramStreams.set(botName, new TelegramStreamController(adapter, config.streaming.intervalMs));
     }
+  }
+
+  const codexNotificationConfig = config.notifications?.codex;
+  if (codexNotificationConfig?.enabled === true) {
+    const notificationBot = config.bots[codexNotificationConfig.botName];
+    const codexDir = join(homedir(), '.codex');
+    notificationService = new CodexNotificationService({
+      botName: codexNotificationConfig.botName,
+      workingDirectory: notificationBot.workingDirectory,
+      sessionsDir: join(codexDir, 'sessions'),
+      sessionIndexPath: join(codexDir, 'session_index.jsonl'),
+      socketPath: join(homedir(), '.cli2im', 'codex-notify.sock'),
+      store,
+      resolveAdapter: (botName) => adapters.get(botName),
+      timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC',
+    });
   }
 
   const pipeline = new InboundPipeline(config);
@@ -347,6 +371,12 @@ async function main(): Promise<void> {
           voiceSessions,
           runtimeState,
           botConfig,
+          {
+            platform: msg.platform,
+            chatType: msg.chatType,
+            userId: msg.userId,
+          },
+          notificationService,
         );
         return;
       }
@@ -534,11 +564,14 @@ async function main(): Promise<void> {
     }
   }
 
+  await notificationService?.start();
+
   console.log('[cli2im] Ready');
 
   const shutdown = async () => {
     console.log('[cli2im] Shutting down...');
     await httpServer.stop();
+    await notificationService?.stop();
     for (const adapter of adapters.values()) {
       await adapter.disconnect();
     }
@@ -564,8 +597,33 @@ export async function handleBridgeCommand(
   voiceSessions: Map<SessionKey, string>,
   runtimeState: RuntimeCommandState,
   botConfig: BotConfig,
+  commandSender?: BridgeCommandSender,
+  notificationService?: CodexNotificationService,
 ): Promise<void> {
   switch (cmd.command) {
+    case 'notify-me': {
+      if (
+        !notificationService
+        || botName !== notificationService.botName
+        || commandSender?.platform !== 'feishu'
+        || commandSender.chatType !== 'p2p'
+        || !botConfig.allowFrom.map(String).includes(commandSender.userId)
+      ) {
+        await adapter.send(chatId, { text: '通知绑定失败：请使用获授权的 codexbot 飞书私聊。' });
+        break;
+      }
+      await notificationService.bindTarget({
+        botName,
+        platform: 'feishu',
+        chatId,
+        userId: commandSender.userId,
+      });
+      await adapter.send(chatId, {
+        text: 'Codex 通知已绑定到当前私聊。后续只发送项目、任务和状态。',
+      });
+      break;
+    }
+
     case 'new': {
       agentManager.killAgent(sessionKey);
       clearSessionScopedBuffers(sessionKey, { voiceSessions, tgStreamController });
