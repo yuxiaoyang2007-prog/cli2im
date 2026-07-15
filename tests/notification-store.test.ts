@@ -1,5 +1,5 @@
 import { createRequire } from 'node:module';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import initSqlJs from 'sql.js';
@@ -92,6 +92,54 @@ describe('notification persistence', () => {
       updatedAt: 20,
     });
     expect(await store.getNotificationCursor('/tmp/missing.jsonl')).toBeNull();
+    store.close();
+  });
+
+  it('migrates legacy cursors and persists an optional continuity hash', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'cli2im-notification-store-'));
+    temporaryDirectories.push(directory);
+    const dbPath = join(directory, 'sessions.db');
+    const SQL = await initSqlJs({
+      locateFile: (file: string) => join(sqlWasmDir, file),
+    });
+    const legacyDb = new SQL.Database();
+    legacyDb.run(`
+      CREATE TABLE notification_cursors (
+        file_path TEXT PRIMARY KEY,
+        file_id TEXT NOT NULL,
+        byte_offset INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      )
+    `);
+    legacyDb.run(
+      'INSERT INTO notification_cursors (file_path, file_id, byte_offset, updated_at) VALUES (?, ?, ?, ?)',
+      ['/tmp/rollout-legacy.jsonl', '1:2', 24, 10],
+    );
+    writeFileSync(dbPath, Buffer.from(legacyDb.export()));
+    legacyDb.close();
+
+    const store = await SessionStore.create(dbPath);
+    expect(await store.getNotificationCursor('/tmp/rollout-legacy.jsonl')).toEqual({
+      filePath: '/tmp/rollout-legacy.jsonl',
+      fileId: '1:2',
+      byteOffset: 24,
+      updatedAt: 10,
+    });
+
+    await store.upsertNotificationCursor({
+      filePath: '/tmp/rollout-legacy.jsonl',
+      fileId: '1:2',
+      byteOffset: 48,
+      continuityHash: '0123456789abcdef01234567',
+      updatedAt: 20,
+    });
+    expect(await store.getNotificationCursor('/tmp/rollout-legacy.jsonl')).toEqual({
+      filePath: '/tmp/rollout-legacy.jsonl',
+      fileId: '1:2',
+      byteOffset: 48,
+      continuityHash: '0123456789abcdef01234567',
+      updatedAt: 20,
+    });
     store.close();
   });
 

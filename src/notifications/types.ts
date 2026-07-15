@@ -37,6 +37,7 @@ export interface NotificationCursor {
   filePath: string;
   fileId: string;
   byteOffset: number;
+  continuityHash?: string;
   updatedAt: number;
 }
 

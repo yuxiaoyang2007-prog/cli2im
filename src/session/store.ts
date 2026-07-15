@@ -70,9 +70,11 @@ export class SessionStore {
         file_path TEXT PRIMARY KEY,
         file_id TEXT NOT NULL,
         byte_offset INTEGER NOT NULL,
+        continuity_hash TEXT,
         updated_at INTEGER NOT NULL
       )
     `);
+    const cursorSchemaMigrated = ensureNotificationCursorContinuityColumn(db);
 
     db.run(`
       CREATE TABLE IF NOT EXISTS notification_deliveries (
@@ -85,7 +87,9 @@ export class SessionStore {
       )
     `);
 
-    return new SessionStore(db, dbPath);
+    const store = new SessionStore(db, dbPath);
+    if (cursorSchemaMigrated) store.save();
+    return store;
   }
 
   async getOrCreate(key: SessionKey, defaults: {
@@ -241,7 +245,8 @@ export class SessionStore {
 
   async getNotificationCursor(filePath: string): Promise<NotificationCursor | null> {
     const stmt = this.db.prepare(
-      'SELECT file_path, file_id, byte_offset, updated_at FROM notification_cursors WHERE file_path = ?',
+      `SELECT file_path, file_id, byte_offset, continuity_hash, updated_at
+       FROM notification_cursors WHERE file_path = ?`,
     );
     stmt.bind([filePath]);
 
@@ -256,19 +261,30 @@ export class SessionStore {
       filePath: row.file_path as string,
       fileId: row.file_id as string,
       byteOffset: row.byte_offset as number,
+      ...(typeof row.continuity_hash === 'string'
+        ? { continuityHash: row.continuity_hash }
+        : {}),
       updatedAt: row.updated_at as number,
     };
   }
 
   async upsertNotificationCursor(cursor: NotificationCursor): Promise<void> {
     this.db.run(
-      `INSERT INTO notification_cursors (file_path, file_id, byte_offset, updated_at)
-       VALUES (?, ?, ?, ?)
+      `INSERT INTO notification_cursors
+         (file_path, file_id, byte_offset, continuity_hash, updated_at)
+       VALUES (?, ?, ?, ?, ?)
        ON CONFLICT(file_path) DO UPDATE SET
          file_id = excluded.file_id,
          byte_offset = excluded.byte_offset,
+         continuity_hash = excluded.continuity_hash,
          updated_at = excluded.updated_at`,
-      [cursor.filePath, cursor.fileId, cursor.byteOffset, cursor.updatedAt],
+      [
+        cursor.filePath,
+        cursor.fileId,
+        cursor.byteOffset,
+        cursor.continuityHash ?? null,
+        cursor.updatedAt,
+      ],
     );
     this.save();
   }
@@ -365,4 +381,19 @@ export class SessionStore {
       lastActiveAt: row.last_active_at as number,
     };
   }
+}
+
+function ensureNotificationCursorContinuityColumn(db: Database): boolean {
+  const stmt = db.prepare('PRAGMA table_info(notification_cursors)');
+  let found = false;
+  while (stmt.step()) {
+    if (stmt.getAsObject().name === 'continuity_hash') {
+      found = true;
+      break;
+    }
+  }
+  stmt.free();
+  if (found) return false;
+  db.run('ALTER TABLE notification_cursors ADD COLUMN continuity_hash TEXT');
+  return true;
 }

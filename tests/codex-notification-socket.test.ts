@@ -16,6 +16,14 @@ const approvalInput = {
   command: 'synthetic private command',
 };
 
+const approvalEvent: PermissionHookEvent = {
+  type: 'approval',
+  sessionId: 'session_synthetic',
+  turnId: 'turn_synthetic',
+  requestId: 'approval_synthetic',
+  occurredAt: 1234,
+};
+
 describe('CodexNotificationSocket', () => {
   const directories: string[] = [];
   const sockets: CodexNotificationSocket[] = [];
@@ -69,25 +77,102 @@ describe('CodexNotificationSocket', () => {
     await socket.start();
 
     await send(socketPath, Buffer.from('{malformed}\n'));
-    await send(socketPath, Buffer.from(`${JSON.stringify(approvalInput)}\n`));
+    await send(socketPath, Buffer.from(`${JSON.stringify(approvalEvent)}\n`));
 
     expect(onApproval).toHaveBeenCalledTimes(1);
-    expect(onApproval).toHaveBeenCalledWith({
-      type: 'approval',
-      sessionId: 'session_synthetic',
-      turnId: 'turn_synthetic',
-      requestId: 'approval_synthetic',
-      occurredAt: expect.any(Number),
-    });
+    expect(onApproval).toHaveBeenCalledWith(approvalEvent);
     expect(JSON.stringify(onApproval.mock.calls)).not.toContain('synthetic private command');
+  });
+
+  it('rejects raw hook objects and canonical objects with extra fields', async () => {
+    const { onApproval, socket, socketPath } = setup();
+    await socket.start();
+
+    await send(socketPath, Buffer.from(`${JSON.stringify(approvalInput)}\n`));
+    await send(socketPath, Buffer.from(`${JSON.stringify({
+      ...approvalEvent,
+      command: 'synthetic private command',
+    })}\n`));
+
+    expect(onApproval).not.toHaveBeenCalled();
+  });
+
+  it('dispatches one complete line before the client closes its write side', async () => {
+    const { onApproval, socket, socketPath } = setup();
+    await socket.start();
+    const client = createConnection(socketPath);
+    await new Promise<void>((resolve, reject) => {
+      client.once('connect', resolve);
+      client.once('error', reject);
+    });
+
+    let observed = false;
+    try {
+      client.write(`${JSON.stringify(approvalEvent)}\n`);
+      observed = await waitFor(() => onApproval.mock.calls.length === 1, 250);
+    } finally {
+      client.destroy();
+    }
+
+    expect(observed).toBe(true);
+    expect(onApproval).toHaveBeenCalledTimes(1);
+  });
+
+  it('rejects a second frame delivered with the first line', async () => {
+    const { onApproval, socket, socketPath } = setup();
+    await socket.start();
+
+    await send(socketPath, Buffer.from(
+      `${JSON.stringify(approvalEvent)}\n${JSON.stringify(approvalEvent)}\n`,
+    ));
+
+    expect(onApproval).not.toHaveBeenCalled();
+  });
+
+  it('destroys idle clients during stop so shutdown is bounded', async () => {
+    const { socket, socketPath } = setup();
+    await socket.start();
+    const client = createConnection(socketPath);
+    await new Promise<void>((resolve, reject) => {
+      client.once('connect', resolve);
+      client.once('error', reject);
+    });
+
+    const stopping = socket.stop();
+    const outcome = await Promise.race([
+      stopping.then(() => 'stopped' as const),
+      new Promise<'timeout'>((resolve) => setTimeout(() => resolve('timeout'), 150)),
+    ]);
+    client.destroy();
+    await stopping;
+
+    expect(outcome).toBe('stopped');
+  });
+
+  it('serializes concurrent starts onto one listening server', async () => {
+    const { socket, socketPath } = setup();
+
+    await expect(Promise.all([socket.start(), socket.start()])).resolves.toEqual([
+      undefined,
+      undefined,
+    ]);
+    expect((await stat(socketPath)).mode & 0o777).toBe(0o600);
+  });
+
+  it('honors stop requested while start is still in progress', async () => {
+    const { socket, socketPath } = setup();
+
+    await Promise.all([socket.start(), socket.stop()]);
+
+    expect(await canConnect(socketPath)).toBe(false);
   });
 });
 
 function sizedApprovalLine(byteLength: number): Buffer {
-  const base = { ...approvalInput, padding: '' };
+  const base: PermissionHookEvent = { ...approvalEvent, requestId: '' };
   const baseBytes = Buffer.byteLength(`${JSON.stringify(base)}\n`);
   if (baseBytes > byteLength) throw new Error('Test payload base is too large');
-  base.padding = 'x'.repeat(byteLength - baseBytes);
+  base.requestId = 'x'.repeat(byteLength - baseBytes);
   const line = Buffer.from(`${JSON.stringify(base)}\n`);
   if (line.length !== byteLength) throw new Error('Test payload has the wrong size');
   return line;
@@ -99,5 +184,31 @@ function send(socketPath: string, payload: Buffer): Promise<void> {
     client.once('error', reject);
     client.once('close', () => resolve());
     client.end(payload);
+  });
+}
+
+async function waitFor(predicate: () => boolean, timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (predicate()) return true;
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  return predicate();
+}
+
+function canConnect(socketPath: string): Promise<boolean> {
+  return new Promise((resolve) => {
+    const client = createConnection(socketPath);
+    const timer = setTimeout(() => finish(false), 100);
+    let settled = false;
+    const finish = (connected: boolean) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      client.destroy();
+      resolve(connected);
+    };
+    client.once('connect', () => finish(true));
+    client.once('error', () => finish(false));
   });
 }

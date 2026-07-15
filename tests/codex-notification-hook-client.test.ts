@@ -4,14 +4,18 @@ import { createServer, type Server } from 'node:net';
 import { Readable } from 'node:stream';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { runHookClient } from '../src/notifications/hook-client.js';
+import { CodexNotificationSocket } from '../src/notifications/socket-server.js';
+import type { PermissionHookEvent } from '../src/notifications/codex-events.js';
 
 describe('runHookClient', () => {
   const directories: string[] = [];
   const servers: Server[] = [];
+  const notificationSockets: CodexNotificationSocket[] = [];
 
   afterEach(async () => {
+    await Promise.all(notificationSockets.splice(0).map((socket) => socket.stop()));
     await Promise.all(servers.splice(0).map((server) => new Promise<void>((resolve) => {
       server.close(() => resolve());
     })));
@@ -73,4 +77,51 @@ describe('runHookClient', () => {
       turn_id: 'turn_synthetic',
     })]), missingSocketPath)).resolves.toBeUndefined();
   });
+
+  it('delivers one canonical sanitized approval end to end', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'cli2im-hook-client-'));
+    directories.push(directory);
+    const socketPath = join(directory, 'hook.sock');
+    const onApproval = vi.fn<(event: PermissionHookEvent) => void>();
+    const notificationSocket = new CodexNotificationSocket({ socketPath, onApproval });
+    notificationSockets.push(notificationSocket);
+    await notificationSocket.start();
+    const rawInput = {
+      hook_event_name: 'PermissionRequest',
+      session_id: 'session_synthetic',
+      turn_id: 'turn_synthetic',
+      approval_id: 'approval_synthetic',
+      tool_input: { command: 'print synthetic-secret' },
+      command: 'print synthetic-secret',
+      arguments: ['--token', 'synthetic-token'],
+    };
+
+    await runHookClient(Readable.from([JSON.stringify(rawInput)]), socketPath);
+    const observed = await waitFor(() => onApproval.mock.calls.length === 1, 250);
+
+    expect(observed).toBe(true);
+    expect(onApproval).toHaveBeenCalledTimes(1);
+    expect(onApproval).toHaveBeenCalledWith({
+      type: 'approval',
+      sessionId: 'session_synthetic',
+      turnId: 'turn_synthetic',
+      requestId: 'approval_synthetic',
+      occurredAt: expect.any(Number),
+    });
+    const received = JSON.stringify(onApproval.mock.calls);
+    expect(received).not.toContain('command');
+    expect(received).not.toContain('tool_input');
+    expect(received).not.toContain('arguments');
+    expect(received).not.toContain('synthetic-secret');
+    expect(received).not.toContain('synthetic-token');
+  });
 });
+
+async function waitFor(predicate: () => boolean, timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (predicate()) return true;
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  return predicate();
+}
