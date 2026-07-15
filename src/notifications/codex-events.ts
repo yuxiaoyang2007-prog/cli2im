@@ -2,6 +2,9 @@ import { createHash } from 'node:crypto';
 import { basename } from 'node:path';
 import { sanitizeMetadataBasename, sanitizeTaskTitle } from './metadata.js';
 
+const EARLIEST_PLAUSIBLE_EPOCH_MS = Date.UTC(2000, 0, 1);
+const LATEST_PLAUSIBLE_EPOCH_MS = Date.UTC(2100, 0, 1);
+
 export type ParsedRolloutLine =
   | { type: 'session_meta'; sessionId: string; cwd: string; source: string }
   | { type: 'turn_context'; turnId: string; cwd: string }
@@ -37,7 +40,7 @@ export function parseRolloutLine(line: string): ParsedRolloutLine | null {
     case 'response_item':
       return parseResponseItem(payload, parseIsoTimestamp(outer.timestamp));
     case 'event_msg':
-      return parseEventMessage(payload);
+      return parseEventMessage(payload, parseIsoTimestamp(outer.timestamp));
     default:
       return null;
   }
@@ -130,7 +133,10 @@ function parseResponseItem(
   };
 }
 
-function parseEventMessage(payload: Record<string, unknown>): ParsedRolloutLine | null {
+function parseEventMessage(
+  payload: Record<string, unknown>,
+  outerOccurredAt: number | undefined,
+): ParsedRolloutLine | null {
   const turnId = asString(payload.turn_id);
   if (!turnId) return null;
 
@@ -139,7 +145,7 @@ function parseEventMessage(payload: Record<string, unknown>): ParsedRolloutLine 
   }
 
   if (payload.type !== 'task_complete') return null;
-  const occurredAt = asFiniteNumber(payload.completed_at);
+  const occurredAt = outerOccurredAt ?? normalizeCompletionTimestamp(payload.completed_at);
   if (occurredAt === undefined) return null;
 
   const durationMs = asFiniteNumber(payload.duration_ms);
@@ -149,6 +155,20 @@ function parseEventMessage(payload: Record<string, unknown>): ParsedRolloutLine 
     occurredAt,
     ...(durationMs === undefined ? {} : { durationMs }),
   };
+}
+
+function normalizeCompletionTimestamp(value: unknown): number | undefined {
+  const timestamp = asFiniteNumber(value);
+  if (timestamp === undefined) return undefined;
+  if (
+    timestamp >= EARLIEST_PLAUSIBLE_EPOCH_MS
+    && timestamp < LATEST_PLAUSIBLE_EPOCH_MS
+  ) return timestamp;
+  const milliseconds = timestamp * 1000;
+  return (
+    milliseconds >= EARLIEST_PLAUSIBLE_EPOCH_MS
+    && milliseconds < LATEST_PLAUSIBLE_EPOCH_MS
+  ) ? milliseconds : undefined;
 }
 
 function passthroughTurnId(value: unknown): string | undefined {

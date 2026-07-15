@@ -364,9 +364,18 @@ export class CodexEventMonitor {
       const fileId = `${fileStat.dev}:${fileStat.ino}`;
       const cursor = await this.store.getNotificationCursor(filePath);
       const generation = this.generations.get(filePath);
-      const startupClassification = this.state === 'starting'
+      let startupClassification = this.state === 'starting'
         ? this.startupPaths.get(filePath)
         : undefined;
+      if (
+        !cursor
+        && !generation
+        && startupClassification === 'historical'
+        && fileStat.mtimeMs >= this.startupBoundary
+      ) {
+        startupClassification = 'catchup';
+        this.startupPaths.set(filePath, startupClassification);
+      }
       const isCatchup = !cursor
         && !generation
         && startupClassification === 'catchup';

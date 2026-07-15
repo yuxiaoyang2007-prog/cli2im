@@ -69,12 +69,14 @@ describe('CodexEventMonitor', () => {
     const { file, monitor, onEvent } = await setup();
     await monitor.start();
     const liveQuestion = makeQuestionLine('live-created-question');
+    const completionTimestamp = '2026-07-15T18:35:18.250Z';
     const liveCompletion = JSON.stringify({
+      timestamp: completionTimestamp,
       type: 'event_msg',
       payload: {
         type: 'task_complete',
         turn_id: 'turn_live_created',
-        completed_at: 2000,
+        completed_at: Date.parse('2026-07-15T18:35:18Z') / 1000,
       },
     });
 
@@ -84,6 +86,12 @@ describe('CodexEventMonitor', () => {
     expect(onEvent.mock.calls.map(([event]) => event.type)).toEqual(['question', 'completed']);
     expect(onEvent).toHaveBeenCalledWith(
       expect.objectContaining({ type: 'question', requestId: 'live-created-question' }),
+      file,
+    );
+    expect(onEvent).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: 'completed', occurredAt: Date.parse(completionTimestamp),
+      }),
       file,
     );
   });

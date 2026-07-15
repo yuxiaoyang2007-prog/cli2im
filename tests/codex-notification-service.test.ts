@@ -2,7 +2,12 @@ import { describe, expect, it, vi } from 'vitest';
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { eventKey, type ParsedRolloutLine, type PermissionHookEvent } from '../src/notifications/codex-events.js';
+import {
+  eventKey,
+  parseRolloutLine,
+  type ParsedRolloutLine,
+  type PermissionHookEvent,
+} from '../src/notifications/codex-events.js';
 import { CodexNotificationService } from '../src/notifications/service.js';
 import type { NotificationMetadataResolver } from '../src/notifications/metadata.js';
 import type { NotificationRouter } from '../src/notifications/router.js';
@@ -79,12 +84,22 @@ describe('CodexNotificationService', () => {
     await onRollout?.({ type: 'turn_context', turnId: 'turn_1', cwd: '/tmp/project' }, filePath);
     await onRollout?.({ type: 'user_message', turnId: 'turn_1', userText: '飞书通知上线' }, filePath);
     await onRollout?.({ type: 'question', turnId: 'turn_1', requestId: 'request_1' }, filePath);
-    await onRollout?.({
-      type: 'completed',
-      turnId: 'turn_1',
-      occurredAt: 3_000,
+    const completionTimestamp = '2026-07-15T18:35:18.250Z';
+    const completion = parseRolloutLine(JSON.stringify({
+      timestamp: completionTimestamp,
+      type: 'event_msg',
+      payload: {
+        type: 'task_complete',
+        turn_id: 'turn_1',
+        completed_at: Date.parse('2026-07-15T18:35:18Z') / 1000,
+        duration_ms: 1_000,
+      },
+    }));
+    expect(completion).toMatchObject({
+      occurredAt: Date.parse(completionTimestamp),
       durationMs: 1_000,
-    }, filePath);
+    });
+    await onRollout?.(completion as ParsedRolloutLine, filePath);
     await onApproval?.({
       type: 'approval',
       sessionId: 'session_12345678',
@@ -121,7 +136,7 @@ describe('CodexNotificationService', () => {
       projectName: 'cli2im',
       taskName: '飞书通知上线',
       surface: 'Codex Desktop',
-      occurredAt: 3_000,
+      occurredAt: Date.parse(completionTimestamp),
       durationMs: 1_000,
       shortTaskId: 'session_',
     });

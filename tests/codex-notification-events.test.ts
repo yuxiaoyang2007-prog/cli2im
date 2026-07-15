@@ -287,10 +287,55 @@ describe('Codex notification event parsing', () => {
     }
   });
 
-  it('parses task_complete and turn_aborted separately', () => {
+  it('prefers the outer ISO timestamp for a real-format task_complete', () => {
+    const timestamp = '2026-07-15T18:35:18.250Z';
     expect(parseRolloutLine(JSON.stringify({
-      type: 'event_msg', payload: { type: 'task_complete', turn_id: 'turn_1', completed_at: 1000, duration_ms: 2500 },
-    }))).toEqual({ type: 'completed', turnId: 'turn_1', occurredAt: 1000, durationMs: 2500 });
+      timestamp,
+      type: 'event_msg',
+      payload: {
+        type: 'task_complete',
+        turn_id: 'turn_1',
+        completed_at: Date.parse('2026-07-15T18:35:18Z') / 1000,
+        duration_ms: 2500,
+      },
+    }))).toEqual({
+      type: 'completed',
+      turnId: 'turn_1',
+      occurredAt: Date.parse(timestamp),
+      durationMs: 2500,
+    });
+  });
+
+  it('normalizes plausible task_complete fallback timestamps to milliseconds', () => {
+    const seconds = Date.parse('2026-07-15T18:35:18Z') / 1000;
+    const milliseconds = Date.parse('2026-07-15T18:35:18.250Z');
+
+    expect(parseRolloutLine(JSON.stringify({
+      timestamp: 'invalid-outer-time',
+      type: 'event_msg',
+      payload: { type: 'task_complete', turn_id: 'turn_seconds', completed_at: seconds },
+    }))).toEqual({
+      type: 'completed', turnId: 'turn_seconds', occurredAt: seconds * 1000,
+    });
+    expect(parseRolloutLine(JSON.stringify({
+      type: 'event_msg',
+      payload: { type: 'task_complete', turn_id: 'turn_milliseconds', completed_at: milliseconds },
+    }))).toEqual({
+      type: 'completed', turnId: 'turn_milliseconds', occurredAt: milliseconds,
+    });
+  });
+
+  it.each([-1, 1_000, 100_000_000_000_000])(
+    'rejects an implausible task_complete fallback timestamp: %s',
+    (completedAt) => {
+      expect(parseRolloutLine(JSON.stringify({
+        type: 'event_msg',
+        payload: { type: 'task_complete', turn_id: 'turn_invalid', completed_at: completedAt },
+      }))).toBeNull();
+    },
+  );
+
+  it('parses turn_aborted separately from completion', () => {
     expect(parseRolloutLine(JSON.stringify({
       type: 'event_msg', payload: { type: 'turn_aborted', turn_id: 'turn_1', reason: 'interrupted' },
     }))).toEqual({ type: 'aborted', turnId: 'turn_1' });
