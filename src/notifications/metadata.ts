@@ -15,13 +15,20 @@ const IMAGE_EXTENSION = /\.(?:avif|bmp|gif|heic|jpeg|jpg|png|tiff|webp)$/i;
 const CODE_LINE = /^(?:(?:async\s+)?function|const|let|var|class|interface|type|enum|namespace|import|export|def)\b|^(?:console\.log|print)\s*\(|^(?:[A-Za-z_$][\w$]*\.)+[A-Za-z_$][\w$]*\s*\([^)]*\)\s*;?$|^[A-Za-z_$][\w$]*(?:\.[\w$]+)*\s*=(?!=)\s*\S|^\{\s*"[^"]+"\s*:|^\[\s*(?:\{|\[|"|-?\d|true\b|false\b|null\b)|^<[/!]?[A-Za-z][^>]*>/;
 const DIFF_LINE = /^(?:diff --git\b|index [0-9a-f]+\.{2}[0-9a-f]+\b|---\s+\S+|\+\+\+\s+\S+|@@\s+-\d)/i;
 const LOG_LINE = /^(?:\[\d{4}-\d{2}-\d{2}[T ][^\]]*]\s*|\d{4}-\d{2}-\d{2}[T ]\S+\s+)(?:TRACE|DEBUG|INFO|WARN|WARNING|ERROR|FATAL)\b|^(?:TRACE|DEBUG|INFO|WARN|WARNING|ERROR|FATAL)\s+[\[:]/i;
-const NATURAL_LANGUAGE_START = /^(?:(?:please\s+)?(?:review|fix|analy[sz]e|check|explain|summari[sz]e|update|create|add|remove|investigate|find|open|rotate)\s+(?:the|a|an|this|that|these|those|my|our)\b|go\s+(?:review|check|analy[sz]e|find|fix)\b|make\s+(?:the|a|an|this|that|these|those|my|our)\b)/i;
-const COMMAND_LINE_START = /^(?:brew|bun|cargo|cat|cd|cmake|curl|deno|docker|echo|gh|git|go|kubectl|ls|make|node|npm|npx|pip3?|pnpm|pwd|python3?|rm|rsync|scp|ssh|wget|yarn)(?:\s|$)/i;
+const RAW_COMMAND_HEADS = new Set([
+  'awk', 'bash', 'brew', 'bun', 'cargo', 'cat', 'cd', 'cmake', 'curl', 'deno',
+  'deploy', 'docker', 'echo', 'find', 'gh', 'git', 'go', 'grep', 'kubectl', 'ls',
+  'make', 'node', 'npm', 'npx', 'pip', 'pip3', 'pnpm', 'pwd', 'python', 'python3',
+  'rg', 'rm', 'rsync', 'scp', 'sed', 'sh', 'ssh', 'wget', 'yarn', 'zsh',
+]);
+const COMMAND_SHAPED_ARGUMENT = /(?:^|\s)(?:--?[A-Za-z0-9][A-Za-z0-9_-]*(?:=\S*)?|(?:\.{1,2}|~)?[\\/]\S+)/;
+const RELATIVE_EXECUTABLE = /^(?:\.{1,2}|~)[\\/]\S+/;
 const SHELL_SYNTAX = /&&|\|\||(?:^|\s)\|(?!\|)|(?:^|\s)(?:>>?|<<?)|;(?=\s|$)/;
 const SQL_LINE = /^(?:SELECT|INSERT|UPDATE|DELETE|CREATE|ALTER|DROP|WITH)\b.*(?:\bFROM\b|\bINTO\b|\bTABLE\b|\bSET\b|\*)/;
 const CONTROL_FLOW_LINE = /^(?:if|for|while|switch|try|catch)\s*\(/;
 const ERROR_OR_STACK_LINE = /^(?:(?:[A-Za-z_$][\w$.]*)?(?:Error|Exception)):\s+\S|^at\s+\S+(?:\s+\(|:\d)/i;
 const PYTHON_STACK_FRAME = /^\s*File\s+(?:"[^"]+"|\S+),\s+line\s+\d+/i;
+const TRACEBACK_HEADER = /^Traceback \(most recent call last\):$/i;
 const SIMPLE_CALL_LINE = /^[A-Za-z_$][\w$]*\s*\([^)]*\)\s*;?$/;
 
 const WRAPPER_BLOCKS = [
@@ -79,6 +86,7 @@ export function sanitizeTaskTitle(value: string): string {
     .split(/\r?\n/)
     .map((line) => line.trim())
     .find(Boolean) ?? '';
+  if (isHighConfidenceRawCommand(firstMeaningfulLine)) return '';
   const pathSafe = sanitizeAbsolutePaths(firstMeaningfulLine);
   if (pathSafe === null) return '';
   const normalized = pathSafe.replace(/[ \t]+/g, ' ').trim();
@@ -226,17 +234,19 @@ function isUnsafeTechnicalTitle(value: string): boolean {
     || CONTROL_FLOW_LINE.test(value)
     || ERROR_OR_STACK_LINE.test(value)
     || PYTHON_STACK_FRAME.test(value)
+    || TRACEBACK_HEADER.test(value)
     || SIMPLE_CALL_LINE.test(value)) {
     return true;
   }
 
-  if (NATURAL_LANGUAGE_START.test(value)) return false;
-  return COMMAND_LINE_START.test(value) || hasUnclassifiedLowercaseStart(value);
+  return false;
 }
 
-function hasUnclassifiedLowercaseStart(value: string): boolean {
-  const firstToken = /^(\S+)\s+\S/.exec(value)?.[1];
-  return firstToken !== undefined && /^[a-z][a-z0-9._-]*$/.test(firstToken);
+function isHighConfidenceRawCommand(value: string): boolean {
+  if (RELATIVE_EXECUTABLE.test(value)) return true;
+  const head = /^(\S+)/.exec(value)?.[1];
+  if (!head || !/^[a-z][a-z0-9._-]*$/.test(head)) return false;
+  return RAW_COMMAND_HEADS.has(head) || COMMAND_SHAPED_ARGUMENT.test(value);
 }
 
 function redactNamedSecrets(value: string): string {
@@ -293,7 +303,7 @@ function sanitizeUris(value: string): string | null {
       result += full.replace(/[?#].*$/, '');
     } else {
       const { core, suffix } = splitTrailingPunctuation(match[3].split(/[?#]/, 1)[0]);
-      if (hasAmbiguousPathContinuation(value.slice(pattern.lastIndex), core)) return null;
+      if (hasAmbiguousPathContinuation(value.slice(pattern.lastIndex))) return null;
       const safeName = basename(core.replaceAll('\\', '/'));
       result += `${safeName || '[REDACTED]'}${suffix}`;
     }
@@ -316,7 +326,7 @@ function sanitizeAbsolutePaths(value: string): string | null {
 
   while ((match = pattern.exec(quoted)) !== null) {
     const { core, suffix } = splitTrailingPunctuation(match[2]);
-    if (hasAmbiguousPathContinuation(quoted.slice(pattern.lastIndex), core)) return null;
+    if (hasAmbiguousPathContinuation(quoted.slice(pattern.lastIndex))) return null;
     result += quoted.slice(cursor, match.index);
     result += `${match[1]}${basename(core.replaceAll('\\', '/'))}${suffix}`;
     cursor = pattern.lastIndex;
@@ -325,19 +335,8 @@ function sanitizeAbsolutePaths(value: string): string | null {
   return result + quoted.slice(cursor);
 }
 
-function hasAmbiguousPathContinuation(remainder: string, path: string): boolean {
-  const nextToken = /^\s+(\S+)/.exec(remainder)?.[1];
-  if (!nextToken) return false;
-  if (hasClearFilename(path)) return false;
-  if (/^[^\x00-\x7F]/.test(nextToken)) return false;
-  if (/^(?:token|password|passwd|secret|cookie|api[_-]?key)\s*[:=]/i.test(nextToken)) return false;
-  if (/^[,.;:!?)\]}]/.test(nextToken)) return false;
-  return true;
-}
-
-function hasClearFilename(path: string): boolean {
-  const name = basename(path.replaceAll('\\', '/'));
-  return /^[^./\s][^/\s]*\.[A-Za-z0-9]{1,16}$/.test(name);
+function hasAmbiguousPathContinuation(remainder: string): boolean {
+  return /^\s/.test(remainder) && /[\\/]/.test(remainder);
 }
 
 function splitTrailingPunctuation(value: string): { core: string; suffix: string } {

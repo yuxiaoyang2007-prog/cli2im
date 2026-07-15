@@ -12,7 +12,7 @@ describe('sanitizeTaskTitle', () => {
   it('removes secrets URLs home paths and instruction wrappers from a task title', () => {
     const title = sanitizeTaskTitle(`
 <environment_context>ignored</environment_context>
-请部署 /Users/test/private/repo token=sk-live-secret https://example.test/a?token=abc
+请部署 "/Users/test/private/repo" token=sk-live-secret https://example.test/a?token=abc
 `);
     expect(title).toBe('请部署 repo token=[REDACTED] https://example.test/a');
     expect(title).not.toContain('/Users/test');
@@ -42,7 +42,7 @@ const syntheticSecret = true;
 
   it('keeps only basenames from absolute POSIX paths', () => {
     const title = sanitizeTaskTitle(
-      '请检查 /tmp/private/run.log 和 /var/log/service/app.log 后继续',
+      '请检查 "/tmp/private/run.log" 和 "/var/log/service/app.log" 后继续',
     );
 
     expect(title).toBe('请检查 run.log 和 app.log 后继续');
@@ -69,6 +69,8 @@ const syntheticSecret = true;
   it.each([
     'Analyze /tmp/private folder/report.csv and summarize',
     'Analyze /tmp/private with spaces/report.csv',
+    'Analyze /tmp/private.v1 with spaces/report.csv',
+    'Analyze /tmp/report.csv folder/private.csv',
   ])('rejects an ambiguous unquoted absolute path containing spaces', (value) => {
     expect(sanitizeTaskTitle(value)).toBe('');
   });
@@ -123,12 +125,24 @@ const syntheticSecret = true;
     ['lowercase error line', 'error: failed'],
     ['stack line', 'at deploy (/tmp/private/app.js:10:2)'],
     ['Python stack frame', '  File "/tmp/private/app.py", line 12, in deploy'],
+    ['Traceback header', 'Traceback (most recent call last):'],
+    ['lowercase Traceback header', 'traceback (most recent call last):'],
     ['single-word command', 'ls'],
     ['simple call', 'deploy()'],
     ['ambiguous lowercase command', 'deploy production'],
+    ['flag-shaped command', 'runner --verbose'],
+    ['relative-path-shaped command', 'runner ./script'],
     ['shell redirection', 'deploy > /tmp/private/output.log'],
     ['shell operator expression', 'build && deploy'],
   ])('rejects a task title that is principally a %s', (_kind, value) => {
+    expect(sanitizeTaskTitle(value)).toBe('');
+  });
+
+  it.each([
+    './deploy --force',
+    '../deploy --force',
+    '~/deploy --force',
+  ])('rejects a relative executable invocation beginning with %s', (value) => {
     expect(sanitizeTaskTitle(value)).toBe('');
   });
 
@@ -140,10 +154,17 @@ const syntheticSecret = true;
     expect(sanitizeTaskTitle('Go review the deployment flow')).toBe('Go review the deployment flow');
     expect(sanitizeTaskTitle('Make the release safer')).toBe('Make the release safer');
     expect(sanitizeTaskTitle('Find the notification bug')).toBe('Find the notification bug');
-    expect(sanitizeTaskTitle('please review the notification report')).toBe(
-      'please review the notification report',
-    );
-    expect(sanitizeTaskTitle('fix the notification bug')).toBe('fix the notification bug');
+  });
+
+  it.each([
+    'please review the notification report',
+    'fix the notification bug',
+    'explain why the notification failed',
+    'summarize recent notification changes',
+    'implement notification handling',
+    'read the report',
+  ])('accepts ordinary lowercase prose: %s', (value) => {
+    expect(sanitizeTaskTitle(value)).toBe(value);
   });
 
   it('truncates CJK-heavy and Latin-heavy titles by Unicode code points', () => {
