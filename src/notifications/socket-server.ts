@@ -21,6 +21,7 @@ export class CodexNotificationSocket {
   private readonly socketPath: string;
   private readonly onApproval: CodexNotificationSocketOptions['onApproval'];
   private readonly activeSockets = new Set<Socket>();
+  private readonly pendingCallbacks = new Set<Promise<void>>();
   private server: Server | null = null;
   private state: SocketServerState = 'stopped';
   private startPromise: Promise<void> | null = null;
@@ -101,6 +102,7 @@ export class CodexNotificationSocket {
       if (ownsSocketPath) await unlinkIfPresent(this.socketPath);
       if (this.server === server) this.server = null;
       this.ownsSocketPath = false;
+      await this.drainCallbacks();
       this.state = 'stopped';
       throw error;
     }
@@ -118,11 +120,15 @@ export class CodexNotificationSocket {
 
     const server = this.server;
     this.server = null;
-    this.destroyActiveSockets();
-    if (server) await closeServerIfListening(server);
-    if (this.ownsSocketPath) await unlinkIfPresent(this.socketPath);
-    this.ownsSocketPath = false;
-    this.state = 'stopped';
+    try {
+      this.destroyActiveSockets();
+      if (server) await closeServerIfListening(server);
+      if (this.ownsSocketPath) await unlinkIfPresent(this.socketPath);
+    } finally {
+      this.ownsSocketPath = false;
+      await this.drainCallbacks();
+      this.state = 'stopped';
+    }
   }
 
   private handleConnection(socket: Socket): void {
@@ -148,8 +154,14 @@ export class CodexNotificationSocket {
 
       handled = true;
       socket.destroy();
-      void this.handlePayload(payload.subarray(0, newline));
+      this.dispatchPayload(payload.subarray(0, newline));
     });
+  }
+
+  private dispatchPayload(payload: Buffer): void {
+    const operation = this.handlePayload(payload);
+    this.pendingCallbacks.add(operation);
+    void operation.finally(() => this.pendingCallbacks.delete(operation));
   }
 
   private async handlePayload(payload: Buffer): Promise<void> {
@@ -174,6 +186,12 @@ export class CodexNotificationSocket {
   private destroyActiveSockets(): void {
     for (const socket of this.activeSockets) socket.destroy();
     this.activeSockets.clear();
+  }
+
+  private async drainCallbacks(): Promise<void> {
+    while (this.pendingCallbacks.size > 0) {
+      await Promise.allSettled([...this.pendingCallbacks]);
+    }
   }
 }
 

@@ -1,4 +1,5 @@
-import { dirname } from 'node:path';
+import { readdir } from 'node:fs/promises';
+import { dirname, join } from 'node:path';
 import type { SessionStore } from '../session/store.js';
 import { readHeadTailWindow } from '../session/file-window.js';
 import type { PlatformAdapter } from '../types.js';
@@ -50,6 +51,7 @@ export interface CodexNotificationServiceDependencies {
   createMonitor?: (handler: RolloutHandler) => NotificationLifecycle;
   createSocket?: (handler: ApprovalHandler) => NotificationLifecycle;
   readContextFile?: (filePath: string) => Promise<string>;
+  findContextFile?: (sessionsDir: string, sessionId: string) => Promise<string | undefined>;
 }
 
 export interface CodexNotificationServiceOptions {
@@ -82,6 +84,7 @@ export class CodexNotificationService {
   readonly botName: string;
 
   private readonly workingDirectory: string;
+  private readonly sessionsDir: string;
   private readonly store: SessionStore;
   private readonly now: () => number;
   private readonly router: NotificationEventRouter;
@@ -89,6 +92,10 @@ export class CodexNotificationService {
   private readonly monitor: NotificationLifecycle;
   private readonly socket: NotificationLifecycle;
   private readonly readContextFile: (filePath: string) => Promise<string>;
+  private readonly findContextFile: (
+    sessionsDir: string,
+    sessionId: string,
+  ) => Promise<string | undefined>;
   private readonly contextsByFile = new Map<string, RolloutContext>();
   private readonly contextsBySession = new Map<string, RolloutContext>();
   private readonly hydratedFiles = new Set<string>();
@@ -96,9 +103,11 @@ export class CodexNotificationService {
   constructor(options: CodexNotificationServiceOptions) {
     this.botName = options.botName;
     this.workingDirectory = options.workingDirectory;
+    this.sessionsDir = options.sessionsDir;
     this.store = options.store;
     this.now = options.now ?? Date.now;
     this.readContextFile = options.dependencies?.readContextFile ?? readHeadTailWindow;
+    this.findContextFile = options.dependencies?.findContextFile ?? findSessionRollout;
 
     const adapter = options.resolveAdapter(options.botName);
     const adapters = new Map<string, PlatformAdapter>();
@@ -178,18 +187,19 @@ export class CodexNotificationService {
         occurredAt: event.occurredAt,
         durationMs: event.durationMs,
       });
+      this.releaseContext(filePath, context);
     } else if (event.type === 'aborted') {
-      context.turns.delete(event.turnId);
+      this.releaseContext(filePath, context);
     }
   }
 
   private async hydrateContext(filePath: string, context: RolloutContext): Promise<void> {
-    this.hydratedFiles.add(filePath);
     const content = await this.readContextFile(filePath);
     for (const line of content.split(/\r?\n/)) {
       const parsed = parseRolloutLine(line);
       if (parsed) this.applyContextEvent(context, parsed);
     }
+    if (context.sessionId) this.hydratedFiles.add(filePath);
   }
 
   private applyContextEvent(context: RolloutContext, event: ParsedRolloutLine): void {
@@ -245,7 +255,7 @@ export class CodexNotificationService {
   }
 
   private async handleApprovalEvent(event: PermissionHookEvent): Promise<void> {
-    const context = this.contextsBySession.get(event.sessionId) ?? { turns: new Map() };
+    const context = await this.contextForApproval(event.sessionId);
     const metadata = await this.resolveMetadata(context, event.sessionId, event.turnId);
     await this.router.handle({
       eventKey: eventKey([
@@ -264,6 +274,36 @@ export class CodexNotificationService {
     });
   }
 
+  private async contextForApproval(sessionId: string): Promise<RolloutContext> {
+    const existing = this.contextsBySession.get(sessionId);
+    if (existing) return existing;
+
+    const filePath = await this.findContextFile(this.sessionsDir, sessionId);
+    if (!filePath) return { turns: new Map() };
+
+    let context = this.contextsByFile.get(filePath);
+    if (!context) {
+      context = { turns: new Map() };
+      this.contextsByFile.set(filePath, context);
+    }
+    await this.hydrateContext(filePath, context);
+    return context.sessionId === sessionId ? context : { turns: new Map() };
+  }
+
+  private releaseContext(filePath: string, context: RolloutContext): void {
+    context.turns.clear();
+    if (this.contextsByFile.get(filePath) === context) {
+      this.contextsByFile.delete(filePath);
+      this.hydratedFiles.delete(filePath);
+    }
+    if (
+      context.sessionId
+      && this.contextsBySession.get(context.sessionId) === context
+    ) {
+      this.contextsBySession.delete(context.sessionId);
+    }
+  }
+
   private resolveMetadata(
     context: RolloutContext,
     sessionId: string,
@@ -278,6 +318,43 @@ export class CodexNotificationService {
       attachmentName: turn?.attachmentName,
     });
   }
+}
+
+const MAX_CONTEXT_SEARCH_ENTRIES = 20_000;
+
+async function findSessionRollout(
+  sessionsDir: string,
+  sessionId: string,
+): Promise<string | undefined> {
+  const expectedSuffix = `-${sessionId}.jsonl`;
+  const pendingDirectories = [sessionsDir];
+  let entriesSeen = 0;
+
+  while (pendingDirectories.length > 0 && entriesSeen < MAX_CONTEXT_SEARCH_ENTRIES) {
+    const directory = pendingDirectories.pop();
+    if (!directory) break;
+
+    let entries;
+    try {
+      entries = await readdir(directory, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    entries.sort((left, right) => left.name.localeCompare(right.name));
+
+    for (const entry of entries) {
+      entriesSeen += 1;
+      if (entriesSeen > MAX_CONTEXT_SEARCH_ENTRIES) return undefined;
+      const path = join(directory, entry.name);
+      if (entry.isFile()
+        && entry.name.startsWith('rollout-')
+        && entry.name.endsWith(expectedSuffix)) {
+        return path;
+      }
+      if (entry.isDirectory()) pendingDirectories.push(path);
+    }
+  }
+  return undefined;
 }
 
 async function runLifecycleStep(

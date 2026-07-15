@@ -1,4 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { eventKey, type ParsedRolloutLine, type PermissionHookEvent } from '../src/notifications/codex-events.js';
 import { CodexNotificationService } from '../src/notifications/service.js';
 import type { NotificationMetadataResolver } from '../src/notifications/metadata.js';
@@ -305,5 +308,177 @@ describe('CodexNotificationService', () => {
     expect(consoleError).toHaveBeenNthCalledWith(2, '[notifications] monitor stop failed');
     expect(JSON.stringify(consoleError.mock.calls)).not.toContain('private');
     consoleError.mockRestore();
+  });
+
+  it('hydrates persisted rollout context when approval is the first event after restart', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'cli2im-approval-context-'));
+    try {
+      const codexDir = join(directory, 'codex');
+      const sessionsDir = join(codexDir, 'sessions', '2026', '07', '15');
+      const projectDir = join(directory, 'different-project');
+      const fallbackDir = join(directory, 'fallback-project');
+      const sessionId = 'session_approval_first';
+      const turnId = 'turn_approval_first';
+      await Promise.all([
+        mkdir(sessionsDir, { recursive: true }),
+        mkdir(projectDir, { recursive: true }),
+        mkdir(fallbackDir, { recursive: true }),
+      ]);
+      await writeFile(join(
+        sessionsDir,
+        `rollout-2026-07-15T12-00-00-${sessionId}.jsonl`,
+      ), [
+        JSON.stringify({
+          type: 'session_meta',
+          payload: { id: sessionId, cwd: projectDir, source: 'cli' },
+        }),
+        JSON.stringify({
+          type: 'turn_context',
+          payload: { turn_id: turnId, cwd: projectDir },
+        }),
+        JSON.stringify({
+          type: 'event_msg',
+          payload: { type: 'task_complete', turn_id: 'historical_turn', completed_at: 1_000 },
+        }),
+      ].join('\n') + '\n');
+      await writeFile(join(codexDir, 'session_index.jsonl'), `${JSON.stringify({
+        id: sessionId,
+        thread_name: '审批首次事件',
+      })}\n`);
+
+      let onApproval: ((event: PermissionHookEvent) => void | Promise<void>) | undefined;
+      const router = {
+        resumePending: vi.fn().mockResolvedValue(undefined),
+        handle: vi.fn().mockResolvedValue('delivered'),
+        stop: vi.fn(),
+      } as unknown as NotificationRouter;
+      const service = new CodexNotificationService({
+        botName: 'codexbot',
+        workingDirectory: fallbackDir,
+        sessionsDir: join(codexDir, 'sessions'),
+        sessionIndexPath: join(codexDir, 'session_index.jsonl'),
+        socketPath: join(directory, 'notify.sock'),
+        store: { bindNotificationTarget: vi.fn() } as unknown as SessionStore,
+        resolveAdapter: () => undefined,
+        timeZone: 'UTC',
+        dependencies: {
+          router,
+          createMonitor: () => ({ start: vi.fn(), stop: vi.fn() }),
+          createSocket: (handler) => {
+            onApproval = handler;
+            return { start: vi.fn(), stop: vi.fn() };
+          },
+        },
+      });
+
+      await service.start();
+      await onApproval?.({
+        type: 'approval',
+        sessionId,
+        turnId,
+        requestId: 'approval_first',
+        occurredAt: 2_000,
+      });
+
+      expect(router.handle).toHaveBeenCalledTimes(1);
+      expect(router.handle).toHaveBeenCalledWith(expect.objectContaining({
+        eventKey: eventKey([sessionId, turnId, 'approval_first', 'approval']),
+        kind: 'needs_attention',
+        reason: 'approval',
+        projectName: 'different-project',
+        taskName: '审批首次事件',
+        surface: 'CLI',
+      }));
+      expect(JSON.stringify(vi.mocked(router.handle).mock.calls)).not.toContain(projectDir);
+      expect(JSON.stringify(vi.mocked(router.handle).mock.calls)).not.toContain('historical_turn');
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it('releases completed context and rehydrates a later active turn without replay', async () => {
+    let onRollout: ((event: ParsedRolloutLine, filePath: string) => void | Promise<void>) | undefined;
+    const router = {
+      resumePending: vi.fn().mockResolvedValue(undefined),
+      handle: vi.fn().mockResolvedValue('delivered'),
+      stop: vi.fn(),
+    } as unknown as NotificationRouter;
+    const metadataResolver = {
+      resolve: vi.fn(async (input) => ({
+        projectName: 'project',
+        taskName: input.userText || 'unnamed',
+        surface: 'CLI' as const,
+        shortTaskId: 'session_',
+      })),
+    } as unknown as NotificationMetadataResolver;
+    const readContextFile = vi.fn().mockResolvedValue([
+      JSON.stringify({
+        type: 'session_meta',
+        payload: { id: 'session_release', cwd: '/tmp/project', source: 'cli' },
+      }),
+      JSON.stringify({
+        type: 'turn_context',
+        payload: { turn_id: 'turn_2', cwd: '/tmp/project' },
+      }),
+      JSON.stringify({
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'user',
+          content: [{ type: 'input_text', text: '第二轮任务' }],
+          internal_chat_message_metadata_passthrough: { turn_id: 'turn_2' },
+        },
+      }),
+      JSON.stringify({
+        type: 'event_msg',
+        payload: { type: 'task_complete', turn_id: 'turn_1', completed_at: 1_000 },
+      }),
+    ].join('\n'));
+    const filePath = '/tmp/codex/sessions/rollout-release.jsonl';
+    const service = new CodexNotificationService({
+      botName: 'codexbot',
+      workingDirectory: '/tmp/fallback',
+      sessionsDir: '/tmp/codex/sessions',
+      sessionIndexPath: '/tmp/codex/session_index.jsonl',
+      socketPath: '/tmp/cli2im/codex-notify.sock',
+      store: { bindNotificationTarget: vi.fn() } as unknown as SessionStore,
+      resolveAdapter: () => undefined,
+      timeZone: 'UTC',
+      dependencies: {
+        router,
+        metadataResolver,
+        createMonitor: (handler) => {
+          onRollout = handler;
+          return { start: vi.fn(), stop: vi.fn() };
+        },
+        createSocket: () => ({ start: vi.fn(), stop: vi.fn() }),
+        readContextFile,
+      },
+    });
+
+    await onRollout?.({
+      type: 'session_meta',
+      sessionId: 'session_release',
+      cwd: '/tmp/project',
+      source: 'cli',
+    }, filePath);
+    await onRollout?.({ type: 'turn_context', turnId: 'turn_1', cwd: '/tmp/project' }, filePath);
+    await onRollout?.({ type: 'user_message', turnId: 'turn_1', userText: '第一轮任务' }, filePath);
+    await onRollout?.({ type: 'completed', turnId: 'turn_1', occurredAt: 1_000 }, filePath);
+    await onRollout?.({ type: 'question', turnId: 'turn_2', requestId: 'question_2' }, filePath);
+
+    expect(readContextFile).toHaveBeenCalledTimes(1);
+    expect(metadataResolver.resolve).toHaveBeenLastCalledWith({
+      sessionId: 'session_release',
+      cwd: '/tmp/project',
+      source: 'cli',
+      userText: '第二轮任务',
+      attachmentName: undefined,
+    });
+    expect(router.handle).toHaveBeenCalledTimes(2);
+    expect(router.handle).toHaveBeenLastCalledWith(expect.objectContaining({
+      eventKey: eventKey(['session_release', 'turn_2', 'question_2', 'question']),
+      taskName: '第二轮任务',
+    }));
   });
 });

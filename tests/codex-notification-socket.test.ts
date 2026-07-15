@@ -177,6 +177,36 @@ describe('CodexNotificationSocket', () => {
     expect(outcome).toBe('stopped');
   });
 
+  it('waits for an accepted approval callback before stop resolves', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'cli2im-notify-socket-'));
+    directories.push(directory);
+    const socketPath = join(directory, 'notify.sock');
+    let releaseApproval: (() => void) | undefined;
+    let markStarted: (() => void) | undefined;
+    const started = new Promise<void>((resolve) => { markStarted = resolve; });
+    const release = new Promise<void>((resolve) => { releaseApproval = resolve; });
+    const onApproval = vi.fn(async () => {
+      markStarted?.();
+      await release;
+    });
+    const socket = new CodexNotificationSocket({ socketPath, onApproval });
+    sockets.push(socket);
+    await socket.start();
+
+    await send(socketPath, Buffer.from(`${JSON.stringify(approvalEvent)}\n`));
+    await started;
+    const stopping = socket.stop();
+    const outcome = await Promise.race([
+      stopping.then(() => 'stopped' as const),
+      new Promise<'waiting'>((resolve) => setTimeout(() => resolve('waiting'), 100)),
+    ]);
+
+    expect(outcome).toBe('waiting');
+    releaseApproval?.();
+    await stopping;
+    expect(onApproval).toHaveBeenCalledTimes(1);
+  });
+
   it('serializes concurrent starts onto one listening server', async () => {
     const { socket, socketPath } = setup();
 
