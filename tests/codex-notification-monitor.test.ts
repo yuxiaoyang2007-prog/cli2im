@@ -120,10 +120,11 @@ describe('CodexEventMonitor', () => {
     const starting = monitor.start();
     await entered;
     await writeFile(liveFile, `${liveQuestion}\n`);
-    await waitFor(() => (
-      monitor as unknown as { liveWatcherPaths: Set<string> }
-    ).liveWatcherPaths.has(liveFile));
-    releaseResolve();
+    try {
+      await waitForStartupWatcher(monitor, liveFile);
+    } finally {
+      releaseResolve();
+    }
     await starting;
     await waitFor(() => onEvent.mock.calls.length === 1);
 
@@ -137,16 +138,20 @@ describe('CodexEventMonitor', () => {
   });
 
   it('suppresses slow non-atomic replacement history and resumes a later append', async () => {
-    const { file, monitor, onEvent } = await setup();
+    const { file, monitor, onEvent, store } = await setup();
     await writeFile(file, `${historicalCompletion}\n`);
     await monitor.start();
     const replacementHistory = makeQuestionLine('slow-replacement-history');
     const futureAppend = makeQuestionLine('after-slow-replacement');
 
     await writeFile(file, '');
-    await new Promise((resolve) => setTimeout(resolve, 60));
+    await waitFor(() => generationPhase(monitor, file) === 'replacing', 5_000);
     await appendFile(file, `${replacementHistory}\n`);
-    await new Promise((resolve) => setTimeout(resolve, 350));
+    const replacementSize = (await stat(file)).size;
+    await waitFor(async () => (
+      (await store.getNotificationCursor(file))?.byteOffset === replacementSize
+    ), 5_000);
+    await waitFor(() => generationPhase(monitor, file) === 'active', 5_000);
 
     expect(onEvent).not.toHaveBeenCalled();
 
@@ -581,6 +586,7 @@ describe('CodexEventMonitor', () => {
       join(nestedDir, `rollout-batch-${index}.jsonl`)
     ));
     await Promise.all(files.map((file) => writeFile(file, `${historicalCompletion}\n`)));
+    await new Promise((resolve) => setTimeout(resolve, 50));
     let activeLookups = 0;
     let maxActiveLookups = 0;
     const save = vi.spyOn(store, 'save');
@@ -696,10 +702,34 @@ function makeQuestionLine(requestId: string, question = 'synthetic question'): s
   });
 }
 
-async function waitFor(condition: () => boolean, timeoutMs = 1500): Promise<void> {
+async function waitFor(
+  condition: () => boolean | Promise<boolean>,
+  timeoutMs = 1500,
+): Promise<void> {
   const deadline = Date.now() + timeoutMs;
-  while (!condition()) {
+  while (!(await condition())) {
     if (Date.now() >= deadline) throw new Error('Timed out waiting for monitor event');
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
+}
+
+function generationPhase(
+  monitor: CodexEventMonitor,
+  file: string,
+): 'active' | 'replacing' | undefined {
+  return (monitor as unknown as {
+    generations: Map<string, { phase: 'active' | 'replacing' }>;
+  }).generations.get(file)?.phase;
+}
+
+async function waitForStartupWatcher(
+  monitor: CodexEventMonitor,
+  file: string,
+): Promise<void> {
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    if ((monitor as unknown as { rediscoverRequested: boolean }).rediscoverRequested) return;
+    await appendFile(file, `${JSON.stringify({ startupWatcherProbe: attempt })}\n`);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error('Timed out waiting for startup watcher event');
 }

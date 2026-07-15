@@ -13,6 +13,7 @@ interface NotificationCursorStore {
 
 type MonitorState = 'stopped' | 'starting' | 'started' | 'stopping';
 type ProcessingOrigin = 'direct' | 'discovery' | 'watcher' | 'settle';
+type StartupPathClassification = 'pre-listing-event' | 'historical' | 'catchup' | 'live';
 
 interface TrackedGeneration {
   fileId: string;
@@ -24,6 +25,7 @@ interface TrackedGeneration {
 interface DiscoveredFileInspection {
   baseline?: NotificationCursor;
   hasUnreadBytes: boolean;
+  catchupBoundary?: number;
 }
 
 const CONTINUITY_WINDOW_BYTES = 64;
@@ -47,8 +49,7 @@ export class CodexEventMonitor {
   private readonly watcherTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private readonly replacementTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private readonly generations = new Map<string, TrackedGeneration>();
-  private readonly liveWatcherPaths = new Set<string>();
-  private readonly startupHistoricalPaths = new Set<string>();
+  private readonly startupPaths = new Map<string, StartupPathClassification>();
   private watcher: FSWatcher | null = null;
   private state: MonitorState = 'stopped';
   private startPromise: Promise<void> | null = null;
@@ -56,7 +57,8 @@ export class CodexEventMonitor {
   private stopRequested = false;
   private rediscoverRequested = false;
   private discoveryPromise: Promise<void> | null = null;
-  private startupListingCaptured = false;
+  private startupSnapshotCaptured = false;
+  private startupBoundary = 0;
 
   constructor(options: CodexEventMonitorOptions) {
     this.sessionsDir = options.sessionsDir;
@@ -73,6 +75,7 @@ export class CodexEventMonitor {
     }
 
     this.state = 'starting';
+    this.startupBoundary = Date.now();
     this.stopRequested = false;
     const operation = this.startInternal();
     this.startPromise = operation;
@@ -104,17 +107,14 @@ export class CodexEventMonitor {
   private async startInternal(): Promise<void> {
     let watcher: FSWatcher | null = null;
     try {
-      this.liveWatcherPaths.clear();
-      this.startupHistoricalPaths.clear();
-      this.startupListingCaptured = false;
+      this.startupPaths.clear();
+      this.startupSnapshotCaptured = false;
       watcher = watch(this.sessionsDir, { recursive: true }, (_eventType, filename) => {
         if (this.state === 'stopped' || this.state === 'stopping') return;
         if (this.state === 'starting') {
           if (filename) {
             const filePath = join(this.sessionsDir, filename.toString());
-            if (!this.startupHistoricalPaths.has(filePath)) {
-              this.liveWatcherPaths.add(filePath);
-            }
+            this.recordStartupWatcherPath(filePath);
           }
           this.rediscoverRequested = true;
           return;
@@ -130,15 +130,31 @@ export class CodexEventMonitor {
       if (this.stopRequested) {
         watcher.close();
         if (this.watcher === watcher) this.watcher = null;
+        this.startupPaths.clear();
         this.state = 'stopped';
         return;
       }
       this.state = 'started';
+      this.startupPaths.clear();
     } catch (error) {
       watcher?.close();
       if (this.watcher === watcher) this.watcher = null;
+      this.startupPaths.clear();
       this.state = 'stopped';
       throw error;
+    }
+  }
+
+  private recordStartupWatcherPath(filePath: string): void {
+    if (!this.startupSnapshotCaptured) {
+      this.startupPaths.set(filePath, 'pre-listing-event');
+      return;
+    }
+    const classification = this.startupPaths.get(filePath);
+    if (classification === 'historical') {
+      this.startupPaths.set(filePath, 'catchup');
+    } else if (!classification) {
+      this.startupPaths.set(filePath, 'live');
     }
   }
 
@@ -166,6 +182,7 @@ export class CodexEventMonitor {
       }
     }
     await Promise.allSettled([...this.pending.values()]);
+    this.startupPaths.clear();
     this.state = 'stopped';
   }
 
@@ -247,12 +264,25 @@ export class CodexEventMonitor {
   private async discoverFilesOnce(): Promise<void> {
     const files = await discoverRolloutFiles(this.sessionsDir);
     if (this.state === 'starting') {
-      if (!this.startupListingCaptured) {
-        for (const filePath of files) this.startupHistoricalPaths.add(filePath);
-        this.startupListingCaptured = true;
+      if (!this.startupSnapshotCaptured) {
+        const snapshotPaths = new Set(files);
+        for (const filePath of files) {
+          this.startupPaths.set(
+            filePath,
+            this.startupPaths.get(filePath) === 'pre-listing-event'
+              ? 'catchup'
+              : 'historical',
+          );
+        }
+        for (const [filePath, classification] of this.startupPaths) {
+          if (classification === 'pre-listing-event' && !snapshotPaths.has(filePath)) {
+            this.startupPaths.set(filePath, 'live');
+          }
+        }
+        this.startupSnapshotCaptured = true;
       } else {
         for (const filePath of files) {
-          if (!this.startupHistoricalPaths.has(filePath)) this.liveWatcherPaths.add(filePath);
+          if (!this.startupPaths.has(filePath)) this.startupPaths.set(filePath, 'live');
         }
       }
     }
@@ -308,10 +338,9 @@ export class CodexEventMonitor {
           && inspection
           && (inspection.baseline || inspection.hasUnreadBytes)
         ) {
-          await this.processFileOnce(filePath, 'discovery');
+          await this.processFileOnce(filePath, 'discovery', inspection.catchupBoundary);
           this.scheduleReplacementSettle(filePath);
         }
-        if (committed) this.liveWatcherPaths.delete(filePath);
       } catch (error) {
         ready.reject(error);
         throw error;
@@ -335,9 +364,15 @@ export class CodexEventMonitor {
       const fileId = `${fileStat.dev}:${fileStat.ino}`;
       const cursor = await this.store.getNotificationCursor(filePath);
       const generation = this.generations.get(filePath);
+      const startupClassification = this.state === 'starting'
+        ? this.startupPaths.get(filePath)
+        : undefined;
+      const isCatchup = !cursor
+        && !generation
+        && startupClassification === 'catchup';
       const isLiveNew = !cursor
         && !generation
-        && (this.state === 'started' || this.liveWatcherPaths.has(filePath));
+        && (this.state === 'started' || startupClassification === 'live');
       const precedingBytes = await readPrecedingBytes(handle, cursor?.byteOffset ?? fileStat.size);
       const hasValidCursor = cursor
         && cursor.fileId === fileId
@@ -345,14 +380,15 @@ export class CodexEventMonitor {
         && typeof cursor.continuityHash === 'string'
         && cursor.continuityHash === hashBytes(precedingBytes);
       if (!hasValidCursor) {
-        const byteOffset = isLiveNew ? 0 : fileStat.size;
+        const byteOffset = isLiveNew || isCatchup ? 0 : fileStat.size;
         const isReplacement = this.state === 'started'
           && !isLiveNew
           && Boolean(cursor || generation);
         this.setGeneration(filePath, fileId, isReplacement ? 'replacing' : 'active');
         return {
           baseline: await makeBaselineCursor(handle, filePath, fileId, byteOffset),
-          hasUnreadBytes: isLiveNew && fileStat.size > 0,
+          hasUnreadBytes: (isLiveNew || isCatchup) && fileStat.size > 0,
+          ...(isCatchup ? { catchupBoundary: this.startupBoundary } : {}),
         };
       }
       if (generation?.phase === 'replacing') {
@@ -369,7 +405,11 @@ export class CodexEventMonitor {
     }
   }
 
-  private async processFileOnce(filePath: string, origin: ProcessingOrigin): Promise<void> {
+  private async processFileOnce(
+    filePath: string,
+    origin: ProcessingOrigin,
+    catchupBoundary?: number,
+  ): Promise<void> {
     if (!isRolloutPath(filePath)) return;
 
     let handle = await openIfPresent(filePath);
@@ -381,7 +421,14 @@ export class CodexEventMonitor {
       }
       const fileId = `${fileStat.dev}:${fileStat.ino}`;
       try {
-        await this.processOpenedFile(filePath, handle, fileId, fileStat.size, origin);
+        await this.processOpenedFile(
+          filePath,
+          handle,
+          fileId,
+          fileStat.size,
+          origin,
+          catchupBoundary,
+        );
       } finally {
         await handle.close();
       }
@@ -405,6 +452,7 @@ export class CodexEventMonitor {
     fileId: string,
     fileSize: number,
     origin: ProcessingOrigin,
+    catchupBoundary?: number,
   ): Promise<void> {
     let cursor = await this.store.getNotificationCursor(filePath);
     const generation = this.generations.get(filePath);
@@ -486,7 +534,9 @@ export class CodexEventMonitor {
         if (newline !== -1) {
           if (!oversizedLine) {
             const parsed = parseRolloutLine(Buffer.concat(lineParts, lineBytes).toString('utf8'));
-            if (parsed) await this.onEvent(parsed, filePath);
+            if (parsed && shouldEmitEvent(parsed, catchupBoundary)) {
+              await this.onEvent(parsed, filePath);
+            }
           }
           persistedOffset = chunkStartOffset + segmentEnd;
           committedTail = pendingTail;
@@ -649,6 +699,12 @@ function appendContinuityTail(anchor: Buffer, appended: Buffer): Buffer {
 
 function hashBytes(bytes: Buffer): string {
   return createHash('sha256').update(bytes).digest('hex').slice(0, 24);
+}
+
+function shouldEmitEvent(event: ParsedRolloutLine, catchupBoundary?: number): boolean {
+  if (catchupBoundary === undefined) return true;
+  if (event.type !== 'question' && event.type !== 'completed') return false;
+  return event.occurredAt !== undefined && event.occurredAt >= catchupBoundary;
 }
 
 function deferred<T>(): {
