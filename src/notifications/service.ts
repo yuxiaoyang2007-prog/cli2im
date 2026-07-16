@@ -73,6 +73,7 @@ interface TurnMetadata {
   userText?: string;
   attachmentName?: string;
   hasUserMessage?: boolean;
+  awaitingUser?: boolean;
 }
 
 interface RolloutContext {
@@ -240,12 +241,23 @@ export class CodexNotificationService {
       });
     } else if (event.type === 'completed') {
       if (notificationAllowed) {
-        await this.routeRolloutNotification(context, event, {
-          eventKey: (sessionId) => eventKey([sessionId, event.turnId, 'completed']),
-          kind: 'completed',
-          occurredAt: event.occurredAt,
-          durationMs: event.durationMs,
-        });
+        if (context.turns.get(event.turnId)?.awaitingUser) {
+          await this.routeRolloutNotification(context, event, {
+            eventKey: (sessionId) => eventKey([
+              sessionId, event.turnId, 'implicit-question',
+            ]),
+            kind: 'needs_attention',
+            reason: 'question',
+            occurredAt: event.occurredAt,
+          });
+        } else {
+          await this.routeRolloutNotification(context, event, {
+            eventKey: (sessionId) => eventKey([sessionId, event.turnId, 'completed']),
+            kind: 'completed',
+            occurredAt: event.occurredAt,
+            durationMs: event.durationMs,
+          });
+        }
         this.releaseTurnContext(filePath, context, event.turnId);
       } else {
         this.releaseCatchupTurn(context, event.turnId);
@@ -300,6 +312,13 @@ export class CodexNotificationService {
       turn.userText = event.userText;
       turn.attachmentName = event.attachmentName;
       turn.hasUserMessage = true;
+      context.turns.set(event.turnId, turn);
+      return;
+    }
+
+    if (event.type === 'assistant_state') {
+      const turn = context.turns.get(event.turnId) ?? {};
+      turn.awaitingUser = event.awaitingUser;
       context.turns.set(event.turnId, turn);
       return;
     }

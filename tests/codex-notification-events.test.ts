@@ -298,6 +298,67 @@ describe('Codex notification event parsing', () => {
     });
   });
 
+  it('classifies a final answer that asks for a choice without retaining its text', () => {
+    const privatePrompt = [
+      '先确认讲解时长，这会直接决定页数和展开深度：',
+      '- A：约 15 分钟（推荐）',
+      '- B：约 8 分钟',
+      '回复 A、B 或 C 即可。',
+    ].join('\n');
+    const parsed = parseRolloutLine(JSON.stringify({
+      type: 'response_item',
+      payload: {
+        type: 'message',
+        role: 'assistant',
+        phase: 'final_answer',
+        content: [{ type: 'output_text', text: privatePrompt }],
+        internal_chat_message_metadata_passthrough: { turn_id: 'turn_choice' },
+      },
+    }));
+
+    expect(parsed).toEqual({
+      type: 'assistant_state',
+      turnId: 'turn_choice',
+      awaitingUser: true,
+    });
+    expect(JSON.stringify(parsed)).not.toContain(privatePrompt);
+    expect(JSON.stringify(parsed)).not.toContain('HTML');
+  });
+
+  it('classifies a final confirmation question as awaiting the user', () => {
+    expect(parseRolloutLine(JSON.stringify({
+      type: 'response_item',
+      payload: {
+        type: 'message',
+        role: 'assistant',
+        phase: 'final_answer',
+        content: [{ type: 'output_text', text: '确认按“方案一 + 16 页结构”执行吗？' }],
+        internal_chat_message_metadata_passthrough: { turn_id: 'turn_confirm' },
+      },
+    }))).toEqual({
+      type: 'assistant_state',
+      turnId: 'turn_confirm',
+      awaitingUser: true,
+    });
+  });
+
+  it('classifies a delivered final answer as not awaiting the user', () => {
+    expect(parseRolloutLine(JSON.stringify({
+      type: 'response_item',
+      payload: {
+        type: 'message',
+        role: 'assistant',
+        phase: 'final_answer',
+        content: [{ type: 'output_text', text: '已修改并完成导出，两个问题均已处理。' }],
+        internal_chat_message_metadata_passthrough: { turn_id: 'turn_delivered' },
+      },
+    }))).toEqual({
+      type: 'assistant_state',
+      turnId: 'turn_delivered',
+      awaitingUser: false,
+    });
+  });
+
   it.each([
     ['GitHub PAT', 'ghp_1234567890abcdefghijklmnopqrstuvwxyzAB'],
     ['AWS access key', 'AKIAIOSFODNN7EXAMPLE'],

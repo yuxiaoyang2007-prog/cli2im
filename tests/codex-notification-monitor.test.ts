@@ -586,6 +586,40 @@ describe('CodexEventMonitor', () => {
     expect(requestIds).toEqual(['scan-growth-first', 'scan-growth-second']);
   });
 
+  it('polls an active rollout to catch a terminal append when the watcher misses it', async () => {
+    const { file, monitor, onEvent } = await setup();
+    await writeFile(file, '');
+    await monitor.start();
+    const turnContext = JSON.stringify({
+      type: 'turn_context',
+      payload: { turn_id: 'turn_active_poll', cwd: '/tmp/project' },
+    });
+    await appendFile(file, `${turnContext}\n`);
+    await monitor.processFile(file);
+    expect(onEvent).toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'turn_context', turnId: 'turn_active_poll' }),
+      file,
+    );
+
+    (monitor as unknown as { watcher: { close(): void } | null }).watcher?.close();
+    const terminal = JSON.stringify({
+      timestamp: '2026-07-16T07:45:29.499Z',
+      type: 'event_msg',
+      payload: {
+        type: 'task_complete',
+        turn_id: 'turn_active_poll',
+        completed_at: Date.parse('2026-07-16T07:45:29Z') / 1000,
+      },
+    });
+    await appendFile(file, `${terminal}\n`);
+
+    await waitFor(() => onEvent.mock.calls.some(([event]) => event.type === 'completed'), 3_000);
+    expect(onEvent).toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'completed', turnId: 'turn_active_poll' }),
+      file,
+    );
+  });
+
   it('discovers rollout files sequentially and durably baselines them with one save', async () => {
     const { onEvent, sessionsDir, store } = await setup();
     await monitors.pop()?.stop();

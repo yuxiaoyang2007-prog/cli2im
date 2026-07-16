@@ -12,7 +12,7 @@ interface NotificationCursorStore {
 }
 
 type MonitorState = 'stopped' | 'starting' | 'started' | 'stopping';
-type ProcessingOrigin = 'direct' | 'discovery' | 'watcher' | 'settle';
+type ProcessingOrigin = 'direct' | 'discovery' | 'watcher' | 'settle' | 'poll';
 type StartupPathClassification = 'pre-listing-event' | 'historical' | 'catchup' | 'live';
 
 interface TrackedGeneration {
@@ -34,6 +34,7 @@ const READ_CHUNK_BYTES = 64 * 1024;
 const MAX_LINE_BYTES = 1024 * 1024;
 const WATCH_COALESCE_MS = 25;
 const REPLACEMENT_QUIET_MS = 250;
+const ACTIVE_POLL_MS = 500;
 
 export interface CodexEventMonitorOptions {
   sessionsDir: string;
@@ -57,6 +58,8 @@ export class CodexEventMonitor {
   private readonly pending = new Map<string, Promise<unknown>>();
   private readonly watcherTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private readonly replacementTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  private readonly activePollTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  private readonly activeTurns = new Map<string, Set<string>>();
   private readonly generations = new Map<string, TrackedGeneration>();
   private readonly startupPaths = new Map<string, StartupPathClassification>();
   private watcher: FSWatcher | null = null;
@@ -182,6 +185,9 @@ export class CodexEventMonitor {
     this.watcherTimers.clear();
     for (const timer of this.replacementTimers.values()) clearTimeout(timer);
     this.replacementTimers.clear();
+    for (const timer of this.activePollTimers.values()) clearTimeout(timer);
+    this.activePollTimers.clear();
+    this.activeTurns.clear();
     this.rediscoverRequested = false;
     if (this.discoveryPromise) {
       try {
@@ -227,10 +233,14 @@ export class CodexEventMonitor {
   }
 
   private async queueFile(filePath: string, origin: ProcessingOrigin): Promise<void> {
-    await this.queuePathOperation(
-      filePath,
-      () => this.processFileOnce(filePath, origin),
-    );
+    try {
+      await this.queuePathOperation(
+        filePath,
+        () => this.processFileOnce(filePath, origin),
+      );
+    } finally {
+      this.scheduleActivePoll(filePath);
+    }
   }
 
   private async queuePathOperation<T>(
@@ -554,9 +564,9 @@ export class CodexEventMonitor {
             const parsed = parseRolloutLine(Buffer.concat(lineParts, lineBytes).toString('utf8'));
             if (parsed) {
               if (catchupBoundary === undefined) {
-                await this.onEvent(parsed, filePath);
+                await this.emitEvent(parsed, filePath);
               } else {
-                await this.onEvent(parsed, filePath, {
+                await this.emitEvent(parsed, filePath, {
                   mode: 'startup-catchup',
                   notificationAllowed: shouldEmitEvent(parsed, catchupBoundary),
                 });
@@ -589,6 +599,40 @@ export class CodexEventMonitor {
         if (hashBytes(liveTail) !== cursor.continuityHash) return;
       }
     }
+  }
+
+  private async emitEvent(
+    event: ParsedRolloutLine,
+    filePath: string,
+    delivery?: CodexMonitorDelivery,
+  ): Promise<void> {
+    if (delivery === undefined) {
+      await this.onEvent(event, filePath);
+    } else {
+      await this.onEvent(event, filePath, delivery);
+    }
+    if (event.type === 'turn_context') {
+      const turns = this.activeTurns.get(filePath) ?? new Set<string>();
+      turns.add(event.turnId);
+      this.activeTurns.set(filePath, turns);
+    } else if (event.type === 'completed' || event.type === 'aborted') {
+      const turns = this.activeTurns.get(filePath);
+      turns?.delete(event.turnId);
+      if (turns?.size === 0) this.activeTurns.delete(filePath);
+    }
+  }
+
+  private scheduleActivePoll(filePath: string): void {
+    const existing = this.activePollTimers.get(filePath);
+    if (existing) clearTimeout(existing);
+    this.activePollTimers.delete(filePath);
+    if (this.state !== 'started' || !this.activeTurns.has(filePath)) return;
+    const timer = setTimeout(() => {
+      this.activePollTimers.delete(filePath);
+      if (this.state !== 'started' || !this.activeTurns.has(filePath)) return;
+      void this.queueFile(filePath, 'poll').catch(() => undefined);
+    }, ACTIVE_POLL_MS);
+    this.activePollTimers.set(filePath, timer);
   }
 
   private async baseline(

@@ -9,6 +9,7 @@ export type ParsedRolloutLine =
   | { type: 'session_meta'; sessionId: string; cwd: string; source: string }
   | { type: 'turn_context'; turnId: string; cwd: string }
   | { type: 'user_message'; turnId: string; userText?: string; attachmentName?: string }
+  | { type: 'assistant_state'; turnId: string; awaitingUser: boolean }
   | { type: 'question'; turnId?: string; requestId: string; occurredAt?: number }
   | { type: 'completed'; turnId: string; occurredAt: number; durationMs?: number }
   | { type: 'aborted'; turnId: string };
@@ -110,9 +111,24 @@ function parseResponseItem(
   const turnId = nestedTurnId(payload.internal_chat_message_metadata_passthrough);
   if (!turnId) return null;
 
-  if (payload.type !== 'message' || payload.role !== 'user' || !Array.isArray(payload.content)) {
+  if (payload.type !== 'message' || !Array.isArray(payload.content)) {
     return null;
   }
+
+  if (payload.role === 'assistant' && payload.phase === 'final_answer') {
+    const text = payload.content
+      .filter(isRecord)
+      .filter((item) => item.type === 'output_text' && typeof item.text === 'string')
+      .map((item) => item.text as string)
+      .join('\n');
+    return text ? {
+      type: 'assistant_state',
+      turnId,
+      awaitingUser: assistantAwaitsUser(text),
+    } : null;
+  }
+
+  if (payload.role !== 'user') return null;
 
   let userText = '';
   let attachmentName = '';
@@ -133,6 +149,20 @@ function parseResponseItem(
     ...(userText ? { userText } : {}),
     ...(attachmentName ? { attachmentName } : {}),
   };
+}
+
+function assistantAwaitsUser(text: string): boolean {
+  const normalized = text.replace(/[\p{C}\p{Z}\s]+/gu, ' ').trim();
+  if (!normalized) return false;
+  return [
+    /(?:请|需要你|麻烦你|烦请).{0,24}(?:选择|选定|确认|批准|审批|回复|提供|决定)/u,
+    /(?:你希望|你想要|你倾向|你选择|你选|选哪|哪一种|哪个方案)/u,
+    /(?:先确认|待确认|等待确认|获批后|确认后|选择后|选定后).{0,40}(?:我再|再进入|再继续|继续|开始|执行|实现|制作)/u,
+    /(?:回复|告诉)我.{0,24}(?:即可|就行|选择|决定|方案)/u,
+    /(?:回复|答复).{1,40}(?:即可|就行|都可以)/u,
+    /确认.{0,80}(?:执行|继续|开始|采用|方案).{0,12}(?:吗|么)[？?]?$/u,
+    /(?:please\s+(?:choose|confirm|select|reply|provide)|let\s+me\s+know|after\s+you\s+confirm)/iu,
+  ].some((pattern) => pattern.test(normalized));
 }
 
 function parseEventMessage(

@@ -215,6 +215,69 @@ describe('CodexNotificationService', () => {
     expect(eventTime + 31_000 - vi.mocked(router.handle).mock.calls[0][0].occurredAt).toBeGreaterThan(30_000);
   });
 
+  it('routes an implicit final-answer choice as attention instead of completion', async () => {
+    let onRollout: ((event: ParsedRolloutLine, filePath: string) => void | Promise<void>) | undefined;
+    const router = {
+      resumePending: vi.fn(),
+      handle: vi.fn().mockResolvedValue('delivered'),
+      stop: vi.fn(),
+    } as unknown as NotificationRouter;
+    const metadataResolver = {
+      resolve: vi.fn(async () => ({
+        projectName: 'power-trader-edu',
+        taskName: '生成宣传讲解 HTML PPT',
+        surface: 'Codex Desktop' as const,
+        shortTaskId: 'session_',
+      })),
+    } as unknown as NotificationMetadataResolver;
+    const service = new CodexNotificationService({
+      botName: 'codexbot',
+      workingDirectory: '/tmp/project',
+      sessionsDir: '/tmp/codex/sessions',
+      sessionIndexPath: '/tmp/codex/session_index.jsonl',
+      socketPath: '/tmp/cli2im/codex-notify.sock',
+      store: { bindNotificationTarget: vi.fn() } as unknown as SessionStore,
+      resolveAdapter: () => undefined,
+      timeZone: 'UTC',
+      dependencies: {
+        router,
+        metadataResolver,
+        createMonitor: (handler) => {
+          onRollout = handler;
+          return { start: vi.fn(), stop: vi.fn() };
+        },
+        createSocket: () => ({ start: vi.fn(), stop: vi.fn() }),
+        readContextFile: vi.fn().mockResolvedValue(''),
+      },
+    });
+    const filePath = '/tmp/codex/sessions/rollout-choice.jsonl';
+
+    await onRollout?.({
+      type: 'session_meta', sessionId: 'session_choice', cwd: '/tmp/project', source: 'codex-desktop',
+    }, filePath);
+    await onRollout?.({ type: 'turn_context', turnId: 'turn_choice', cwd: '/tmp/project' }, filePath);
+    await onRollout?.({
+      type: 'user_message', turnId: 'turn_choice', userText: '生成宣传讲解 HTML PPT',
+    }, filePath);
+    await onRollout?.({
+      type: 'assistant_state', turnId: 'turn_choice', awaitingUser: true,
+    }, filePath);
+    await onRollout?.({
+      type: 'completed', turnId: 'turn_choice', occurredAt: 5_000,
+    }, filePath);
+
+    expect(router.handle).toHaveBeenCalledTimes(1);
+    expect(router.handle).toHaveBeenCalledWith(expect.objectContaining({
+      eventKey: eventKey(['session_choice', 'turn_choice', 'implicit-question']),
+      kind: 'needs_attention',
+      reason: 'question',
+      projectName: 'power-trader-edu',
+      taskName: '生成宣传讲解 HTML PPT',
+      occurredAt: 5_000,
+    }));
+    expect(router.handle).not.toHaveBeenCalledWith(expect.objectContaining({ kind: 'completed' }));
+  });
+
   it('uses now only when a question timestamp is missing', async () => {
     let onRollout: ((event: ParsedRolloutLine, filePath: string) => void | Promise<void>) | undefined;
     const router = {
