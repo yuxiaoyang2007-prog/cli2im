@@ -6,7 +6,7 @@ const MAX_WINDOW_BYTES = 65536;
 const MAX_FULL_TEXT_BYTES = 65536;
 const CAPPED_HEAD_BYTES = 32768;
 const ROLLOUT_CONTEXT_HEAD_BYTES = 256 * 1024;
-const ROLLOUT_CONTEXT_TAIL_BYTES = 32768;
+const ROLLOUT_CONTEXT_TAIL_BYTES = 1024 * 1024;
 
 export async function readHeadTailWindow(filePath: string): Promise<string> {
   let fh;

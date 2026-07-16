@@ -80,6 +80,10 @@ interface RolloutContext {
   sessionId?: string;
   cwd?: string;
   source?: string;
+  latestCwd?: string;
+  lastUserText?: string;
+  lastAttachmentName?: string;
+  lastUserCwd?: string;
   turns: Map<string, TurnMetadata>;
   activeTurnIds: Set<string>;
   activeTurnStateTrusted: boolean;
@@ -302,6 +306,7 @@ export class CodexNotificationService {
       const turn = context.turns.get(event.turnId) ?? {};
       turn.cwd = event.cwd;
       context.turns.set(event.turnId, turn);
+      context.latestCwd = event.cwd;
       context.activeTurnIds.add(event.turnId);
       return;
     }
@@ -313,6 +318,9 @@ export class CodexNotificationService {
       turn.attachmentName = event.attachmentName;
       turn.hasUserMessage = true;
       context.turns.set(event.turnId, turn);
+      context.lastUserText = event.userText;
+      context.lastAttachmentName = event.attachmentName;
+      context.lastUserCwd = turn.cwd ?? context.latestCwd;
       return;
     }
 
@@ -433,12 +441,22 @@ export class CodexNotificationService {
     turnId: string,
   ): ReturnType<MetadataResolver['resolve']> {
     const turn = context.turns.get(turnId);
+    const userText = turn?.hasUserMessage
+      ? (turn.userText ?? '')
+      : (context.lastUserText ?? '');
+    const attachmentName = turn?.hasUserMessage
+      ? turn.attachmentName
+      : context.lastAttachmentName;
     return this.metadataResolver.resolve({
       sessionId,
-      cwd: turn?.cwd ?? context.cwd ?? this.workingDirectory,
+      cwd: turn?.cwd
+        ?? context.latestCwd
+        ?? context.lastUserCwd
+        ?? context.cwd
+        ?? this.workingDirectory,
       source: context.source ?? 'unknown',
-      userText: turn?.userText ?? '',
-      attachmentName: turn?.attachmentName,
+      userText,
+      attachmentName,
     });
   }
 }

@@ -915,6 +915,10 @@ describe('CodexNotificationService', () => {
         },
       }),
       JSON.stringify({
+        type: 'event_msg',
+        payload: { type: 'token_count', padding: 'x'.repeat(260_000) },
+      }),
+      JSON.stringify({
         type: 'turn_context',
         payload: { turn_id: 'turn_large_meta', cwd: '/tmp/power-trader-edu' },
       }),
@@ -926,6 +930,10 @@ describe('CodexNotificationService', () => {
           content: [{ type: 'input_text', text: '生成宣传讲解 HTML PPT' }],
           internal_chat_message_metadata_passthrough: { turn_id: 'turn_large_meta' },
         },
+      }),
+      JSON.stringify({
+        type: 'event_msg',
+        payload: { type: 'token_count', padding: 'x'.repeat(50_000) },
       }),
       JSON.stringify({
         type: 'response_item',
@@ -977,9 +985,108 @@ describe('CodexNotificationService', () => {
         projectName: 'power-trader-edu',
         taskName: '生成宣传讲解 HTML PPT',
       }));
+      expect(metadataResolver.resolve).toHaveBeenCalledWith({
+        sessionId: 'session_large_meta',
+        cwd: '/tmp/power-trader-edu',
+        source: 'codex-desktop',
+        userText: '生成宣传讲解 HTML PPT',
+        attachmentName: undefined,
+      });
     } finally {
       await rm(directory, { recursive: true, force: true });
     }
+  });
+
+  it('uses the last meaningful user task for an automatic continuation turn', async () => {
+    let onRollout: ((event: ParsedRolloutLine, filePath: string) => void | Promise<void>) | undefined;
+    const router = {
+      resumePending: vi.fn(),
+      handle: vi.fn().mockResolvedValue('delivered'),
+      stop: vi.fn(),
+    } as unknown as NotificationRouter;
+    const metadataResolver = {
+      resolve: vi.fn(async () => ({
+        projectName: 'content-project',
+        taskName: '输出内容固定到统一文件夹并写入 skill',
+        surface: 'Codex Desktop' as const,
+        shortTaskId: 'session_',
+      })),
+    } as unknown as NotificationMetadataResolver;
+    const historicalContext = [
+      JSON.stringify({
+        type: 'session_meta',
+        payload: { id: 'session_continuation', cwd: '/tmp/original', source: 'codex-desktop' },
+      }),
+      JSON.stringify({
+        type: 'turn_context',
+        payload: { turn_id: 'turn_user', cwd: '/tmp/content-project' },
+      }),
+      JSON.stringify({
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'user',
+          content: [{ type: 'input_text', text: '输出内容固定到统一文件夹并写入 skill' }],
+          internal_chat_message_metadata_passthrough: { turn_id: 'turn_user' },
+        },
+      }),
+      JSON.stringify({
+        type: 'event_msg',
+        payload: { type: 'task_complete', turn_id: 'turn_user' },
+      }),
+      JSON.stringify({
+        type: 'turn_context',
+        payload: { turn_id: 'turn_continuation', cwd: '/tmp/content-project' },
+      }),
+      JSON.stringify({
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'assistant',
+          phase: 'final_answer',
+          content: [{ type: 'output_text', text: '已持久化并完成验证。' }],
+          internal_chat_message_metadata_passthrough: { turn_id: 'turn_continuation' },
+        },
+      }),
+    ].join('\n');
+    const service = new CodexNotificationService({
+      botName: 'codexbot',
+      workingDirectory: '/tmp/fallback',
+      sessionsDir: '/tmp/codex/sessions',
+      sessionIndexPath: '/tmp/codex/session_index.jsonl',
+      socketPath: '/tmp/cli2im/codex-notify.sock',
+      store: { bindNotificationTarget: vi.fn() } as unknown as SessionStore,
+      resolveAdapter: () => undefined,
+      timeZone: 'UTC',
+      dependencies: {
+        router,
+        metadataResolver,
+        createMonitor: (handler) => {
+          onRollout = handler;
+          return { start: vi.fn(), stop: vi.fn() };
+        },
+        createSocket: () => ({ start: vi.fn(), stop: vi.fn() }),
+        readContextFile: vi.fn().mockResolvedValue(historicalContext),
+      },
+    });
+
+    await onRollout?.({
+      type: 'completed', turnId: 'turn_continuation', occurredAt: 5_000,
+    }, '/tmp/codex/sessions/rollout-continuation.jsonl');
+
+    expect(metadataResolver.resolve).toHaveBeenCalledWith({
+      sessionId: 'session_continuation',
+      cwd: '/tmp/content-project',
+      source: 'codex-desktop',
+      userText: '输出内容固定到统一文件夹并写入 skill',
+      attachmentName: undefined,
+    });
+    expect(router.handle).toHaveBeenCalledWith(expect.objectContaining({
+      eventKey: eventKey(['session_continuation', 'turn_continuation', 'completed']),
+      kind: 'completed',
+      projectName: 'content-project',
+      taskName: '输出内容固定到统一文件夹并写入 skill',
+    }));
   });
 
   it.each([
