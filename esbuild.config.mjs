@@ -40,6 +40,27 @@ async function main() {
   });
   chmodSync('dist/codex-notify-hook.js', 0o755);
 
+  await build({
+    entryPoints: ['src/notifications/lifecycle-hook-client.ts'],
+    bundle: true,
+    platform: 'node',
+    target: 'node22',
+    format: 'esm',
+    outfile: 'plugins/codex-task-notifier/dist/lifecycle-hook.js',
+    banner: { js: '#!/usr/bin/env node' },
+  });
+  await build({
+    entryPoints: ['src/notifications/mcp-server.ts'],
+    bundle: true,
+    platform: 'node',
+    target: 'node22',
+    format: 'esm',
+    outfile: 'plugins/codex-task-notifier/dist/mcp-server.js',
+    banner: { js: '#!/usr/bin/env node' },
+  });
+  chmodSync('plugins/codex-task-notifier/dist/lifecycle-hook.js', 0o755);
+  chmodSync('plugins/codex-task-notifier/dist/mcp-server.js', 0o755);
+
   const sqlJsDir = dirname(require.resolve('sql.js/dist/sql-wasm.wasm'));
   mkdirSync('dist', { recursive: true });
   cpSync(join(sqlJsDir, 'sql-wasm.wasm'), 'dist/sql-wasm.wasm');

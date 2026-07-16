@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "codex_task_notifier": {
+      "command": "node",
+      "args": ["./dist/mcp-server.js"],
+      "cwd": "."
+    }
+  }
+}

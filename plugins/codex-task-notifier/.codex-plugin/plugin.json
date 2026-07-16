@@ -1,0 +1,19 @@
+{
+  "name": "codex-task-notifier",
+  "version": "0.1.0",
+  "description": "Accurate Feishu alerts for Codex tasks that need attention or are completed.",
+  "author": {
+    "name": "Joulian"
+  },
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Codex Task Notifier",
+    "shortDescription": "Accurate Codex task status alerts in Feishu.",
+    "longDescription": "Reports explicit main-task waiting and completion states to the local cli2im bridge without replacing native Codex notifications.",
+    "developerName": "Joulian",
+    "category": "Productivity",
+    "capabilities": ["Automation"],
+    "defaultPrompt": ["Use explicit task status reporting for this task."]
+  },
+  "mcpServers": "./.mcp.json"
+}
