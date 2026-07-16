@@ -154,7 +154,7 @@ function parseResponseItem(
 function assistantAwaitsUser(text: string): boolean {
   const normalized = text.replace(/[\p{C}\p{Z}\s]+/gu, ' ').trim();
   if (!normalized) return false;
-  return [
+  const blocking = [
     /(?:请|需要你|麻烦你|烦请).{0,24}(?:选择|选定|确认|批准|审批|回复|提供|决定)/u,
     /(?:你希望|你想要|你倾向|你选择|你选|选哪|哪一种|哪个方案)/u,
     /(?:先确认|待确认|等待确认|获批后|确认后|选择后|选定后).{0,40}(?:我再|再进入|再继续|继续|开始|执行|实现|制作)/u,
@@ -163,6 +163,15 @@ function assistantAwaitsUser(text: string): boolean {
     /确认.{0,80}(?:执行|继续|开始|采用|方案).{0,12}(?:吗|么)[？?]?$/u,
     /(?:please\s+(?:choose|confirm|select|reply|provide)|let\s+me\s+know|after\s+you\s+confirm)/iu,
   ].some((pattern) => pattern.test(normalized));
+  if (!blocking) return false;
+
+  const delivered = /(?:已|已经).{0,24}(?:完成|生成|创建|修改|修复|导出|上线|部署|发布|保存|写入|交付)/u
+    .test(normalized);
+  const optionalFollowUp = /(?:如果|如需|若需|需要的话).{0,48}(?:回复|答复|告诉|调整|修改).{0,24}(?:即可|就行|可以)/u
+    .test(normalized)
+    || /(?:if\s+you(?:'d|\s+would)?\s+like|if\s+you\s+want).{0,80}(?:reply|let\s+me\s+know|adjust|change)/iu
+      .test(normalized);
+  return !(delivered && optionalFollowUp);
 }
 
 function parseEventMessage(

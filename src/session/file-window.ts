@@ -5,6 +5,8 @@ const TAIL_BYTES = 32768;
 const MAX_WINDOW_BYTES = 65536;
 const MAX_FULL_TEXT_BYTES = 65536;
 const CAPPED_HEAD_BYTES = 32768;
+const ROLLOUT_CONTEXT_HEAD_BYTES = 256 * 1024;
+const ROLLOUT_CONTEXT_TAIL_BYTES = 32768;
 
 export async function readHeadTailWindow(filePath: string): Promise<string> {
   let fh;
@@ -18,6 +20,26 @@ export async function readHeadTailWindow(filePath: string): Promise<string> {
     const tailStart = Math.max(0, fileStat.size - tailBytes);
     const tail = tailStart <= headBytes ? '' : await readAt(fh, tailBytes, tailStart);
 
+    return tail ? `${head}\n${tail}` : head;
+  } catch {
+    return '';
+  } finally {
+    await fh?.close();
+  }
+}
+
+export async function readRolloutContextWindow(filePath: string): Promise<string> {
+  let fh;
+  try {
+    fh = await open(filePath, 'r');
+    const fileStat = await fh.stat();
+    const headBytes = Math.min(ROLLOUT_CONTEXT_HEAD_BYTES, fileStat.size);
+    const head = await readAt(fh, headBytes, 0);
+    if (headBytes === fileStat.size) return head;
+
+    const tailBytes = Math.min(ROLLOUT_CONTEXT_TAIL_BYTES, fileStat.size - headBytes);
+    const tailStart = fileStat.size - tailBytes;
+    const tail = await readAt(fh, tailBytes, tailStart);
     return tail ? `${head}\n${tail}` : head;
   } catch {
     return '';

@@ -1,7 +1,7 @@
 import { readdir } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import type { SessionStore } from '../session/store.js';
-import { readHeadTailWindow } from '../session/file-window.js';
+import { readRolloutContextWindow } from '../session/file-window.js';
 import type { PlatformAdapter } from '../types.js';
 import {
   eventKey,
@@ -112,7 +112,7 @@ export class CodexNotificationService {
     this.sessionsDir = options.sessionsDir;
     this.store = options.store;
     this.now = options.now ?? Date.now;
-    this.readContextFile = options.dependencies?.readContextFile ?? readHeadTailWindow;
+    this.readContextFile = options.dependencies?.readContextFile ?? readRolloutContextWindow;
     this.findContextFile = options.dependencies?.findContextFile ?? findSessionRollout;
 
     const adapter = options.resolveAdapter(options.botName);

@@ -359,6 +359,26 @@ describe('Codex notification event parsing', () => {
     });
   });
 
+  it('does not treat an optional follow-up after delivery as blocking', () => {
+    expect(parseRolloutLine(JSON.stringify({
+      type: 'response_item',
+      payload: {
+        type: 'message',
+        role: 'assistant',
+        phase: 'final_answer',
+        content: [{
+          type: 'output_text',
+          text: '已完成并导出。如需调整，回复我即可。',
+        }],
+        internal_chat_message_metadata_passthrough: { turn_id: 'turn_optional_followup' },
+      },
+    }))).toEqual({
+      type: 'assistant_state',
+      turnId: 'turn_optional_followup',
+      awaitingUser: false,
+    });
+  });
+
   it.each([
     ['GitHub PAT', 'ghp_1234567890abcdefghijklmnopqrstuvwxyzAB'],
     ['AWS access key', 'AKIAIOSFODNN7EXAMPLE'],

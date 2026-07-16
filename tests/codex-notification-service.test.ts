@@ -887,6 +887,101 @@ describe('CodexNotificationService', () => {
     }));
   });
 
+  it('restores context when a rollout session metadata line exceeds the generic head window', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'cli2im-large-session-meta-'));
+    const filePath = join(directory, 'rollout-large-session-meta.jsonl');
+    let onRollout: ((event: ParsedRolloutLine, filePath: string) => void | Promise<void>) | undefined;
+    const router = {
+      resumePending: vi.fn().mockResolvedValue(undefined),
+      handle: vi.fn().mockResolvedValue('delivered'),
+      stop: vi.fn(),
+    } as unknown as NotificationRouter;
+    const metadataResolver = {
+      resolve: vi.fn(async () => ({
+        projectName: 'power-trader-edu',
+        taskName: '生成宣传讲解 HTML PPT',
+        surface: 'Codex Desktop' as const,
+        shortTaskId: 'session_',
+      })),
+    } as unknown as NotificationMetadataResolver;
+    const lines = [
+      JSON.stringify({
+        type: 'session_meta',
+        payload: {
+          id: 'session_large_meta',
+          cwd: '/tmp/power-trader-edu',
+          source: 'codex-desktop',
+          padding: 'x'.repeat(40_000),
+        },
+      }),
+      JSON.stringify({
+        type: 'turn_context',
+        payload: { turn_id: 'turn_large_meta', cwd: '/tmp/power-trader-edu' },
+      }),
+      JSON.stringify({
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'user',
+          content: [{ type: 'input_text', text: '生成宣传讲解 HTML PPT' }],
+          internal_chat_message_metadata_passthrough: { turn_id: 'turn_large_meta' },
+        },
+      }),
+      JSON.stringify({
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'assistant',
+          phase: 'final_answer',
+          content: [{ type: 'output_text', text: '确认按方案一执行吗？' }],
+          internal_chat_message_metadata_passthrough: { turn_id: 'turn_large_meta' },
+        },
+      }),
+      JSON.stringify({
+        timestamp: '2026-07-16T07:45:29.499Z',
+        type: 'event_msg',
+        payload: { type: 'task_complete', turn_id: 'turn_large_meta' },
+      }),
+    ];
+
+    try {
+      await writeFile(filePath, `${lines.join('\n')}\n`);
+      new CodexNotificationService({
+        botName: 'codexbot',
+        workingDirectory: '/tmp/fallback',
+        sessionsDir: directory,
+        sessionIndexPath: '/tmp/codex/session_index.jsonl',
+        socketPath: '/tmp/cli2im/codex-notify.sock',
+        store: { bindNotificationTarget: vi.fn() } as unknown as SessionStore,
+        resolveAdapter: () => undefined,
+        timeZone: 'UTC',
+        dependencies: {
+          router,
+          metadataResolver,
+          createMonitor: (handler) => {
+            onRollout = handler;
+            return { start: vi.fn(), stop: vi.fn() };
+          },
+          createSocket: () => ({ start: vi.fn(), stop: vi.fn() }),
+        },
+      });
+
+      await onRollout?.({
+        type: 'completed', turnId: 'turn_large_meta', occurredAt: 5_000,
+      }, filePath);
+
+      expect(router.handle).toHaveBeenCalledWith(expect.objectContaining({
+        eventKey: eventKey(['session_large_meta', 'turn_large_meta', 'implicit-question']),
+        kind: 'needs_attention',
+        reason: 'question',
+        projectName: 'power-trader-edu',
+        taskName: '生成宣传讲解 HTML PPT',
+      }));
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
   it.each([
     ['router', ['router.resume', 'router.stop']],
     ['socket', ['router.resume', 'socket.start', 'socket.stop', 'router.stop']],
