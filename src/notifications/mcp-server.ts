@@ -20,11 +20,23 @@ const TOOLS = [
       required: ['reason'],
       additionalProperties: false,
     },
+    annotations: {
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
   },
   {
     name: 'mark_completed',
     description: 'Report that the main Codex task has been fully completed and delivered.',
     inputSchema: { type: 'object', properties: {}, additionalProperties: false },
+    annotations: {
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
   },
 ];
 

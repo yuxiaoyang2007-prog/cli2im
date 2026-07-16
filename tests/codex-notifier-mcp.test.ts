@@ -8,6 +8,16 @@ describe('codex-task-notifier MCP server', () => {
     });
     const listed = handleMcpMessage({ jsonrpc: '2.0', id: 2, method: 'tools/list' }) as any;
     expect(listed.result.tools.map((tool: any) => tool.name)).toEqual(['mark_waiting', 'mark_completed']);
+    expect(listed.result.tools).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        annotations: {
+          readOnlyHint: true,
+          destructiveHint: false,
+          idempotentHint: true,
+          openWorldHint: false,
+        },
+      }),
+    ]));
   });
 
   it('validates waiting and completed arguments', () => {
