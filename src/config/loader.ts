@@ -132,6 +132,12 @@ function validateConfig(config: AppConfig): void {
     if (config.bots[codex.botName].platform !== 'feishu') {
       throw new Error('Config error: notifications.codex.botName must use the feishu platform');
     }
+    codex.completionSource ??= 'legacy';
+    if (codex.completionSource !== 'legacy' && codex.completionSource !== 'structured') {
+      throw new Error(
+        'Config error: notifications.codex.completionSource must be "legacy" or "structured"',
+      );
+    }
   }
   if (config.sandboxExtraRoots != null) {
     if (!Array.isArray(config.sandboxExtraRoots)) {

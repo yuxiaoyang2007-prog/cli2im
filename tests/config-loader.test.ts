@@ -69,8 +69,11 @@ notifications:
   codex:
     enabled: true
     botName: codexbot
+    completionSource: structured
 `);
-    expect(config.notifications?.codex).toEqual({ enabled: true, botName: 'codexbot' });
+    expect(config.notifications?.codex).toEqual({
+      enabled: true, botName: 'codexbot', completionSource: 'structured',
+    });
   });
 
   it('keeps the sample config internally valid for Codex notifications', () => {
@@ -97,6 +100,23 @@ notifications:
     enabled: ${field === 'enabled' ? value : 'true'}
     botName: ${field === 'botName' ? JSON.stringify(value) : 'codexbot'}
 `)).toThrow('Config error: notifications.codex');
+  });
+
+  it('defaults the Codex completion source to legacy and rejects unknown modes', () => {
+    const legacy = loadNotificationFixture(`
+notifications:
+  codex:
+    enabled: true
+    botName: codexbot
+`);
+    expect(legacy.notifications?.codex.completionSource).toBe('legacy');
+    expect(() => loadNotificationFixture(`
+notifications:
+  codex:
+    enabled: true
+    botName: codexbot
+    completionSource: heuristic
+`)).toThrow('Config error: notifications.codex.completionSource');
   });
 
   it('rejects a Codex notification bot name that does not exist', () => {

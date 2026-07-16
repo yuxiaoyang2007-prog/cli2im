@@ -167,6 +167,7 @@ notifications:
   codex:
     enabled: true
     botName: codexbot
+    completionSource: structured
 
 # ----------------------------------------------------------
 # Content guard — optional content safety filtering

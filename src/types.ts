@@ -292,6 +292,7 @@ export interface AgentConfig {
 export interface CodexNotificationConfig {
   enabled: boolean;
   botName: string;
+  completionSource: 'legacy' | 'structured';
 }
 
 export interface AppConfig {

@@ -16,6 +16,9 @@ import {
 import { CodexEventMonitor, type CodexMonitorDelivery } from './monitor.js';
 import { NotificationRouter } from './router.js';
 import { CodexNotificationSocket } from './socket-server.js';
+import type { StructuredLifecycleEvent } from './lifecycle-protocol.js';
+import { CodexNotificationOutbox } from './outbox.js';
+import { StructuredLifecycleService } from './structured-lifecycle.js';
 import type { CodexNotificationEvent, NotificationBinding } from './types.js';
 
 interface NotificationLifecycle {
@@ -45,12 +48,15 @@ type RolloutHandler = (
 ) => void | Promise<void>;
 
 type ApprovalHandler = (event: PermissionHookEvent) => void | Promise<void>;
+type StructuredHandler = (event: StructuredLifecycleEvent) => unknown | Promise<unknown>;
 
 export interface CodexNotificationServiceDependencies {
   router?: NotificationEventRouter;
   metadataResolver?: MetadataResolver;
   createMonitor?: (handler: RolloutHandler) => NotificationLifecycle;
   createSocket?: (handler: ApprovalHandler) => NotificationLifecycle;
+  createStructuredSocket?: (handler: StructuredHandler) => NotificationLifecycle;
+  createOutbox?: (handler: StructuredHandler) => NotificationLifecycle;
   readContextFile?: (filePath: string) => Promise<string>;
   findContextFile?: (sessionsDir: string, sessionId: string) => Promise<string | undefined>;
 }
@@ -61,6 +67,7 @@ export interface CodexNotificationServiceOptions {
   sessionsDir: string;
   sessionIndexPath: string;
   socketPath: string;
+  completionSource?: 'legacy' | 'structured';
   store: SessionStore;
   resolveAdapter: (botName: string) => PlatformAdapter | undefined;
   timeZone: string;
@@ -100,6 +107,9 @@ export class CodexNotificationService {
   private readonly metadataResolver: MetadataResolver;
   private readonly monitor: NotificationLifecycle;
   private readonly socket: NotificationLifecycle;
+  private readonly outbox?: NotificationLifecycle;
+  private readonly completionSource: 'legacy' | 'structured';
+  private readonly structuredLifecycle: StructuredLifecycleService;
   private readonly readContextFile: (filePath: string) => Promise<string>;
   private readonly findContextFile: (
     sessionsDir: string,
@@ -116,6 +126,7 @@ export class CodexNotificationService {
     this.sessionsDir = options.sessionsDir;
     this.store = options.store;
     this.now = options.now ?? Date.now;
+    this.completionSource = options.completionSource ?? 'legacy';
     this.readContextFile = options.dependencies?.readContextFile ?? readRolloutContextWindow;
     this.findContextFile = options.dependencies?.findContextFile ?? findSessionRollout;
 
@@ -131,6 +142,10 @@ export class CodexNotificationService {
     });
     this.metadataResolver = options.dependencies?.metadataResolver
       ?? new NotificationMetadataResolver({ codexDir: dirname(options.sessionIndexPath) });
+    this.structuredLifecycle = new StructuredLifecycleService({
+      store: options.store,
+      router: this.router,
+    });
     this.monitor = options.dependencies?.createMonitor?.(
       (event, filePath, delivery) => this.handleRolloutEvent(event, filePath, delivery),
     ) ?? new CodexEventMonitor({
@@ -138,12 +153,25 @@ export class CodexNotificationService {
       store: options.store,
       onEvent: (event, filePath, delivery) => this.handleRolloutEvent(event, filePath, delivery),
     });
-    this.socket = options.dependencies?.createSocket?.(
-      (event) => this.handleApprovalEvent(event),
-    ) ?? new CodexNotificationSocket({
-      socketPath: options.socketPath,
-      onApproval: (event) => this.handleApprovalEvent(event),
-    });
+    if (this.completionSource === 'structured') {
+      const handler = (event: StructuredLifecycleEvent) => this.structuredLifecycle.handle(event);
+      this.socket = options.dependencies?.createStructuredSocket?.(handler)
+        ?? new CodexNotificationSocket({
+          socketPath: options.socketPath,
+          onEvent: async (event) => {
+            if (event.type !== 'approval') await handler(event);
+          },
+        });
+      this.outbox = options.dependencies?.createOutbox?.(handler)
+        ?? new CodexNotificationOutbox({ dataRoot: dirname(options.socketPath), handle: handler });
+    } else {
+      this.socket = options.dependencies?.createSocket?.(
+        (event) => this.handleApprovalEvent(event),
+      ) ?? new CodexNotificationSocket({
+        socketPath: options.socketPath,
+        onApproval: (event) => this.handleApprovalEvent(event),
+      });
+    }
   }
 
   async start(): Promise<void> {
@@ -155,6 +183,7 @@ export class CodexNotificationService {
       await this.router.resumePending();
       socketAttempted = true;
       await this.socket.start();
+      if (this.outbox) await this.outbox.start();
       monitorAttempted = true;
       await this.monitor.start();
       console.log('[notifications] healthy router=ready socket=ready monitor=ready');
@@ -192,6 +221,7 @@ export class CodexNotificationService {
     }
     if (components.socket) {
       stops.push(runLifecycleStep('socket stop', () => this.socket.stop()));
+      if (this.outbox) stops.push(runLifecycleStep('outbox stop', () => this.outbox?.stop()));
     }
     if (components.router) {
       stops.push(runLifecycleStep('router stop', () => this.router.stop()));
@@ -226,6 +256,11 @@ export class CodexNotificationService {
       delivery?.mode === 'startup-catchup' ? 'gap-free' : 'live',
     );
     const notificationAllowed = delivery?.notificationAllowed ?? true;
+
+    if (this.completionSource === 'structured' && event.type === 'completed') {
+      this.releaseTurnContext(filePath, context, event.turnId);
+      return;
+    }
 
     if (event.type === 'question') {
       if (!notificationAllowed) return;
@@ -503,7 +538,7 @@ async function findSessionRollout(
 }
 
 async function runLifecycleStep(
-  label: 'router resume' | 'socket start' | 'monitor start' | 'monitor stop' | 'socket stop' | 'router stop',
+  label: 'router resume' | 'socket start' | 'monitor start' | 'monitor stop' | 'socket stop' | 'outbox stop' | 'router stop',
   operation: () => void | Promise<void>,
 ): Promise<void> {
   try {

@@ -6,6 +6,10 @@ import {
   type Socket,
 } from 'node:net';
 import type { PermissionHookEvent } from './codex-events.js';
+import {
+  parseStructuredLifecycleEvent,
+  type StructuredLifecycleEvent,
+} from './lifecycle-protocol.js';
 import { dirname } from 'node:path';
 import { ensurePrivateDirectorySync } from '../util/data-dir.js';
 
@@ -16,12 +20,13 @@ type SocketServerState = 'stopped' | 'starting' | 'started' | 'stopping';
 
 export interface CodexNotificationSocketOptions {
   socketPath: string;
-  onApproval: (event: PermissionHookEvent) => void | Promise<void>;
+  onApproval?: (event: PermissionHookEvent) => void | Promise<void>;
+  onEvent?: (event: PermissionHookEvent | StructuredLifecycleEvent) => void | Promise<void>;
 }
 
 export class CodexNotificationSocket {
   private readonly socketPath: string;
-  private readonly onApproval: CodexNotificationSocketOptions['onApproval'];
+  private readonly onEvent: NonNullable<CodexNotificationSocketOptions['onEvent']>;
   private readonly activeSockets = new Set<Socket>();
   private readonly pendingCallbacks = new Set<Promise<void>>();
   private server: Server | null = null;
@@ -33,7 +38,14 @@ export class CodexNotificationSocket {
 
   constructor(options: CodexNotificationSocketOptions) {
     this.socketPath = options.socketPath;
-    this.onApproval = options.onApproval;
+    if (options.onEvent) {
+      this.onEvent = options.onEvent;
+    } else if (options.onApproval) {
+      const onApproval = options.onApproval;
+      this.onEvent = (event) => event.type === 'approval' ? onApproval(event) : undefined;
+    } else {
+      throw new Error('Codex notification socket requires an event handler');
+    }
   }
 
   async start(): Promise<void> {
@@ -177,10 +189,10 @@ export class CodexNotificationSocket {
       return;
     }
 
-    const approval = parsePermissionHookEvent(input);
-    if (!approval) return;
+    const event = parseStructuredLifecycleEvent(input) ?? parsePermissionHookEvent(input);
+    if (!event) return;
     try {
-      await this.onApproval(approval);
+      await this.onEvent(event);
     } catch {
       // One callback failure must not affect the listening socket.
     }

@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { CodexNotificationSocket } from '../src/notifications/socket-server.js';
 import type { PermissionHookEvent } from '../src/notifications/codex-events.js';
+import type { StructuredLifecycleEvent } from '../src/notifications/lifecycle-protocol.js';
 
 const approvalInput = {
   hook_event_name: 'PermissionRequest',
@@ -96,6 +97,24 @@ describe('CodexNotificationSocket', () => {
     expect(onApproval).toHaveBeenCalledTimes(1);
     expect(onApproval).toHaveBeenCalledWith(approvalEvent);
     expect(JSON.stringify(onApproval.mock.calls)).not.toContain('synthetic private command');
+  });
+
+  it('forwards exact versioned structured lifecycle events', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'cli2im-notify-structured-'));
+    directories.push(directory);
+    const socketPath = join(directory, 'notify.sock');
+    const onEvent = vi.fn<(event: StructuredLifecycleEvent | PermissionHookEvent) => void>();
+    const socket = new CodexNotificationSocket({ socketPath, onEvent });
+    sockets.push(socket);
+    await socket.start();
+    const event: StructuredLifecycleEvent = {
+      version: 1, type: 'status_tool', eventKey: 'event_1', sessionId: 'session_1',
+      turnId: 'turn_1', toolUseId: 'tool_1', status: 'completed', occurredAt: 1_000,
+    };
+
+    await send(socketPath, Buffer.from(`${JSON.stringify(event)}\n`));
+
+    expect(onEvent).toHaveBeenCalledWith(event);
   });
 
   it('rejects raw hook objects and canonical objects with extra fields', async () => {

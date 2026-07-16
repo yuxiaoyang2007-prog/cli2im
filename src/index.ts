@@ -206,6 +206,7 @@ async function main(): Promise<void> {
       sessionsDir: join(codexDir, 'sessions'),
       sessionIndexPath: join(codexDir, 'session_index.jsonl'),
       socketPath: join(homedir(), '.cli2im', 'codex-notify.sock'),
+      completionSource: codexNotificationConfig.completionSource,
       store,
       resolveAdapter: (botName) => adapters.get(botName),
       timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC',
