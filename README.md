@@ -425,6 +425,20 @@ cli2im/
 
 ## Development
 
+### Accurate Codex task notifications
+
+`codex-task-notifier` uses Codex lifecycle Hooks and two explicit MCP status tools. It sends an orange Feishu card for approval, confirmation, or a blocking question, and a green card only after the main task explicitly reports verified completion. JSONL `task_complete` is ignored in structured mode, so a turn that merely asks the user to choose a plan cannot be mistaken for finished work.
+
+Build and install the personal plugin:
+
+```bash
+npm run build
+./scripts/install-codex-task-notifier.sh
+codex plugin add codex-task-notifier@personal
+```
+
+Set `notifications.codex.completionSource: structured` in `~/.cli2im/config.yaml`, then restart the bridge. The installer does not change `~/.codex/config.toml`; native Codex notifications remain enabled.
+
 ```bash
 npm run dev          # Run with tsx (hot reload)
 npm test             # Run all 458 tests
