@@ -159,7 +159,7 @@ function base<T extends StructuredLifecycleEvent['type'], E extends Record<strin
     turnId,
     occurredAt,
     ...extra,
-  } as Extract<StructuredLifecycleEvent, { type: T }>;
+  } as unknown as Extract<StructuredLifecycleEvent, { type: T }>;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
