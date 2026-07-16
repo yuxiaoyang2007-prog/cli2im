@@ -1,7 +1,9 @@
 # Codex 全局飞书通知设计
 
 日期：2026-07-15  
-状态：已完成对话确认，待书面复核
+状态：已废弃，由 `2026-07-16-codex-structured-feishu-notifications-design.md` 取代
+
+> 本文把 Codex JSONL 中的 `task_complete` 当成业务任务完成。生产验证证明该假设错误：`task_complete` 只表示当前回合结束。后续实现以 2026-07-16 的结构化状态协议设计为准。
 
 ## 1. 目标
 
