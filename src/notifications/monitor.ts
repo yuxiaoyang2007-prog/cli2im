@@ -35,6 +35,7 @@ const MAX_LINE_BYTES = 1024 * 1024;
 const WATCH_COALESCE_MS = 25;
 const REPLACEMENT_QUIET_MS = 250;
 const ACTIVE_POLL_MS = 500;
+const STARTUP_SETTLE_SCAN_MS = 50;
 
 export interface CodexEventMonitorOptions {
   sessionsDir: string;
@@ -63,6 +64,7 @@ export class CodexEventMonitor {
   private readonly generations = new Map<string, TrackedGeneration>();
   private readonly startupPaths = new Map<string, StartupPathClassification>();
   private watcher: FSWatcher | null = null;
+  private startupSettleTimer: ReturnType<typeof setTimeout> | null = null;
   private state: MonitorState = 'stopped';
   private startPromise: Promise<void> | null = null;
   private stopPromise: Promise<void> | null = null;
@@ -148,6 +150,11 @@ export class CodexEventMonitor {
       }
       this.state = 'started';
       this.startupPaths.clear();
+      this.startupSettleTimer = setTimeout(() => {
+        this.startupSettleTimer = null;
+        if (this.state !== 'started') return;
+        void this.discoverFiles().catch(() => undefined);
+      }, STARTUP_SETTLE_SCAN_MS);
     } catch (error) {
       watcher?.close();
       if (this.watcher === watcher) this.watcher = null;
@@ -181,6 +188,8 @@ export class CodexEventMonitor {
     }
     this.watcher?.close();
     this.watcher = null;
+    if (this.startupSettleTimer) clearTimeout(this.startupSettleTimer);
+    this.startupSettleTimer = null;
     for (const timer of this.watcherTimers.values()) clearTimeout(timer);
     this.watcherTimers.clear();
     for (const timer of this.replacementTimers.values()) clearTimeout(timer);
