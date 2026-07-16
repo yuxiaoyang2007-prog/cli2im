@@ -22,6 +22,8 @@ import type {
   CodexNotificationEvent,
   NotificationBinding,
   NotificationCursor,
+  StoredCodexTask,
+  StoredCodexTaskState,
   StoredNotificationDelivery,
 } from '../notifications/types.js';
 
@@ -146,6 +148,24 @@ export class SessionStore {
       )
     `);
     const deliverySchemaMigrated = ensureNotificationDeliveryColumns(db);
+
+    db.run(`
+      CREATE TABLE IF NOT EXISTS notification_tasks (
+        task_id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL,
+        first_turn_id TEXT NOT NULL,
+        current_turn_id TEXT NOT NULL,
+        project_name TEXT NOT NULL,
+        task_name TEXT NOT NULL,
+        state TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      )
+    `);
+    db.run(`
+      CREATE INDEX IF NOT EXISTS idx_notification_tasks_session_updated
+      ON notification_tasks(session_id, updated_at)
+    `);
 
     const store = new SessionStore(db, dbPath);
     if (openedExistingSnapshot) {
@@ -306,6 +326,51 @@ export class SessionStore {
       userId: row.user_id as string,
       updatedAt: row.updated_at as number,
     };
+  }
+
+  async upsertCodexTask(task: StoredCodexTask): Promise<void> {
+    assertCodexTask(task);
+    this.db.run(
+      `INSERT INTO notification_tasks
+         (task_id, session_id, first_turn_id, current_turn_id, project_name, task_name, state, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(task_id) DO UPDATE SET
+         current_turn_id = excluded.current_turn_id,
+         project_name = excluded.project_name,
+         task_name = excluded.task_name,
+         state = excluded.state,
+         updated_at = excluded.updated_at`,
+      [
+        task.taskId,
+        task.sessionId,
+        task.firstTurnId,
+        task.currentTurnId,
+        task.projectName,
+        task.taskName,
+        task.state,
+        task.createdAt,
+        task.updatedAt,
+      ],
+    );
+    this.save();
+  }
+
+  async getCodexTask(taskId: string): Promise<StoredCodexTask | null> {
+    const stmt = this.db.prepare('SELECT * FROM notification_tasks WHERE task_id = ?');
+    stmt.bind([taskId]);
+    const task = stmt.step() ? rowToCodexTask(stmt.getAsObject()) : null;
+    stmt.free();
+    return task;
+  }
+
+  async getLatestCodexTask(sessionId: string): Promise<StoredCodexTask | null> {
+    const stmt = this.db.prepare(
+      'SELECT * FROM notification_tasks WHERE session_id = ? ORDER BY updated_at DESC LIMIT 1',
+    );
+    stmt.bind([sessionId]);
+    const task = stmt.step() ? rowToCodexTask(stmt.getAsObject()) : null;
+    stmt.free();
+    return task;
   }
 
   async getNotificationCursor(filePath: string): Promise<NotificationCursor | null> {
@@ -561,6 +626,48 @@ export class SessionStore {
 function databaseBackupPath(dbPath: string): string {
   return `${dbPath}.bak`;
 }
+
+const CODEX_TASK_STATES = new Set<StoredCodexTaskState>([
+  'RUNNING',
+  'WAITING_APPROVAL',
+  'WAITING_QUESTION',
+  'COMPLETED',
+  'ENDED_UNREPORTED',
+  'CANCELLED',
+]);
+
+function assertCodexTask(task: StoredCodexTask): void {
+  if (
+    !task.taskId
+    || !task.sessionId
+    || !task.firstTurnId
+    || !task.currentTurnId
+    || !task.projectName
+    || !task.taskName
+    || !CODEX_TASK_STATES.has(task.state)
+    || !Number.isFinite(task.createdAt)
+    || !Number.isFinite(task.updatedAt)
+  ) {
+    throw new Error('Invalid Codex task');
+  }
+}
+
+function rowToCodexTask(row: Record<string, unknown>): StoredCodexTask {
+  const task = {
+    taskId: row.task_id as string,
+    sessionId: row.session_id as string,
+    firstTurnId: row.first_turn_id as string,
+    currentTurnId: row.current_turn_id as string,
+    projectName: row.project_name as string,
+    taskName: row.task_name as string,
+    state: row.state as StoredCodexTaskState,
+    createdAt: row.created_at as number,
+    updatedAt: row.updated_at as number,
+  };
+  assertCodexTask(task);
+  return task;
+}
+
 
 function hardenDatabaseSnapshotModes(dbPath: string): void {
   const directory = dirname(dbPath);

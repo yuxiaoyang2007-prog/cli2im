@@ -53,3 +53,23 @@ export interface StoredNotificationDelivery {
   acknowledgedAt: number | null;
   delayedPatchCompletedAt: number | null;
 }
+
+export type StoredCodexTaskState =
+  | 'RUNNING'
+  | 'WAITING_APPROVAL'
+  | 'WAITING_QUESTION'
+  | 'COMPLETED'
+  | 'ENDED_UNREPORTED'
+  | 'CANCELLED';
+
+export interface StoredCodexTask {
+  taskId: string;
+  sessionId: string;
+  firstTurnId: string;
+  currentTurnId: string;
+  projectName: string;
+  taskName: string;
+  state: StoredCodexTaskState;
+  createdAt: number;
+  updatedAt: number;
+}
