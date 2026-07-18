@@ -83,6 +83,19 @@ bots:
   #   permissionMode: blacklist         # blacklist → build mode → tools ask approval via card buttons
                                         # bypass → yolo mode → no approval prompts at all
 
+  # --- Example: Kimi Work (desktop Work quota, text-only) on Feishu ---
+  # kimibot:
+  #   agent: kimi-work
+  #   platform: feishu
+  #   feishu:
+  #     appId: ${KIMI_FEISHU_APP_ID}
+  #     appSecret: ${KIMI_FEISHU_APP_SECRET}
+  #   workingDirectory: ~/projects
+  #   allowFrom:
+  #     - ou_xxxxxxxxxxxx
+  #   permissionMode: blacklist         # default: dangerous tools ask via IM approval
+                                        # bypass explicitly auto-allows daemon approvals
+
 # ----------------------------------------------------------
 # Agents — CLI binaries that bots can spawn.
 # Only define the agents you have installed.
@@ -111,6 +124,19 @@ agents:
       # zcode reads its own config; usually nothing extra is needed.
       # Keep PATH so it can find tools it spawns (git, ripgrep, ...).
       PATH: ${PATH}
+
+  # Kimi desktop Work agent. This launches the bundled daimon with its own
+  # share/config paths, so it does not contend with the running Kimi desktop
+  # instance. k3-agent uses the desktop Work entitlement, not kimi-code CLI.
+  # First release is text-only and does not support cross-restart resume.
+  # kimi-work:
+  #   binary: /Applications/Kimi.app/Contents/Resources/resources/daimon-bundle/bin/kimi-daimon
+  #   defaultModel: k3-agent
+  #   defaultEffort: low                # low | high | max
+  #   env:
+  #     KIMI_SHARE_DIR: ~/.cli2im/kimi-work
+  #     DAIMON_CONFIG_PATH: ~/.cli2im/kimi-work/config.json
+  #     DAIMON_BUNDLE_NODE_BIN: /Applications/Kimi.app/Contents/Resources/resources/runtime/node
 
 # ----------------------------------------------------------
 # Session management

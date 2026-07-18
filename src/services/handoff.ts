@@ -1,4 +1,11 @@
-import type { SessionKey, HandoffRequest, HandoffResult, HandoffRelease, Session } from '../types.js';
+import type {
+  AgentCapabilities,
+  SessionKey,
+  HandoffRequest,
+  HandoffResult,
+  HandoffRelease,
+  Session,
+} from '../types.js';
 
 export interface HandoffDeps {
   spawnResume: (
@@ -9,7 +16,16 @@ export interface HandoffDeps {
   ) => Promise<{ pid: number; sessionId: string }>;
   getSession: (sessionKey: SessionKey) => Promise<Session | null>;
   updateState: (sessionId: string, state: Session['state']) => Promise<void>;
+  getAgentCapabilities?: (agentName: string) => Pick<AgentCapabilities, 'sessionResume'> | undefined;
+  getBotAgent?: (botName: string) => string | undefined;
 }
+
+export interface AcceptHandoffOptions {
+  lockAlreadyAcquired?: boolean;
+  beforeProceed?: () => void | Promise<void>;
+}
+
+const UNSUPPORTED_HANDOFF = '该 agent 不支持会话恢复/交接';
 
 export class HandoffService {
   private deps: HandoffDeps;
@@ -36,10 +52,14 @@ export class HandoffService {
     this.locks.delete(sessionKey);
   }
 
-  async acceptHandoff(req: HandoffRequest, opts?: { lockAlreadyAcquired?: boolean }): Promise<HandoffResult> {
+  async acceptHandoff(req: HandoffRequest, opts?: AcceptHandoffOptions): Promise<HandoffResult> {
     const chatId = req.chatId ?? 'default';
     const platform = req.platform ?? 'feishu';
     const sessionKey: SessionKey = `${platform}:${chatId}:${req.botName}`;
+
+    if (this.deps.getAgentCapabilities?.(req.agentName)?.sessionResume === false) {
+      return { success: false, error: UNSUPPORTED_HANDOFF };
+    }
 
     const lockAlreadyAcquired = opts?.lockAlreadyAcquired === true;
     if (lockAlreadyAcquired && !this.locks.has(sessionKey)) {
@@ -51,6 +71,7 @@ export class HandoffService {
     }
 
     try {
+      await opts?.beforeProceed?.();
       await this.deps.spawnResume(sessionKey, req.agentName, req.sessionId, req.workDir);
       return { success: true };
     } catch (err) {
@@ -64,6 +85,12 @@ export class HandoffService {
   }
 
   async releaseHandoff(sessionKey: SessionKey): Promise<HandoffRelease> {
+    const botName = sessionKey.split(':')[2];
+    const currentAgent = this.deps.getBotAgent?.(botName);
+    if (currentAgent && this.deps.getAgentCapabilities?.(currentAgent)?.sessionResume === false) {
+      throw new Error(UNSUPPORTED_HANDOFF);
+    }
+
     const session = await this.deps.getSession(sessionKey);
     if (!session) {
       throw new Error('No active session to release');

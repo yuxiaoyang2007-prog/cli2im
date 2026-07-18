@@ -64,10 +64,6 @@ export async function handleCLISessionResume(params: {
     }
 
     const agentName = botConfig.agent;
-    agentManager.cancelAgent(sessionKey);
-    params.cardController?.interruptCard(sessionKey);
-    params.tgStreamController?.interrupt(sessionKey);
-
     const result = await handoffService.acceptHandoff({
       botName,
       sessionId: resume.sessionId,
@@ -75,7 +71,14 @@ export async function handleCLISessionResume(params: {
       agentName,
       chatId: callback.chatId,
       platform: callback.platform,
-    }, { lockAlreadyAcquired: true });
+    }, {
+      lockAlreadyAcquired: true,
+      beforeProceed: () => {
+        agentManager.cancelAgent(sessionKey);
+        params.cardController?.interruptCard(sessionKey);
+        params.tgStreamController?.interrupt(sessionKey);
+      },
+    });
 
     if (!result.success) {
       await adapter.send(callback.chatId, { text: `Resume failed: ${result.error}` });

@@ -1557,6 +1557,25 @@ describe('AgentManager', () => {
   });
 });
 
+describe('AgentManager plugin shutdown', () => {
+  it('awaits every registered plugin shutdown hook', async () => {
+    const manager = new AgentManager(new ToolGate([]), () => {});
+    const first = createMockPlugin();
+    const second = createMockPlugin();
+    first.name = 'first';
+    second.name = 'second';
+    first.shutdown = vi.fn().mockResolvedValue(undefined);
+    second.shutdown = vi.fn().mockResolvedValue(undefined);
+    manager.registerPlugin(first);
+    manager.registerPlugin(second);
+
+    await manager.shutdownPlugins();
+
+    expect(first.shutdown).toHaveBeenCalledTimes(1);
+    expect(second.shutdown).toHaveBeenCalledTimes(1);
+  });
+});
+
 function assistantText(text: string, model = 'claude-sonnet-4-20250514'): SDKMessage {
   return {
     type: 'assistant',

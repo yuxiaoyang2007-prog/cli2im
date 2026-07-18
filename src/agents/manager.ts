@@ -88,6 +88,10 @@ export class AgentManager {
     return [...this.plugins.keys()];
   }
 
+  async shutdownPlugins(): Promise<void> {
+    await Promise.all([...this.plugins.values()].map((plugin) => plugin.shutdown?.()));
+  }
+
   async spawnAgent(
     sessionKey: SessionKey,
     agentName: string,

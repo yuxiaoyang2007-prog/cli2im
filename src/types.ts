@@ -58,6 +58,7 @@ export interface AgentPlugin {
   formatStdinMessage(msg: UserMessage): string;
   formatPermissionResponse(requestId: string, decision: 'allow' | 'deny'): string;
   formatCancelMessage?(): string;
+  shutdown?(): Promise<void>;
   capabilities: AgentCapabilities;
 }
 

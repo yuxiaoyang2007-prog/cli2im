@@ -116,7 +116,10 @@ describe('handleCLISessionResume', () => {
     });
 
     expect(handoffService.acceptHandoff).toHaveBeenCalledTimes(1);
-    expect(handoffService.acceptHandoff).toHaveBeenCalledWith(expect.any(Object), { lockAlreadyAcquired: true });
+    expect(handoffService.acceptHandoff).toHaveBeenCalledWith(expect.any(Object), {
+      lockAlreadyAcquired: true,
+      beforeProceed: expect.any(Function),
+    });
     expect(handoffService.releaseLock).toHaveBeenCalledWith('feishu:chat_1:ccbot');
     expect(store.getOrCreate).toHaveBeenCalledTimes(1);
     expect(store.updateWorkingDirectory).toHaveBeenCalledWith('session_row_1', '/Users/test/project');
@@ -125,7 +128,7 @@ describe('handleCLISessionResume', () => {
     });
   });
 
-  it('cancels the old active process after acquiring the handoff lock', async () => {
+  it('cancels the old active process from the gated beforeProceed callback', async () => {
     const store = storeDeps();
     const cancelAgent = vi.fn();
     const handoffService = handoffDeps({ success: true });
@@ -149,8 +152,8 @@ describe('handleCLISessionResume', () => {
     expect(handoffService.tryAcquireLock.mock.invocationCallOrder[0]).toBeLessThan(
       cancelAgent.mock.invocationCallOrder[0],
     );
-    expect(cancelAgent.mock.invocationCallOrder[0]).toBeLessThan(
-      handoffService.acceptHandoff.mock.invocationCallOrder[0],
+    expect(handoffService.acceptHandoff.mock.invocationCallOrder[0]).toBeLessThan(
+      cancelAgent.mock.invocationCallOrder[0],
     );
   });
 
@@ -249,7 +252,52 @@ describe('handleCLISessionResume', () => {
     expect(handoffService.acceptHandoff).toHaveBeenCalledWith(expect.objectContaining({
       workDir: '/Users/test/project',
       agentName: 'codex',
-    }), { lockAlreadyAcquired: true });
+    }), {
+      lockAlreadyAcquired: true,
+      beforeProceed: expect.any(Function),
+    });
+  });
+
+  it('does not cancel, interrupt, spawn, or write the store when capability gating rejects resume', async () => {
+    const store = storeDeps();
+    const cancelAgent = vi.fn();
+    const cardController = { interruptCard: vi.fn() };
+    const tgStreamController = { interrupt: vi.fn() };
+    const spawnResume = vi.fn();
+    const handoffService = new HandoffService({
+      spawnResume,
+      getSession: vi.fn().mockResolvedValue(null),
+      updateState: vi.fn().mockResolvedValue(undefined),
+      getAgentCapabilities: vi.fn().mockReturnValue({ sessionResume: false }),
+      getBotAgent: vi.fn().mockReturnValue('kimi-work'),
+    });
+    const adapter = { send: vi.fn().mockResolvedValue('msg_1') };
+
+    await handleCLISessionResume({
+      callback: callback(),
+      resume: { sessionId: 'old-session', cwd: '/Users/test/project' },
+      botName: 'kimibot',
+      botConfig: botConfig({ agent: 'kimi-work' }),
+      adapter,
+      store,
+      agentManager: { cancelAgent },
+      handoffService,
+      cardController,
+      tgStreamController,
+    });
+
+    expect(adapter.send).toHaveBeenCalledWith('chat_1', {
+      text: 'Resume failed: 该 agent 不支持会话恢复/交接',
+    });
+    expect(cancelAgent).not.toHaveBeenCalled();
+    expect(cardController.interruptCard).not.toHaveBeenCalled();
+    expect(tgStreamController.interrupt).not.toHaveBeenCalled();
+    expect(spawnResume).not.toHaveBeenCalled();
+    expect(store.getOrCreate).not.toHaveBeenCalled();
+    expect(store.updateAgentSessionId).not.toHaveBeenCalled();
+    expect(store.updateWorkingDirectory).not.toHaveBeenCalled();
+    expect(store.updateState).not.toHaveBeenCalled();
+    expect(store.touch).not.toHaveBeenCalled();
   });
 });
 
@@ -290,7 +338,10 @@ function handoffDeps(result: { success: boolean; error?: string }) {
   return {
     tryAcquireLock: vi.fn().mockReturnValue(true),
     releaseLock: vi.fn(),
-    acceptHandoff: vi.fn().mockResolvedValue(result),
+    acceptHandoff: vi.fn(async (_req: unknown, opts?: { beforeProceed?: () => void | Promise<void> }) => {
+      if (result.success) await opts?.beforeProceed?.();
+      return result;
+    }),
   };
 }
 
@@ -305,7 +356,10 @@ function lockingHandoffDeps(result: { success: boolean; error?: string }) {
     releaseLock: vi.fn((sessionKey: SessionKey) => {
       locks.delete(sessionKey);
     }),
-    acceptHandoff: vi.fn().mockResolvedValue(result),
+    acceptHandoff: vi.fn(async (_req: unknown, opts?: { beforeProceed?: () => void | Promise<void> }) => {
+      if (result.success) await opts?.beforeProceed?.();
+      return result;
+    }),
   };
 }
 

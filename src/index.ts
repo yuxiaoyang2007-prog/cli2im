@@ -12,6 +12,7 @@ import { CodexPlugin } from './agents/codex.js';
 import { GeminiPlugin } from './agents/gemini.js';
 import { AgyPlugin } from './agents/agy.js';
 import { ZcodePlugin } from './agents/zcode.js';
+import { KimiWorkPlugin } from './agents/kimi-work.js';
 import { FeishuAdapter } from './platforms/feishu/adapter.js';
 import { TelegramAdapter } from './platforms/telegram/adapter.js';
 import { TelegramStreamController } from './platforms/telegram/stream.js';
@@ -169,6 +170,8 @@ async function main(): Promise<void> {
       agentManager.registerPlugin(new AgyPlugin(agentConfig.binary));
     } else if (name === 'zcode') {
       agentManager.registerPlugin(new ZcodePlugin(agentConfig.binary));
+    } else if (name === 'kimi-work') {
+      agentManager.registerPlugin(new KimiWorkPlugin(agentConfig));
     }
   }
 
@@ -248,6 +251,8 @@ async function main(): Promise<void> {
     ),
     getSession: async (sessionKey) => store.getByKey(sessionKey),
     updateState: async (id, state) => store.updateState(id, state),
+    getAgentCapabilities: (agentName) => agentManager.getPlugin(agentName)?.capabilities,
+    getBotAgent: (botName) => config.bots[botName]?.agent,
   });
 
   function createEventHandlers(sessionKey: SessionKey): AgentManagerEvents {
@@ -589,6 +594,7 @@ async function main(): Promise<void> {
     console.log('[cli2im] Shutting down...');
     await httpServer.stop();
     await notificationService?.stop();
+    await agentManager.shutdownPlugins();
     for (const adapter of adapters.values()) {
       await adapter.disconnect();
     }
