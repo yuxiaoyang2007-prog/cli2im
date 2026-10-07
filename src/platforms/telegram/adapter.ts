@@ -18,7 +18,7 @@ import {
   assertWithinAttachmentDownloadLimit,
   MAX_ATTACHMENT_DOWNLOAD_BYTES,
 } from '../../security/download-limits.js';
-import { scrubLog } from '../../security/logging.js';
+import { safeErrorFields } from '../../security/logging.js';
 
 export interface TelegramAdapterConfig {
   token: string;
@@ -28,6 +28,7 @@ export interface TelegramAdapterConfig {
 
 interface TelegramApiResponse<T> {
   ok: boolean;
+  error_code?: number;
   result?: T;
   description?: string;
 }
@@ -40,6 +41,7 @@ interface TelegramUpdate {
 
 interface TelegramMessage {
   message_id?: number;
+  message_thread_id?: number;
   chat?: {
     id?: number | string;
     type?: string;
@@ -99,6 +101,8 @@ export class TelegramAdapter implements PlatformAdapter {
   private offset = 0;
   private polling = false;
   private pollTimer?: ReturnType<typeof setTimeout>;
+  private pollGeneration = 0;
+  private pollController?: AbortController;
 
   constructor(config: TelegramAdapterConfig) {
     this.config = config;
@@ -106,13 +110,18 @@ export class TelegramAdapter implements PlatformAdapter {
   }
 
   async connect(): Promise<void> {
+    if (this.polling) return;
+    this.pollGeneration += 1;
     this.offset = this.readOffset();
     this.polling = true;
-    this.schedulePoll(0);
+    this.schedulePoll(0, this.pollGeneration);
   }
 
   async disconnect(): Promise<void> {
     this.polling = false;
+    this.pollGeneration += 1;
+    this.pollController?.abort();
+    this.pollController = undefined;
     if (this.pollTimer) {
       clearTimeout(this.pollTimer);
       this.pollTimer = undefined;
@@ -132,8 +141,9 @@ export class TelegramAdapter implements PlatformAdapter {
     const text = content.text ?? content.card?.content ?? '';
     const payload: Record<string, unknown> = {
       chat_id: chatId,
-      text: toTelegramMarkdownV2(text),
-      parse_mode: 'MarkdownV2',
+      text: content.plainText ? text : toTelegramMarkdownV2(text),
+      ...(content.plainText ? {} : { parse_mode: 'MarkdownV2' }),
+      ...telegramRoute({ ...options, threadId: content.threadId ?? options.threadId, replyToMessageId: content.replyToMessageId ?? options.replyToMessageId }),
     };
 
     if (content.card?.buttons?.length) {
@@ -185,6 +195,7 @@ export class TelegramAdapter implements PlatformAdapter {
     throwIfAborted(options.signal);
 
     form.append('chat_id', chatId);
+    appendTelegramRoute(form, options);
     form.append(field, blob, file.name);
     throwIfAborted(options.signal);
     await this.botApi(method, form, options);
@@ -195,6 +206,7 @@ export class TelegramAdapter implements PlatformAdapter {
     throwIfAborted(options.signal);
     const form = new FormData();
     form.append('chat_id', chatId);
+    appendTelegramRoute(form, options);
     form.append('voice', new Blob([audioBuffer as unknown as BlobPart], { type: 'audio/mpeg' }), 'voice.mp3');
     throwIfAborted(options.signal);
     await this.botApi('sendVoice', form, options);
@@ -212,7 +224,7 @@ export class TelegramAdapter implements PlatformAdapter {
       assertWithinAttachmentDownloadLimit(file.file_size, 'Telegram file');
     }
 
-    const resp = await fetch(
+    const resp = await telegramFetch(
       `https://api.telegram.org/file/bot${this.config.token}/${file.file_path}`,
       { signal: options.signal },
     );
@@ -228,25 +240,33 @@ export class TelegramAdapter implements PlatformAdapter {
     return responseToLimitedBuffer(resp, options.signal);
   }
 
-  private schedulePoll(delayMs: number): void {
-    if (!this.polling) return;
+  private isCurrentPoll(generation: number): boolean {
+    return this.polling && generation === this.pollGeneration;
+  }
+
+  private schedulePoll(delayMs: number, generation = this.pollGeneration): void {
+    if (!this.isCurrentPoll(generation)) return;
     if (this.pollTimer) clearTimeout(this.pollTimer);
     this.pollTimer = setTimeout(() => {
-      void this.pollOnce();
+      this.pollTimer = undefined;
+      void this.pollOnce(generation);
     }, delayMs);
   }
 
-  private async pollOnce(): Promise<void> {
-    if (!this.polling) return;
+  private async pollOnce(generation = this.pollGeneration): Promise<void> {
+    if (!this.isCurrentPoll(generation) || this.pollController) return;
+    const controller = new AbortController();
+    this.pollController = controller;
 
     try {
       const updates = await this.botApi<TelegramUpdate[]>('getUpdates', {
         offset: this.offset,
         timeout: 50,
         allowed_updates: ['message', 'callback_query'],
-      });
+      }, { signal: controller.signal });
 
       for (const update of updates) {
+        if (!this.isCurrentPoll(generation)) return;
         if (typeof update.update_id === 'number') {
           this.offset = update.update_id + 1;
           this.writeOffset(this.offset);
@@ -254,9 +274,12 @@ export class TelegramAdapter implements PlatformAdapter {
         this.dispatchUpdate(update);
       }
     } catch (err) {
-      console.error('Telegram polling failed:', scrubLog(this.scrubToken(err)));
+      if (this.isCurrentPoll(generation) && !controller.signal.aborted) {
+        console.error('Telegram polling failed:', safeErrorFields(err));
+      }
     } finally {
-      this.schedulePoll(1000);
+      if (this.pollController === controller) this.pollController = undefined;
+      this.schedulePoll(1000, generation);
     }
   }
 
@@ -279,11 +302,6 @@ export class TelegramAdapter implements PlatformAdapter {
     return !this.allowedUsers || this.allowedUsers.has(userId);
   }
 
-  private scrubToken(value: unknown): string {
-    const message = value instanceof Error ? value.message : String(value);
-    return message.split(this.config.token).join('<redacted-token>');
-  }
-
   private async botApi<T>(
     method: string,
     payload: Record<string, unknown> | FormData,
@@ -304,12 +322,17 @@ export class TelegramAdapter implements PlatformAdapter {
             signal: options.signal,
           };
 
-    const resp = await fetch(`https://api.telegram.org/bot${this.config.token}/${method}`, init);
+    const resp = await telegramFetch(`https://api.telegram.org/bot${this.config.token}/${method}`, init);
     throwIfAborted(options.signal);
-    const body = (await resp.json()) as TelegramApiResponse<T>;
+    let body: TelegramApiResponse<T>;
+    try {
+      body = (await resp.json()) as TelegramApiResponse<T>;
+    } catch {
+      throw new Error('Telegram returned an invalid response');
+    }
     if (!resp.ok || !body.ok) {
       throw new Error(
-        `Telegram ${method} failed: ${body.description ?? `HTTP ${resp.status}`}`,
+        `Telegram ${method} failed: HTTP ${resp.status}`,
       );
     }
 
@@ -334,8 +357,8 @@ export class TelegramAdapter implements PlatformAdapter {
 
   private writeOffset(offset: number): void {
     const path = this.offsetPath();
-    mkdirSync(join(homedir(), '.cli2im'), { recursive: true });
-    writeFileSync(path, JSON.stringify({ offset }, null, 2));
+    mkdirSync(join(homedir(), '.cli2im'), { recursive: true, mode: 0o700 });
+    writeFileSync(path, JSON.stringify({ offset }, null, 2), { mode: 0o600 });
   }
 }
 
@@ -385,6 +408,8 @@ export function parseTelegramUpdate(update: unknown): InboundMessage | null {
   return {
     platform: 'telegram',
     chatId: String(message.chat.id),
+    messageId,
+    threadId: message.message_thread_id === undefined ? undefined : String(message.message_thread_id),
     userId: String(message.from.id),
     userName: message.from.username ?? formatTelegramName(message.from),
     text,
@@ -412,6 +437,7 @@ export function parseTelegramCallback(update: unknown): CallbackQuery | null {
     chatType: callback.message?.chat?.type,
     data: callback.data,
     messageId: String(messageId),
+    threadId: callback.message?.message_thread_id === undefined ? undefined : String(callback.message.message_thread_id),
   };
 }
 
@@ -420,6 +446,29 @@ function largestPhoto(photos: TelegramPhotoSize[] | undefined): TelegramPhotoSiz
     if (!largest) return photo;
     return photoScore(photo) > photoScore(largest) ? photo : largest;
   }, undefined);
+}
+
+function telegramRoute(options: AbortableOptions): Record<string, unknown> {
+  return {
+    ...(options.threadId ? { message_thread_id: Number(options.threadId) } : {}),
+    ...(options.replyToMessageId ? { reply_parameters: { message_id: Number(options.replyToMessageId) } } : {}),
+  };
+}
+
+function appendTelegramRoute(form: FormData, options: AbortableOptions): void {
+  for (const [key, value] of Object.entries(telegramRoute(options))) {
+    form.append(key, typeof value === 'object' ? JSON.stringify(value) : String(value));
+  }
+}
+
+async function telegramFetch(url: string, options: RequestInit): Promise<Response> {
+  try {
+    return await fetch(url, options);
+  } catch (error) {
+    // Preserve cancellation semantics, but never attach a URL-bearing cause.
+    if (options.signal?.aborted) throw new DOMException('Operation aborted', 'AbortError');
+    throw Object.assign(new Error('Telegram network request failed'), safeErrorFields(error));
+  }
 }
 
 function photoScore(photo: TelegramPhotoSize): number {

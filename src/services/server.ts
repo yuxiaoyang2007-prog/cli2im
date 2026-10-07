@@ -4,9 +4,13 @@ import type { HandoffRequest } from '../types.js';
 import { validateWorkingDirectory } from '../security/validators.js';
 
 export interface ServerDeps {
-  acceptHandoff: (req: HandoffRequest) => Promise<{ success: boolean; error?: string }>;
+  captureHandoffReadiness?: (req: Record<string, unknown>) => () => void;
+  acceptHandoff: (req: HandoffRequest, ensureReady?: () => void) => Promise<{ success: boolean; error?: string }>;
   releaseHandoff: (sessionKey: string) => Promise<{ sessionId: string; resumeCommand: string }>;
   getStatus: () => { uptime: number; activeSessions: number; bots: string[] };
+  getBotStatus?: () => unknown;
+  controlBot?: (name: string, action: 'start' | 'stop' | 'restart') => Promise<void>;
+  doctor?: () => Promise<unknown>;
 }
 
 export interface HandoffValidationConfig {
@@ -43,11 +47,16 @@ export class HttpServer {
 
   async start(host: string, port: number): Promise<void> {
     this.server = createServer((req, res) => {
-      void this.handleRequest(req, res);
+      void this.handleRequest(req, res).catch(() => {
+        if (!res.headersSent) this.json(res, 500, { error: 'Request failed' });
+        else res.end();
+      });
     });
 
-    return new Promise((resolve) => {
+    return new Promise((resolve, reject) => {
+      this.server!.once('error', reject);
       this.server!.listen(port, host, () => {
+        this.server!.off('error', reject);
         console.log(`[server] HTTP server listening on ${host}:${port}`);
         resolve();
       });
@@ -65,7 +74,9 @@ export class HttpServer {
   }
 
   private async handleRequest(req: IncomingMessage, res: ServerResponse): Promise<void> {
-    const url = new URL(req.url ?? '/', `http://${req.headers.host}`);
+    let url: URL;
+    try { url = new URL(req.url ?? '/', 'http://localhost'); }
+    catch { this.json(res, 400, { error: 'Invalid request URL' }); return; }
     const path = url.pathname;
 
     if (path === '/health' && req.method === 'GET') {
@@ -80,8 +91,23 @@ export class HttpServer {
     }
 
     try {
+      if (path === '/api/bots' && req.method === 'GET' && this.deps.getBotStatus) {
+        this.json(res, 200, this.deps.getBotStatus()); return;
+      }
+      if (path === '/api/doctor' && req.method === 'GET' && this.deps.doctor) {
+        this.json(res, 200, await this.deps.doctor()); return;
+      }
+      if (path === '/api/bots' && req.method === 'POST' && this.deps.controlBot) {
+        const body = await this.readBody(req, 8192);
+        if (typeof body.name !== 'string' || !['start', 'stop', 'restart'].includes(String(body.action))) {
+          this.json(res, 400, { error: 'Expected name and action: start/stop/restart' }); return;
+        }
+        await this.deps.controlBot(body.name, body.action as 'start' | 'stop' | 'restart');
+        this.json(res, 200, { success: true }); return;
+      }
       if (path === '/api/handoff/accept' && req.method === 'POST') {
         const body = await this.readBody(req);
+        const ensureReady = this.deps.captureHandoffReadiness?.(body);
         const validationError = await validateHandoffRequestBody(body, this.handoffValidation);
         if (validationError) {
           this.json(res, 400, {
@@ -89,7 +115,10 @@ export class HttpServer {
           });
           return;
         }
-        const result = await this.deps.acceptHandoff(body as unknown as HandoffRequest);
+        ensureReady?.();
+        const result = ensureReady
+          ? await this.deps.acceptHandoff(body as unknown as HandoffRequest, ensureReady)
+          : await this.deps.acceptHandoff(body as unknown as HandoffRequest);
         this.json(res, result.success ? 200 : 400, result);
         return;
       }
@@ -116,7 +145,7 @@ export class HttpServer {
         this.json(res, err.status, { error: err.message });
         return;
       }
-      this.json(res, 500, { error: err instanceof Error ? err.message : String(err) });
+      this.json(res, 500, { error: 'Operation failed; check local diagnostics' });
     }
   }
 
@@ -187,6 +216,8 @@ export async function validateHandoffRequestBody(
       return 'Invalid platform';
     }
   }
+  if (body.threadId !== undefined && (typeof body.threadId !== 'string'
+    || !/^[A-Za-z0-9_-]{1,128}$/.test(body.threadId))) return 'Invalid threadId';
 
   if (config && !config.botNames.includes(body.botName)) {
     return 'Unknown botName';

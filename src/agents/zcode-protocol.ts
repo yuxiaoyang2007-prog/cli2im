@@ -1,3 +1,4 @@
+import { buildChildEnv } from '../security/child-env.js';
 import { spawn, type ChildProcess } from 'node:child_process';
 import { EventEmitter } from 'node:events';
 import type { SpawnOpts } from '../types.js';
@@ -423,7 +424,7 @@ export class ZcodeRpcError extends Error {
 export function spawnZcodeAppServer(binary: string, opts: SpawnOpts): ChildProcess {
   return spawn(process.execPath, [binary, 'app-server'], {
     cwd: opts.workingDirectory,
-    env: { ...process.env, ...opts.env },
+    env: buildChildEnv('zcode', opts.env),
     stdio: ['pipe', 'pipe', 'pipe'],
   });
 }

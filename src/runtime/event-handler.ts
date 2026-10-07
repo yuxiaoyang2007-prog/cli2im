@@ -18,6 +18,7 @@ const TERMINAL_PATTERNS = /^(done|lgtm|confirmed|accepted|acknowledged|agreed|ok
 export type SessionIdStore = Pick<SessionStore, 'getByKey' | 'updateAgentSessionId'>;
 
 export interface RuntimeEventHandlerDeps {
+  onTerminal?: (state: 'completed' | 'failed', text: string) => Promise<void>;
   sessionKey: SessionKey;
   store: SessionIdStore;
   voiceSessions: Map<SessionKey, string>;
@@ -56,6 +57,7 @@ export function createRuntimeEventHandler(
   const botName = sessionKey.split(':')[2];
   const chatId = sessionKey.split(':')[1];
   let relayTextBuffer = '';
+  let recoveryText = '';
 
   return async (_sk, event, eventContext: AgentEventContext) => {
     try {
@@ -65,9 +67,16 @@ export function createRuntimeEventHandler(
     const ensureCurrent = () => eventContext.isCurrent();
     const ensureActive = () => ensureCurrent() && !signal.aborted;
     if (!ensureActive()) return;
+    if (event.type === 'text') recoveryText = (recoveryText + event.content).slice(0, 1_048_576);
+    if (event.type === 'result' || event.type === 'error') {
+      const finalText = recoveryText + (event.type === 'error' ? '\n任务执行失败。' : '');
+      recoveryText = '';
+      await deps.onTerminal?.(event.type === 'result' ? 'completed' : 'failed', finalText);
+      if (!ensureActive()) return;
+    }
 
     const isVoiceSession = voiceSessions.has(sessionKey);
-    console.log(`[event] ${scrubLog(sessionKey)}: type=${event.type} voice=${isVoiceSession} hasCard=${!!cardController} hasTgStream=${!!tgStream}`);
+    console.log(`[event] bot=${scrubLog(botName)} type=${event.type} voice=${isVoiceSession} hasCard=${!!cardController} hasTgStream=${!!tgStream}`);
 
     if ((event.type === 'result' || event.type === 'status') && event.sessionId) {
       await persistAgentSessionIdIfCurrent(
@@ -148,8 +157,9 @@ export function createRuntimeEventHandler(
         relayTextBuffer = '';
       } else {
         const trimmedRelay = relayTextBuffer.trim();
-        const shouldRelay = trimmedRelay.length > 0 && !isTerminalRelayText(trimmedRelay);
-        console.log(`[relay-trigger] ${scrubLog(botName)}: len=${trimmedRelay.length} relay=${shouldRelay} preview=${scrubLog(trimmedRelay, 100)}`);
+        const shouldRelay = sessionKey.split(':').length === 3
+          && relayDeps.config.bots[botName]?.relay?.enabled === true
+          && trimmedRelay.length > 0 && !isTerminalRelayText(trimmedRelay);
         relayTextBuffer = '';
         if (shouldRelay) {
           await relayToOtherBotsFn(botName, chatId, trimmedRelay, relayDeps, { signal });
@@ -177,14 +187,14 @@ export function createRuntimeEventHandler(
         if (!ensureActive()) return;
         try {
           if (!(await isCreatedFileCurrent(file))) {
-            console.warn(`[file-send] skip changed or missing file: ${scrubLog(file.path)}`);
+            console.warn('[file-send] skipped_changed_or_missing_file');
             continue;
           }
           if (!ensureActive()) return;
           await adapter.sendFile(chatId, file, { signal });
         } catch (err) {
           if (isAbortError(err) || signal.aborted) return;
-          console.warn(`[file-send] failed to send ${scrubLog(file.path)}: ${scrubLog(err instanceof Error ? err.message : String(err))}`);
+          console.warn('[file-send] delivery_failed');
         }
         if (!ensureActive()) return;
       }

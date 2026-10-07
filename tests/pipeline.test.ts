@@ -36,13 +36,19 @@ describe('isBridgeCommand', () => {
     expect(isBridgeCommand('/perm allow req_123')).toBe(true);
     expect(isBridgeCommand('/sessions')).toBe(true);
     expect(isBridgeCommand('/notify-me')).toBe(true);
+    expect(isBridgeCommand('/help')).toBe(true);
+    expect(isBridgeCommand('/projects')).toBe(true);
+    expect(isBridgeCommand('/cd demo')).toBe(true);
+    expect(isBridgeCommand('/task review')).toBe(true);
+    expect(isBridgeCommand('/doctor')).toBe(true);
+    expect(isBridgeCommand('/bots')).toBe(true);
+    expect(isBridgeCommand('/result')).toBe(true);
   });
 
   it('does not recognize CLI passthrough commands', () => {
     expect(isBridgeCommand('/compact')).toBe(false);
     expect(isBridgeCommand('/review')).toBe(false);
     expect(isBridgeCommand('/cost')).toBe(false);
-    expect(isBridgeCommand('/doctor')).toBe(false);
   });
 
   it('does not recognize plain messages', () => {
@@ -70,6 +76,10 @@ describe('parseBridgeCommand', () => {
   it('parses /cwd with path', () => {
     const cmd = parseBridgeCommand('/cwd ~/projects/newsradar');
     expect(cmd).toEqual({ command: 'cwd', args: ['~/projects/newsradar'] });
+  });
+
+  it('parses /cd as a project switch alias', () => {
+    expect(parseBridgeCommand('/cd demo')).toEqual({ command: 'cwd', args: ['demo'] });
   });
 
   it('parses /model with name', () => {
@@ -168,6 +178,30 @@ describe('InboundPipeline authorization', () => {
     const result = pipeline.process(message({ chatType: 'group', userId: 'ou_allowed' }), 'ccbot');
 
     expect('rejected' in result).toBe(false);
+  });
+
+  it.each([{ allowFrom: [] }, { allowFrom: ['*'] }])('denies implicit public access %j', (override) => {
+    const pipeline = new InboundPipeline({ ...config, bots: { ccbot: { ...config.bots.ccbot, ...override } } });
+    expect(pipeline.process(message({}), 'ccbot')).toEqual({ rejected: true, reason: 'Unauthorized user' });
+  });
+
+  it('applies group restrictions in pipeline itself, including Telegram supergroups', () => {
+    const pipeline = new InboundPipeline({ ...config, bots: { ccbot: { ...config.bots.ccbot, groupAllowFrom: ['allowed_group'] } } });
+    expect(pipeline.process(message({ userId: 'ou_allowed', chatType: 'supergroup' }), 'ccbot')).toEqual({ rejected: true, reason: 'Unauthorized group' });
+  });
+
+  it('separates two topics inside one chat', () => {
+    const pipeline = new InboundPipeline(config);
+    const first = pipeline.process(message({ userId: 'ou_allowed', threadId: 'topic_1' }), 'ccbot');
+    const second = pipeline.process(message({ userId: 'ou_allowed', threadId: 'topic_2' }), 'ccbot');
+    expect('sessionKey' in first && first.sessionKey).toBe('feishu:chat_1:ccbot:topic_1');
+    expect('sessionKey' in second && second.sessionKey).toBe('feishu:chat_1:ccbot:topic_2');
+  });
+
+  it('denies a relay flag without an explicitly granted source', () => {
+    const pipeline = new InboundPipeline(config);
+    expect(pipeline.process(message({ userId: 'relay:other', chatType: 'group', isRelay: true }), 'ccbot'))
+      .toEqual({ rejected: true, reason: 'Unauthorized relay' });
   });
 
   it('rejects rate-limited users before sanitizing inbound text', () => {

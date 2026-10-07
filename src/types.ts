@@ -106,6 +106,8 @@ export interface SenderInfo {
 
 export interface InboundMessage {
   platform: string;
+  messageId?: string;
+  threadId?: string;
   chatId: string;
   userId: string;
   userName?: string;
@@ -116,10 +118,15 @@ export interface InboundMessage {
   mentions?: string[];
   isVoice?: boolean;
   isRelay?: boolean;
+  /** Set only by the in-process relay producer, never by a platform payload. */
+  relayFromBot?: string;
   raw?: unknown;
 }
 
 export interface OutboundContent {
+  plainText?: boolean;
+  threadId?: string;
+  replyToMessageId?: string;
   text?: string;
   card?: CardPayload;
   file?: FilePayload;
@@ -169,6 +176,7 @@ export interface PlatformAdapter {
 
 export interface CallbackQuery {
   platform: string;
+  threadId?: string;
   chatId: string;
   userId: string;
   chatType?: string;
@@ -192,6 +200,12 @@ export interface UserMessage {
 // === Session ===
 
 export type SessionKey = `${string}:${string}:${string}`;
+
+/** Keep the first three components stable for existing persisted sessions. */
+export function buildSessionKey(platform: string, chatId: string, botName: string, threadId?: string): SessionKey {
+  const base: SessionKey = `${platform}:${chatId}:${botName}`;
+  return threadId ? `${base}:${encodeURIComponent(threadId)}` : base;
+}
 
 export interface Session {
   id: string;
@@ -227,6 +241,7 @@ export interface PendingPermission {
 // === Handoff ===
 
 export interface HandoffRequest {
+  threadId?: string;
   botName: string;
   sessionId: string;
   workDir: string;
@@ -248,6 +263,7 @@ export interface HandoffRelease {
 // === Config ===
 
 export interface BotConfig {
+  enabled?: boolean;
   agent: string;
   platform: 'feishu' | 'telegram';
   feishu?: {
@@ -259,6 +275,16 @@ export interface BotConfig {
   };
   workingDirectory: string;
   allowFrom: string[];
+  /** Named administrators can manage this bot's compatible desktop sessions. */
+  adminUsers?: string[];
+  /** Public access additionally requires an explicit '*' in allowFrom. */
+  allowPublic?: boolean;
+  /** Explicitly shared desktop-session roots; workingDirectory alone grants no history access. */
+  sessionRoots?: string[];
+  projects?: Record<string, string>;
+  shortcuts?: Record<string, { description?: string; prompt: string }>;
+  debounceMs?: number;
+  speech?: { stt?: boolean; tts?: boolean };
   permissionMode: 'bypass' | 'blacklist';
   /**
    * Path to a per-bot runtime instructions file read on every conversation.
@@ -279,6 +305,7 @@ export interface BotConfig {
   sandboxMode?: string;
   relay?: {
     enabled: boolean;
+    allowFromBots?: string[];
     maxConsecutiveRounds?: number;
   };
 }
@@ -297,6 +324,7 @@ export interface CodexNotificationConfig {
 }
 
 export interface AppConfig {
+  network?: { mode: 'system' | 'environment'; required: boolean; noProxy?: string[] };
   bots: Record<string, BotConfig>;
   agents: Record<string, AgentConfig>;
   session: {

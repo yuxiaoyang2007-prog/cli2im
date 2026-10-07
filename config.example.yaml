@@ -6,7 +6,16 @@
 # Secrets: use ${ENV_VAR} syntax to reference environment variables
 # instead of hardcoding tokens. Set them in your shell profile,
 # .env file, or LaunchAgent plist EnvironmentVariables.
+# Protect the config/data directory; do not commit expanded credentials.
 # ============================================================
+
+# Follow the current macOS system HTTP/HTTPS proxy. If unavailable, pause network work.
+# Linux/Windows: use mode: environment and configure HTTP_PROXY/HTTPS_PROXY.
+# Requires Node.js 24.14+ (24 LTS) or 25.4+. This is not an OS firewall or DNS leak test.
+network:
+  mode: system
+  required: true
+  noProxy: [127.0.0.1, localhost, "::1"]  # required mode permits local exceptions only
 
 # ----------------------------------------------------------
 # Bots — each bot binds one agent to one IM platform.
@@ -15,6 +24,7 @@
 bots:
   # --- Example: Claude Code on Feishu ---
   ccbot:
+    enabled: true                  # false keeps config/history but stops this bot
     agent: claude-code              # must match a key in `agents` below
     platform: feishu
     feishu:
@@ -22,16 +32,31 @@ bots:
       appSecret: ${CCBOT_FEISHU_APP_SECRET}
     workingDirectory: ~/projects    # default cwd for agent subprocess
     allowFrom:                      # user IDs allowed to use this bot
-      - ou_xxxxxxxxxxxx             #   Feishu: open_id (check bot event logs)
+      - ou_xxxxxxxxxxxx             # Feishu open_id; use the platform's user management
+    adminUsers:                    # owner/operator IDs; do not put ordinary users here
+      - ou_xxxxxxxxxxxx
+    allowPublic: false             # '*' alone never enables public access
+    requireMention: true
+    groupPolicy: allowlist          # a listed user must also use an allowed group
+    groupAllowFrom: []              # empty: private chats only; add exact group IDs if needed
+    debounceMs: 800                 # combine same-sender/same-topic bursts; 0 disables
+    projects:
+      default: ~/projects          # /projects default; each path is checked again on use
+    shortcuts:
+      progress:
+        description: 查看项目进展
+        prompt: 请检查当前项目，简要说明进展和下一步，不修改文件。
+    speech:
+      stt: true                    # DashScope receives incoming audio for transcription
+      tts: false                   # false: do not send reply text for voice synthesis
+    # sessionRoots: [~/projects/shared]  # explicitly SHARE these existing desktop histories
+                                        # ordinary users otherwise see only this chat/topic's bound sessions
     permissionMode: blacklist       # bypass = skip all tool approval
                                     # blacklist = block dangerous commands (default)
     # --- Optional fields ---
     # autoApprove: false            # true = auto-approve all tool requests
-    # requireMention: false         # true = only respond when @mentioned (group chats)
-    # groupPolicy: allowlist        # all = anyone in allowed groups; allowlist = only groupAllowFrom
-    # groupAllowFrom: []            # group chat IDs allowed (when groupPolicy=allowlist)
     # turnTimeoutMs: 600000         # hard cap N ms after process START (not per-turn, never reset — can kill healthy long sessions); unset = no cap
-    # idleTimeoutMs: 300000         # kill + auto-recover a session after N ms of zero output (stall recovery); unset = disabled
+    # idleTimeoutMs: 300000         # stop a stalled process; tasks are not automatically re-executed
     # larkCliConfigDir: ~/.lark-cli/  # path to lark-cli config (for lark-cli skills)
     # agentsFile: AGENTS.md         # per-bot runtime instructions read every conversation.
                                     #   Relative paths resolve against workingDirectory; ~ is expanded.
@@ -44,11 +69,13 @@ bots:
     #   ou_xxxxxxxxxxxx:
     #     workingDirectory: ~/user-a-projects
     # relay:                         # bot-to-bot relay (group chats only)
-    #   enabled: true                # opt-in: both sender and receiver must enable
+    #   enabled: false               # opt-in: both sender and receiver must enable
+    #   allowFromBots: [codexbot]     # exact permitted source bots; never authorizes control commands
     #   maxConsecutiveRounds: 10     # safety cap for bot-to-bot turns without human input
 
   # --- Example: Codex on Feishu ---
   codexbot:
+    enabled: true
     agent: codex
     platform: feishu
     feishu:
@@ -57,6 +84,13 @@ bots:
     workingDirectory: ~/projects
     allowFrom:
       - ou_xxxxxxxxxxxx
+    adminUsers:
+      - ou_xxxxxxxxxxxx
+    allowPublic: false
+    requireMention: true
+    groupPolicy: allowlist
+    groupAllowFrom: []
+    speech: { stt: true, tts: false }
     permissionMode: blacklist
 
   # --- Example: Gemini on Telegram ---
@@ -191,7 +225,7 @@ newMessageBehavior: queue          # queue = hold until agent is free
 
 notifications:
   codex:
-    enabled: true
+    enabled: false                  # optional; enable and bind an authorized private chat explicitly
     botName: codexbot
     completionSource: structured
 
@@ -201,4 +235,4 @@ notifications:
 # ----------------------------------------------------------
 # contentGuard:
 #   enabled: true
-#   blockThreshold: 0.8            # 0-1, higher = stricter
+#   blockThreshold: 15             # detector score threshold; /doctor reports actual load status

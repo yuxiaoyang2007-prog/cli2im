@@ -1,6 +1,8 @@
+import { buildChildEnv } from '../security/child-env.js';
 import { execFileSync, spawn as spawnProcess, type ChildProcess } from 'node:child_process';
 import { EventEmitter } from 'node:events';
-import { writeFileSync, mkdirSync } from 'node:fs';
+import { writeFileSync, mkdtempSync, rmSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { PassThrough, Transform, Writable, type TransformCallback } from 'node:stream';
@@ -155,8 +157,6 @@ export class GeminiStreamParser extends Transform {
 
 type GeminiStdinPayload = { type: 'user'; message: UserMessage };
 
-const PROMPT_ARG_MAX_BYTES = 100 * 1024;
-
 export class GeminiVirtualProcess implements AgentProcess {
   pid = process.pid;
   sessionId: string;
@@ -170,6 +170,7 @@ export class GeminiVirtualProcess implements AgentProcess {
   private terminated = false;
   private exitEmitted = false;
   private eventEmitter = new EventEmitter();
+  private imageDirectory?: string;
 
   constructor(
     private readonly binary: string,
@@ -211,6 +212,7 @@ export class GeminiVirtualProcess implements AgentProcess {
   }
 
   private handleStdinChunk(chunk: Buffer | string | Uint8Array): void {
+    if (this.terminated) return;
     this.inputBuffer += Buffer.isBuffer(chunk) ? chunk.toString('utf8') : String(chunk);
     const lines = this.inputBuffer.split('\n');
     this.inputBuffer = lines.pop() ?? '';
@@ -225,7 +227,10 @@ export class GeminiVirtualProcess implements AgentProcess {
         continue;
       }
       if (payload.type === 'user') {
-        this.enqueue(messageToPrompt(payload.message));
+        this.enqueue(messageToPrompt(payload.message, () => {
+          this.imageDirectory ??= mkdtempSync(join(tmpdir(), 'cli2im-gemini-images-'));
+          return this.imageDirectory;
+        }));
       }
     }
   }
@@ -244,40 +249,34 @@ export class GeminiVirtualProcess implements AgentProcess {
   private runTurn(prompt: string): void {
     if (this.terminated) return;
 
-    const promptBytes = Buffer.byteLength(prompt, 'utf8');
-    const useStdinPrompt = promptBytes > PROMPT_ARG_MAX_BYTES;
-    const args = this.createTurnArgs(prompt, useStdinPrompt);
+    // Piped input is supported headless input; prompts never belong in process argv.
+    const args = this.createTurnArgs();
     const child = spawnProcess(this.binary, args, {
       cwd: this.opts.workingDirectory,
-      env: { ...process.env, ...this.opts.env },
-      stdio: [useStdinPrompt ? 'pipe' : 'ignore', 'pipe', 'pipe'],
+      env: buildChildEnv('gemini', this.opts.env),
+      stdio: ['pipe', 'pipe', 'pipe'],
     });
 
     this.activeChild = child;
     this.stderrBuffer = '';
 
-    if (useStdinPrompt) {
-      if (!child.stdin) {
-        this.stdout.write({ type: 'error', message: 'Gemini CLI stdin is unavailable' } satisfies AgentEvent);
-        this.activeChild = undefined;
-        return;
-      }
-      child.stdin.write(prompt);
-      child.stdin.end();
-    }
-
     this.attachChild(child);
+    if (!child.stdin) {
+      child.kill('SIGTERM');
+      this.stdout.write({ type: 'error', message: 'Gemini CLI stdin is unavailable' } satisfies AgentEvent);
+      return;
+    }
+    child.stdin.on('error', () => {
+      this.stdout.write({ type: 'error', message: 'Gemini prompt input failed' } satisfies AgentEvent);
+    });
+    child.stdin.end(prompt);
   }
 
-  private createTurnArgs(prompt: string, useStdinPrompt: boolean): string[] {
+  private createTurnArgs(): string[] {
     const args = buildGeminiBaseArgs(this.opts);
 
     if (this.geminiSessionId) {
       args.push('--resume', this.geminiSessionId);
-    }
-
-    if (!useStdinPrompt) {
-      args.push('-p', prompt);
     }
 
     return args;
@@ -372,6 +371,7 @@ export class GeminiVirtualProcess implements AgentProcess {
     if (this.exitEmitted) return;
 
     this.exitEmitted = true;
+    if (this.imageDirectory) rmSync(this.imageDirectory, { recursive: true, force: true });
     this.stdout.end();
     this.eventEmitter.emit('exit', code);
   }
@@ -399,6 +399,7 @@ export class GeminiPlugin implements AgentPlugin {
       const output = execFileSync(this.binary, ['--version'], {
         timeout: 10000,
         encoding: 'utf-8',
+        env: buildChildEnv('gemini'),
       });
       return { ok: true, version: output.trim() };
     } catch (err) {
@@ -453,7 +454,7 @@ function buildGeminiBaseArgs(opts: SpawnOpts): string[] {
   return args;
 }
 
-function messageToPrompt(message: UserMessage): string {
+function messageToPrompt(message: UserMessage, imageDirectory: () => string): string {
   if (typeof message.content === 'string') return message.content;
 
   const textParts: string[] = [];
@@ -463,11 +464,9 @@ function messageToPrompt(message: UserMessage): string {
     if (block.type === 'text') {
       textParts.push(block.text);
     } else if (block.type === 'image') {
-      const ext = block.source.media_type.split('/')[1] ?? 'png';
-      const dir = join(tmpdir(), 'cli2im-gemini-images');
-      mkdirSync(dir, { recursive: true });
-      const filePath = join(dir, `img-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${ext}`);
-      writeFileSync(filePath, Buffer.from(block.source.data, 'base64'));
+      const ext = ({ 'image/jpeg': 'jpg', 'image/webp': 'webp', 'image/gif': 'gif' } as Record<string, string>)[block.source.media_type] ?? 'png';
+      const filePath = join(imageDirectory(), `img-${randomUUID()}.${ext}`);
+      writeFileSync(filePath, Buffer.from(block.source.data, 'base64'), { mode: 0o600, flag: 'wx' });
       imagePaths.push(filePath);
     }
   }

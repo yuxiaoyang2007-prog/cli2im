@@ -1,8 +1,8 @@
 import { EventEmitter } from 'node:events';
 import { PassThrough, Readable, Writable } from 'node:stream';
-import { existsSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   FeishuAdapter,
@@ -14,11 +14,24 @@ import type { InboundMessage } from '../src/types.js';
 
 const larkMocks = vi.hoisted(() => {
   const clients: MockClient[] = [];
+  const configurations: Array<Record<string, unknown>> = [];
+  const wsClients: MockWsClient[] = [];
+  const wsConfigurations: Array<Record<string, unknown>> = [];
+
+  class MockWsClient {
+    start = vi.fn(async () => undefined);
+    close = vi.fn();
+    constructor(options: Record<string, unknown>) {
+      wsClients.push(this);
+      wsConfigurations.push(options);
+    }
+  }
 
   class MockClient {
     im = {
       message: {
         create: vi.fn(async () => ({ code: 0, data: { message_id: 'om_sent' } })),
+        reply: vi.fn(async () => ({ code: 0, data: { message_id: 'om_reply' } })),
         patch: vi.fn(async () => ({ code: 0 })),
         delete: vi.fn(async () => ({})),
       },
@@ -26,7 +39,7 @@ const larkMocks = vi.hoisted(() => {
         create: vi.fn(async () => ({ image_key: 'img_top' })),
       },
       file: {
-        create: vi.fn(async () => ({ data: { file_key: 'file_data' } })),
+        create: vi.fn(async (_request: any) => ({ data: { file_key: 'file_data' } })),
       },
       messageResource: {
         get: vi.fn(async () => ({
@@ -35,12 +48,13 @@ const larkMocks = vi.hoisted(() => {
       },
     };
 
-    constructor() {
+    constructor(options: Record<string, unknown>) {
       clients.push(this);
+      configurations.push(options);
     }
   }
 
-  return { clients, MockClient };
+  return { clients, configurations, MockClient, wsClients, wsConfigurations, MockWsClient };
 });
 
 const childProcessMocks = vi.hoisted(() => ({
@@ -51,6 +65,7 @@ type MockClient = {
   im: {
     message: {
       create: ReturnType<typeof vi.fn>;
+      reply: ReturnType<typeof vi.fn>;
       patch: ReturnType<typeof vi.fn>;
       delete: ReturnType<typeof vi.fn>;
     };
@@ -62,10 +77,7 @@ type MockClient = {
 
 vi.mock('@larksuiteoapi/node-sdk', () => ({
   Client: larkMocks.MockClient,
-  WSClient: class {
-    start = vi.fn(async () => undefined);
-    close = vi.fn();
-  },
+  WSClient: larkMocks.MockWsClient,
   EventDispatcher: class {
     register = vi.fn(() => this);
   },
@@ -85,6 +97,12 @@ vi.mock('node:child_process', async (importOriginal) => {
 describe('FeishuAdapter file handling', () => {
   beforeEach(() => {
     larkMocks.clients.length = 0;
+    larkMocks.configurations.length = 0;
+    larkMocks.wsClients.length = 0;
+    larkMocks.wsConfigurations.length = 0;
+    vi.stubEnv('CLI2IM_NETWORK_REQUIRED', '0');
+    vi.stubEnv('https_proxy', '');
+    vi.stubEnv('HTTPS_PROXY', '');
   });
 
   afterEach(() => {
@@ -92,6 +110,7 @@ describe('FeishuAdapter file handling', () => {
     childProcessMocks.spawn.mockReset();
     vi.restoreAllMocks();
     vi.unstubAllGlobals();
+    vi.unstubAllEnvs();
   });
 
   it('renders an allowlisted Feishu card header color', async () => {
@@ -365,11 +384,13 @@ describe('FeishuAdapter file handling', () => {
     await expect(adapter.downloadFile('om_1', 'file_1', 'file')).rejects.toThrow(/download limit/);
   });
 
-  it('logs a fixed card action summary without serializing the callback object', () => {
+  it('logs a fixed card action summary without serializing the callback object', async () => {
     const adapter = new FeishuAdapter({ appId: 'app', appSecret: 'secret', botName: 'bot' });
     const consoleSpy = vi.spyOn(console, 'log').mockImplementation(() => undefined);
     const callback = vi.fn();
     adapter.onCallback(callback);
+    larkMocks.clients[0].im.message.create.mockResolvedValueOnce({ code: 0, data: { message_id: 'om_private_secret' } });
+    await adapter.send('oc_private_secret', { text: 'card placeholder' });
 
     expect(() =>
       (adapter as unknown as { handleCardAction(data: unknown): unknown }).handleCardAction({
@@ -548,11 +569,10 @@ describe('FeishuAdapter file handling', () => {
     const adapter = new FeishuAdapter({ appId: 'app', appSecret: 'secret', botName: 'bot' });
     const client = larkMocks.clients[0];
     const controller = new AbortController();
-    const now = 1_765_000_000_000;
-    const tmpPath = join(tmpdir(), `cli2im-opus-${now}.ogg`);
-    vi.spyOn(Date, 'now').mockReturnValue(now);
+    let tmpPath = '';
     mockFfmpegOutput(Buffer.from('opus-data'));
-    client.im.file.create.mockImplementationOnce(async () => {
+    client.im.file.create.mockImplementationOnce(async (request: { data: { file: { path: string } } }) => {
+      tmpPath = request.data.file.path;
       controller.abort();
       throw new DOMException('Operation aborted', 'AbortError');
     });
@@ -562,7 +582,174 @@ describe('FeishuAdapter file handling', () => {
     ).rejects.toMatchObject({ name: 'AbortError' });
 
     expect(existsSync(tmpPath)).toBe(false);
+    expect(existsSync(dirname(tmpPath))).toBe(false);
     expect(client.im.message.create).not.toHaveBeenCalled();
+  });
+
+  it('isolates simultaneous audio uploads even when the wall clock is identical', async () => {
+    const adapter = new FeishuAdapter({ appId: 'app', appSecret: 'secret', botName: 'bot' });
+    const client = larkMocks.clients[0];
+    vi.spyOn(Date, 'now').mockReturnValue(1234);
+    mockFfmpegOutput(Buffer.from('voice-A'));
+    mockFfmpegOutput(Buffer.from('voice-B'));
+    const uploads: Array<{ path: string; content: string }> = [];
+    const gate = deferred<void>();
+    client.im.file.create.mockImplementation(async (request: { data: { file: { path: string } } }) => {
+      const path = request.data.file.path;
+      expect(statSync(path).mode & 0o777).toBe(0o600);
+      expect(statSync(dirname(path)).mode & 0o777).toBe(0o700);
+      uploads.push({ path, content: readFileSync(path, 'utf8') });
+      if (uploads.length === 2) gate.resolve();
+      await gate.promise;
+      expect(readFileSync(path, 'utf8')).toBe(uploads.find((upload) => upload.path === path)?.content);
+      return { data: { file_key: 'uploaded' } };
+    });
+    await Promise.all([adapter.sendAudio('chat-A', Buffer.from('A')), adapter.sendAudio('chat-B', Buffer.from('B'))]);
+    expect(new Set(uploads.map((upload) => upload.path)).size).toBe(2);
+    expect(uploads.map((upload) => upload.content).sort()).toEqual(['voice-A', 'voice-B']);
+    expect(uploads.every((upload) => !existsSync(dirname(upload.path)))).toBe(true);
+  });
+
+  it('installs the private logger at the SDK client boundary', () => {
+    new FeishuAdapter({ appId: 'app', appSecret: 'secret', botName: 'bot' });
+    const sink = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    const logger = larkMocks.configurations[0].logger as { error(...values: unknown[]): void };
+    logger.error({ config: { data: '{"app_secret":"secret-value"}' }, code: 'ECONNRESET' });
+    expect(sink).toHaveBeenCalledWith('[feishu] SDK error', { code: 'ECONNRESET' });
+    expect(JSON.stringify(sink.mock.calls)).not.toContain('secret-value');
+  });
+
+  it('does not expose Axios request bodies even when callers log the rejected error', async () => {
+    const adapter = new FeishuAdapter({ appId: 'app', appSecret: 'secret', botName: 'bot' });
+    larkMocks.clients[0].im.message.create.mockRejectedValueOnce(Object.assign(new Error('private-message'), {
+      config: { data: 'app-secret' }, response: { status: 401, data: 'private-message' },
+    }));
+    const failure = await adapter.send('chat', { text: 'private-message' }).catch((error) => error);
+    expect(failure).toMatchObject({ message: 'Feishu request failed', status: 401 });
+    expect(JSON.stringify(failure)).not.toMatch(/private-message|app-secret/);
+    expect(failure).not.toHaveProperty('cause');
+  });
+
+  it('carries platform topic metadata without treating an ordinary reply as a topic', () => {
+    const adapter = new FeishuAdapter({ appId: 'app', appSecret: 'secret', botName: 'bot' });
+    const received: InboundMessage[] = [];
+    adapter.onMessage((message) => received.push(message));
+    const handle = adapter as unknown as { handleMessage(data: unknown): void };
+    for (const message of [
+      { message_id: 'one', thread_id: 'thread-1', root_id: 'root' },
+      { message_id: 'two', root_id: 'ordinary-reply' },
+    ]) handle.handleMessage({ sender: { sender_type: 'user', sender_id: { open_id: 'user' } }, message: {
+      ...message, chat_id: 'group', message_type: 'text', content: '{"text":"hello"}',
+    } });
+    expect(received[0]).toMatchObject({ messageId: 'one', threadId: 'thread-1' });
+    expect(received[1].threadId).toBeUndefined();
+  });
+
+  it('replies into an explicit topic and refuses a topic without its anchor', async () => {
+    const adapter = new FeishuAdapter({ appId: 'app', appSecret: 'secret', botName: 'bot' });
+    await adapter.send('chat', { text: 'hello', threadId: 'topic', replyToMessageId: 'anchor' });
+    expect(larkMocks.clients[0].im.message.reply).toHaveBeenCalledWith({
+      path: { message_id: 'anchor' }, data: { msg_type: 'text', content: '{"text":"hello"}', reply_in_thread: true },
+    });
+    await expect(adapter.send('chat', { text: 'hello', threadId: 'topic' })).rejects.toThrow('anchor');
+    expect(larkMocks.clients[0].im.message.create).not.toHaveBeenCalled();
+  });
+
+  it('recovers callback topic only from a sent-message route in the same chat', async () => {
+    const adapter = new FeishuAdapter({ appId: 'app', appSecret: 'secret', botName: 'bot' });
+    const callback = vi.fn();
+    adapter.onCallback(callback);
+    await adapter.send('chat', { card: { type: 'final', content: 'hello' }, threadId: 'topic', replyToMessageId: 'anchor' });
+    const invoke = (chatId: string) => (adapter as unknown as { handleCardAction(data: unknown): void }).handleCardAction({
+      context: { open_chat_id: chatId, open_message_id: 'om_reply', chat_type: 'group' }, operator: { open_id: 'user' },
+      action: { value: { threadId: 'untrusted-forged-topic' } },
+    });
+    invoke('chat');
+    expect(callback.mock.calls[0][0].threadId).toBe('topic');
+    invoke('other-chat');
+    expect(callback).toHaveBeenCalledOnce();
+  });
+
+  it('rejects cards from before restart instead of treating a missing topic as the main chat', () => {
+    const restarted = new FeishuAdapter({ appId: 'app', appSecret: 'secret', botName: 'bot' });
+    const callback = vi.fn();
+    restarted.onCallback(callback);
+    const result = (restarted as unknown as { handleCardAction(data: unknown): unknown }).handleCardAction({
+      context: { open_chat_id: 'chat', open_message_id: 'old-topic-card' }, operator: { open_id: 'user' },
+      action: { value: { action: 'control:/new', threadId: 'forged' } },
+    });
+    expect(callback).not.toHaveBeenCalled();
+    expect(result).toMatchObject({ toast: { content: expect.stringContaining('/status') } });
+  });
+
+  it.each(['p2p', 'group'])('recovers trusted %s chat type when a card callback omits it', async (chatType) => {
+    const adapter = new FeishuAdapter({ appId: 'app', appSecret: 'secret', botName: 'bot' });
+    const callback = vi.fn();
+    adapter.onMessage(() => undefined);
+    adapter.onCallback(callback);
+    const internal = adapter as unknown as { handleMessage(data: unknown): void; handleCardAction(data: unknown): unknown };
+    internal.handleMessage({ sender: { sender_type: 'user', sender_id: { open_id: 'user' } }, message: {
+      message_id: 'inbound', chat_id: 'chat', chat_type: chatType, message_type: 'text', content: '{"text":"/status"}',
+    } });
+    await adapter.send('chat', { card: { type: 'final', content: 'controls' } });
+    internal.handleCardAction({
+      context: { open_chat_id: 'chat', open_message_id: 'om_sent' }, operator: { open_id: 'user' },
+      action: { value: { action: 'control:/status', chat_type: 'forged' } },
+    });
+    expect(callback).toHaveBeenCalledWith(expect.objectContaining({ chatType }));
+  });
+
+  it('recreates the WebSocket client and proxy agent using the current route on reconnect', async () => {
+    vi.stubEnv('CLI2IM_NETWORK_REQUIRED', '1');
+    vi.stubEnv('https_proxy', 'http://127.0.0.1:7890');
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({ tenant_access_token: 'tenant_token', bot: { open_id: 'ou_bot' } }))));
+    const adapter = new FeishuAdapter({ appId: 'app', appSecret: 'secret', botName: 'bot' });
+    expect(larkMocks.wsClients).toHaveLength(0);
+    await adapter.connect();
+    const firstClient = larkMocks.wsClients[0];
+    const firstAgent = larkMocks.wsConfigurations[0].agent as import('node:https').Agent;
+    const destroyFirst = vi.spyOn(firstAgent, 'destroy');
+    expect(firstAgent.options).toMatchObject({ proxyEnv: { HTTPS_PROXY: 'http://127.0.0.1:7890' } });
+    vi.stubEnv('https_proxy', 'http://127.0.0.1:7891');
+    await adapter.connect();
+    const secondClient = larkMocks.wsClients[1];
+    const secondAgent = larkMocks.wsConfigurations[1].agent as import('node:https').Agent;
+    const destroySecond = vi.spyOn(secondAgent, 'destroy');
+    expect(firstClient.close).toHaveBeenCalledOnce();
+    expect(firstClient.close).toHaveBeenCalledWith({ force: true });
+    expect(destroyFirst).toHaveBeenCalledOnce();
+    expect(firstClient.start).toHaveBeenCalledOnce();
+    expect(secondClient.start).toHaveBeenCalledOnce();
+    expect(secondAgent).not.toBe(firstAgent);
+    expect(secondAgent.options).toMatchObject({ proxyEnv: { HTTPS_PROXY: 'http://127.0.0.1:7891' } });
+    await adapter.disconnect();
+    expect(secondClient.close).toHaveBeenCalledOnce();
+    expect(secondClient.close).toHaveBeenCalledWith({ force: true });
+    expect(destroySecond).toHaveBeenCalledOnce();
+  });
+
+  it('refuses missing required proxy before creating a WebSocket client or resolving identity', async () => {
+    vi.stubEnv('CLI2IM_NETWORK_REQUIRED', '1');
+    const fetchMock = vi.fn();
+    vi.stubGlobal('fetch', fetchMock);
+    const adapter = new FeishuAdapter({ appId: 'app', appSecret: 'secret', botName: 'bot' });
+    await expect(adapter.connect()).rejects.toThrow('代理未启用');
+    expect(larkMocks.wsClients).toHaveLength(0);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('does not start an obsolete WebSocket client after disconnect during identity resolution', async () => {
+    let resolveFetch!: (response: Response) => void;
+    vi.stubGlobal('fetch', vi.fn().mockImplementationOnce(() => new Promise<Response>((resolve) => { resolveFetch = resolve; }))
+      .mockResolvedValue(new Response(JSON.stringify({ bot: { open_id: 'ou_bot' } }))));
+    const adapter = new FeishuAdapter({ appId: 'app', appSecret: 'secret', botName: 'bot' });
+    const connecting = adapter.connect();
+    const client = larkMocks.wsClients[0];
+    await adapter.disconnect();
+    resolveFetch(new Response(JSON.stringify({ tenant_access_token: 'tenant_token' })));
+    await connecting;
+    expect(client.close).toHaveBeenCalledOnce();
+    expect(client.start).not.toHaveBeenCalled();
   });
 
   it('resolves bot open id before starting the websocket client', async () => {
@@ -617,7 +804,7 @@ describe('FeishuAdapter file handling', () => {
     expect(adapter.getBotOpenId()).toBeUndefined();
     expect(warn).toHaveBeenCalledWith(
       expect.stringContaining('[cli2im] Failed to resolve Feishu bot identity:'),
-      expect.any(Error),
+      {},
     );
 
     warn.mockRestore();
@@ -640,7 +827,7 @@ function mockFfmpegOutput(output: Buffer): void {
         callback();
         setImmediate(() => {
           proc.stdout.end(output);
-          proc.emit('close', 0);
+          setImmediate(() => proc.emit('close', 0));
         });
       },
     });

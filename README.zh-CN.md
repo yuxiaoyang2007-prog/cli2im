@@ -2,7 +2,7 @@
 
 [English](README.md) | 中文
 
-**用你已经在用的 IM 驱动 Claude Code / Codex / Gemini / GLM。** 离开电脑了，项目不用停——掏出手机在飞书或 Telegram 里继续推，流式输出、tool use、slash 指令、一键 resume 任意本地 CLI 对话，全都有。
+**通过飞书或 Telegram 使用 Claude Code、Codex、Gemini、Antigravity、GLM 和 Kimi Work。** 每个机器人配置自己的使用者、项目和账号；手机可以继续获准使用的本地 CLI 对话。
 
 不是套壳聊天机器人。CLI2IM 跑的是你本来就在用的真实 CLI 二进制，保留全部能力，在上面加了一层 IM 控制面。
 
@@ -15,7 +15,7 @@
 你用公司笔电跑了一上午 Claude Code 改重构，现在要赶高铁回家。以前只能等回家继续；CLI2IM 让你接着推：
 
 - 在手机飞书/Telegram 里发 `/sessions`
-- 弹出一张交互式列表——本机所有 Claude Code 和 Codex 对话，带标题、最后一条消息预览、工作目录、git 分支、时间
+- 弹出该机器人支持且你获准查看的历史对话，带标题、工作目录、git 分支和时间
 - 点你正在做的那条的 **Resume** 按钮
 - Agent 用 `--resume <id>` 拉起来，绑定到这个 IM 聊天。流式输出进卡片，工具调用、权限审批、文件编辑——和在终端里完全一样
 
@@ -31,7 +31,7 @@
 CLI2IM 把 CLI agent 当作插件。一个 YAML 配置就能注册任意多个 bot，每个绑不同 agent、不同平台，全在同一个守护进程里跑：
 
 - **Claude Code** 干推理重的活，**Codex** 写代码，**Gemini** 和 **Antigravity** 要速度时上，**GLM（ZCode）** 是国内友好的选择。每个 bot 单独挑 agent。
-- 每个 bot 会读自己工作目录里的 **`AGENTS.md`**，把里面的设定带进每一次对话。人设就是这么来的：一个 bot 可以是带专属分流规则的能源研究助手，另一个可以是只能碰自己目录的隔离客户 bot。不写代码，一个 bot 一个文件。
+- 每个 bot 可以使用自己工作目录里的 **`AGENTS.md`**，说明任务习惯和项目规则。规则文本不提供文件隔离；严格隔离不同人员的数据，需要独立系统账户或真正受限的运行环境。
 
 所以一个守护进程能同时托管你自己的 Claude Code bot、同事的 Codex bot、还有一个上锁的客户 bot——各自行为不同，全靠 YAML 加 `AGENTS.md` 配出来。
 
@@ -42,7 +42,7 @@ CLI2IM 把 CLI agent 当作插件。一个 YAML 配置就能注册任意多个 b
 - **飞书**：WebSocket 实时事件（不用公网 IP、不用 webhook、不用端口转发）。交互式卡片一行一行流式更新。权限审批和会话恢复直接做成卡片按钮。语音消息走 DashScope 转文字；文字回复也能转成语音发出去。
 - **Telegram**：长轮询（NAT 后面也能跑）。MarkdownV2 格式化。权限和恢复用内联键盘。语音 STT 支持。
 
-对比那些"AI 桌面 app"（Cursor / Claude Desktop 之类的），它们要求每台设备装专门客户端；CLI2IM 骑在你和同事本来就在用的 IM 上。换设备？已经登录了。手机？已经配好了。要分享给同事？拉进群就行。
+同事要使用机器人，需要把其用户 ID 加入对应机器人的名单。群聊还要满足群名单和 @ 提及规则；拉进群本身不会获得权限。
 
 ---
 
@@ -55,7 +55,7 @@ CLI2IM 把 CLI agent 当作插件。一个 YAML 配置就能注册任意多个 b
 | **Windows 10 / 11** | ✅ 支持 | 工作目录路径接受 `C:\Users\...`（也接受其他盘符的 `Users\` 目录）。用 [NSSM](https://nssm.cc/) 跑成 Windows 服务，或挂计划任务 |
 
 **前置条件**：
-- Node.js >= 20（跨平台）
+- 使用本版本代理保护时，需要 Node.js 24.14+（24 LTS）或 25.4+
 - 至少装一个 CLI agent：[Claude Code](https://docs.anthropic.com/en/docs/claude-code) / [Codex CLI](https://github.com/openai/codex) / [Gemini CLI](https://github.com/google-gemini/gemini-cli)
 - 飞书 app 或 Telegram bot token
 
@@ -190,11 +190,11 @@ nssm start cli2im
 - **多平台**：飞书（WebSocket + 交互式卡片）和 Telegram（长轮询 + 内联键盘）
 - **流式输出**：飞书实时卡片更新，Telegram 消息编辑，支持 thinking 可见性切换
 - **权限审批**：危险命令检测（可配正则），交互式 Allow/Deny 按钮，会话级自动批准
-- **会话恢复**：扫描本地 CLI session（`~/.claude/`、`~/.codex/`），IM 里展示交互式列表，一键恢复任意对话
+- **会话恢复**：扫描对应 AI 的本地历史，按当前聊天、明确共享的目录和管理员身份过滤；点击按钮时再次检查权限
 - **双向交接**：CLI 终端 ↔ IM bot 无缝交接——附带 `cli2im handoff` 命令行工具
 - **每-bot 运行时设定**：每个 bot 读自己工作目录里的 `AGENTS.md`，注入到每一次对话——人设、分流规则、护栏，按 bot 区分，不写代码
 - **语音支持**：语音消息转文字，文字回复转语音（DashScope）
-- **安全**：用户白名单、工作目录校验、内容过滤、速率限制、危险命令拦截
+- **安全**：固定用户和群名单、历史访问检查、工作目录校验、可选内容检测、速率限制及危险命令审批；这些不等于操作系统隔离
 - **会话持久化**：SQLite 存储，空闲清理，状态追踪
 - **多 Bot**：一个进程跑多个 bot——每个 bot 绑一个 agent 和一个 IM 平台
 
@@ -271,19 +271,45 @@ newMessageBehavior: queue        # queue | interrupt
 | 指令 | 说明 |
 |------|------|
 | `/new` | 新建会话（终止当前 agent） |
-| `/sessions` | 列出本地 CLI session，带交互式 Resume 按钮 |
-| `/sessions codex` | 强制列出 Codex CLI session |
+| `/sessions` | 列出当前机器人支持且你获准查看的历史，点击恢复 |
+| `/sessions codex` | 在 Codex 机器人中查看获准使用的 Codex 历史 |
 | `/resume <id>` | 按 ID 恢复指定 session |
 | `/handoff` | 释放会话回 CLI 终端 |
-| `/status` | 查看当前会话信息 |
-| `/stop` | 优雅取消 (SIGTERM) |
-| `/kill` | 强制终止 (SIGKILL) |
-| `/cwd <path>` | 切换工作目录 |
+| `/status` | 控制卡片：模型、项目、任务状态和常用按钮 |
+| `/stop` | 优先取消当前任务及尚未开始的排队消息 |
+| `/kill` | 优先终止当前进程及尚未开始的排队消息 |
+| `/cwd <path>` 或 `/cd <path>` | 切换到获准目录，下一条消息使用新对话 |
+| `/projects` 或 `/projects <别名>` | 选择已配置项目或最近目录 |
+| `/task` 或 `/task <名称>` | 列出／执行已配置的提示词快捷任务 |
+| `/result [页码]` | 主动取回当前聊天／话题最近一次保存的结束结果，不重跑任务 |
+| `/bots` 或 `/bots stop\|restart` | 管理员查看／停止／重启当前机器人 |
+| `/doctor [页码]` | 管理员查看本地检查结果和外部服务清单；未验证项会明确标出 |
 | `/thinking` | 切换 thinking 可见性（飞书） |
 | `/fast` | 切换快速/低推理模式 |
 | `/model <name>` | 设置下次 spawn 的模型 |
 | `/perm allow\|deny <id>` | 回复权限请求 |
 | `/list` | 列出活跃 bot 会话 |
+
+`/model <名称>` 保存后在下次启动 AI 进程时生效；`/model default` 恢复默认。模型名能保存，不代表服务商已经验证该模型可用。正在执行任务时先等待完成，或使用 `/stop`。
+
+`/task` 将配置好的文字交给当前 AI，不直接运行命令行脚本。AI 仍按自己的工具权限执行任务。停止一个机器人会中断它自己的任务；其他机器人继续运行。已停止的机器人无法接收 `/bots start`，需要从本机启动。
+
+## 固定用户与数据边界
+
+- `allowFrom` 是每个机器人的普通用户名单，空名单默认拒绝普通用户。`adminUsers` 单独指定管理员；管理员可管理当前机器人并查看同类 AI 的本机历史，应只填机器人的负责人。
+- 群内仍检查用户身份。配置 `groupPolicy: allowlist` 与 `groupAllowFrom` 后，只在指定群工作；空群名单允许私聊、拒绝群聊。`requireMention: true` 要求群里 @ 机器人。
+- 普通用户默认只能接续当前聊天／话题绑定的历史。`sessionRoots` 是**明确共享历史**的目录列表，会把这些目录下的同类 AI 历史开放给该机器人的获准用户；不应随手填整个个人目录。
+- `workingDirectory`、项目别名、`AGENTS.md` 和环境变量过滤都不是文件系统沙箱。不同机器人共用系统账户时，保留完整工具权限的 AI 仍可能访问该账户能读到的文件。
+
+详见 [完整配置示例](config.example.yaml)。机器人使用飞书工具时，为不同账号配置各自的 `larkCliConfigDir`，不要把多个用户的个人授权混在同一目录。
+
+## 代理、语音与恢复
+
+macOS 可使用 `network.mode: system` 跟随系统 HTTP/HTTPS 代理；Linux/Windows 使用 `environment` 模式读取代理环境变量。`required: true` 下，代理失效时停止联网任务，不自动改成直连；直连例外只允许本机地址。应用设置不会替代系统 TUN、防火墙或 DNS 防漏规则，忽略代理的工具和系统 DNS 仍需单独验证。
+
+每个机器人分别设置 `speech.stt`（语音转文字）和 `speech.tts`（文字转语音）。DashScope 会收到对应的完整语音或回复文字；不使用的功能可以关闭。DeepSeek、MiniMax 等域名仅出现在代理例外名单中，不表示 cli2im 正在调用这些服务。
+
+恢复缓存保存最近一次任务结束时的回复文字，可能包含私人信息；它不是脱敏副本。目录／文件使用 `700`／`600` 权限，相同系统账户仍能读取。`/result` 只在用户主动请求时取回；程序重启不会自动重做任务或重复补发。详见 [外部服务与本地数据说明](docs/service-inventory.md)。
 
 ## 命令行工具
 
@@ -295,7 +321,18 @@ cli2im handoff --bot ccbot --session <uuid> --workdir ~/projects/myapp
 
 # 查看守护进程状态
 cli2im status
+
+# 需要已有的 CLI2IM_WEB_TOKEN；值不要写进命令行或聊天
+cli2im bots
+cli2im bots stop ccbot
+cli2im bots start ccbot
+cli2im bots restart ccbot
+cli2im doctor
 ```
+
+这些命令作用于本机已经运行的服务。修改源码或通过测试并不代表已经完成部署；更新前备份配置、数据库和上一版构建，再按自己的运行方式重启并验证。
+
+在运行服务的同一目录中验证更新时，使用 `CLI2IM_BUILD_DIR=dist-candidate npm run build`。这会把主程序、CLI、通知钩子和插件钩子写入候选目录，避免覆盖正在运行的 `dist` 和插件构建；它不会部署或重启服务。
 
 ## Agent 插件
 

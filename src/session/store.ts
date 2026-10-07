@@ -42,6 +42,20 @@ const EXPECTED_SESSION_COLUMNS = new Set([
   'last_active_at',
 ]);
 
+export interface SessionAccessBinding {
+  agentName: string;
+  agentSessionId: string;
+  key: SessionKey;
+  workingDirectory: string;
+}
+
+export interface RuntimePreferences {
+  model?: string;
+  recentDirectories?: string[];
+  taskState?: 'running' | 'completed' | 'failed' | 'interrupted';
+  taskUpdatedAt?: number;
+}
+
 export class SessionStore {
   private db: Database;
   private dbPath: string;
@@ -109,6 +123,18 @@ export class SessionStore {
         last_active_at INTEGER NOT NULL
       )
     `);
+
+    db.run(`CREATE TABLE IF NOT EXISTS session_access (
+      agent_name TEXT NOT NULL, agent_session_id TEXT NOT NULL,
+      scope_key TEXT NOT NULL, working_directory TEXT NOT NULL,
+      PRIMARY KEY (agent_name, agent_session_id, scope_key)
+    )`);
+    db.run(`INSERT OR IGNORE INTO session_access
+      SELECT agent_name, agent_session_id, key, working_directory FROM sessions
+      WHERE agent_session_id IS NOT NULL AND agent_session_id <> ''`);
+    db.run(`CREATE TABLE IF NOT EXISTS runtime_preferences (
+      scope_key TEXT PRIMARY KEY, value_json TEXT NOT NULL
+    )`);
 
     db.run(`
       CREATE TABLE IF NOT EXISTS notification_bindings (
@@ -244,6 +270,67 @@ export class SessionStore {
 
   async updateAgentSessionId(id: string, agentSessionId: string): Promise<void> {
     this.db.run('UPDATE sessions SET agent_session_id = ? WHERE id = ?', [agentSessionId, id]);
+    this.db.run(`INSERT OR REPLACE INTO session_access
+      SELECT agent_name, agent_session_id, key, working_directory FROM sessions WHERE id = ?`, [id]);
+    this.save();
+  }
+
+  async listSessionAccess(sessionKey: SessionKey): Promise<SessionAccessBinding[]> {
+    return this.readSessionAccess('scope_key = ?', [sessionKey]);
+  }
+
+  async getSessionAccess(agentName: string, agentSessionId: string): Promise<SessionAccessBinding[]> {
+    return this.readSessionAccess('agent_name = ? AND agent_session_id = ?', [agentName, agentSessionId]);
+  }
+
+  private readSessionAccess(where: string, values: string[]): SessionAccessBinding[] {
+    const stmt = this.db.prepare(`SELECT * FROM session_access WHERE ${where}`);
+    stmt.bind(values);
+    const rows: SessionAccessBinding[] = [];
+    while (stmt.step()) {
+      const row = stmt.getAsObject();
+      rows.push({ agentName: String(row.agent_name), agentSessionId: String(row.agent_session_id),
+        key: String(row.scope_key) as SessionKey, workingDirectory: String(row.working_directory) });
+    }
+    stmt.free();
+    return rows;
+  }
+
+  async getPreferences(key: SessionKey): Promise<RuntimePreferences> {
+    return this.readPreferences(key);
+  }
+
+  private readPreferences(key: SessionKey): RuntimePreferences {
+    const stmt = this.db.prepare('SELECT value_json FROM runtime_preferences WHERE scope_key = ?');
+    stmt.bind([key]);
+    const value = stmt.step() ? String(stmt.getAsObject().value_json) : '{}';
+    stmt.free();
+    try { return JSON.parse(value) as RuntimePreferences; } catch { return {}; }
+  }
+
+  async updatePreferences(key: SessionKey, patch: Partial<RuntimePreferences>, isCurrent?: () => boolean): Promise<void> {
+    if (isCurrent && !isCurrent()) return;
+    const value = { ...this.readPreferences(key), ...patch };
+    this.db.run(`INSERT INTO runtime_preferences VALUES (?, ?)
+      ON CONFLICT(scope_key) DO UPDATE SET value_json = excluded.value_json`, [key, JSON.stringify(value)]);
+    this.save();
+  }
+
+  async markInterruptedTasks(): Promise<number> {
+    const stmt = this.db.prepare('SELECT scope_key, value_json FROM runtime_preferences');
+    const pending: Array<[SessionKey, RuntimePreferences]> = [];
+    while (stmt.step()) {
+      const row = stmt.getAsObject();
+      try {
+        const prefs = JSON.parse(String(row.value_json)) as RuntimePreferences;
+        if (prefs.taskState === 'running') pending.push([String(row.scope_key) as SessionKey, prefs]);
+      } catch { /* Ignore malformed optional metadata. */ }
+    }
+    stmt.free();
+    for (const [key, prefs] of pending) {
+      await this.updatePreferences(key, { ...prefs, taskState: 'interrupted', taskUpdatedAt: Date.now() });
+    }
+    return pending.length;
   }
 
   async updateState(id: string, state: Session['state']): Promise<void> {
@@ -252,6 +339,11 @@ export class SessionStore {
 
   async updateWorkingDirectory(id: string, dir: string): Promise<void> {
     this.db.run('UPDATE sessions SET working_directory = ? WHERE id = ?', [dir, id]);
+  }
+
+  async clearAgentSessionId(id: string): Promise<void> {
+    this.db.run('UPDATE sessions SET agent_session_id = NULL WHERE id = ?', [id]);
+    this.save();
   }
 
   async findIdle(maxIdleMs: number): Promise<Session[]> {
@@ -270,13 +362,12 @@ export class SessionStore {
   }
 
   async listByBot(botName: string): Promise<Session[]> {
-    const pattern = `%:${botName}`;
-    const stmt = this.db.prepare('SELECT * FROM sessions WHERE key LIKE ?');
-    stmt.bind([pattern]);
+    const stmt = this.db.prepare('SELECT * FROM sessions');
 
     const sessions: Session[] = [];
     while (stmt.step()) {
-      sessions.push(this.rowToSession(stmt.getAsObject()));
+      const session = this.rowToSession(stmt.getAsObject());
+      if (session.key.split(':')[2] === botName) sessions.push(session);
     }
     stmt.free();
     return sessions;

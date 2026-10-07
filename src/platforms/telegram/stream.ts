@@ -12,7 +12,8 @@ export class TelegramStreamController {
   private states = new Map<SessionKey, TelegramBufferState>();
   private adapter: PlatformAdapter;
 
-  constructor(adapter: PlatformAdapter, _intervalMs?: number) {
+  constructor(adapter: PlatformAdapter, _intervalMs?: number,
+    private resolveRoute: (key: SessionKey) => AbortableOptions = () => ({})) {
     this.adapter = adapter;
   }
 
@@ -48,9 +49,10 @@ export class TelegramStreamController {
     try {
       if (options.signal?.aborted) return;
       if (options.signal) {
-        await this.adapter.send(state.chatId, { text }, { signal: options.signal });
+        await this.adapter.send(state.chatId, { text }, { ...this.resolveRoute(sessionKey), signal: options.signal });
       } else {
-        await this.adapter.send(state.chatId, { text });
+        const route = this.resolveRoute(sessionKey);
+        await this.adapter.send(state.chatId, { text }, ...(Object.keys(route).length ? [route] : []));
       }
     } catch (err) {
       console.error(`[tg-stream] send error for ${scrubLog(sessionKey)}:`, scrubLog(err));

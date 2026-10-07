@@ -50,7 +50,7 @@ describe('handleBridgeCommand lifecycle cleanup', () => {
     await runCommand(command!.command, command!.args, deps);
     await deps.tgStreamController.finalize(sessionKey);
 
-    expect(deps.agentManager.killAgent).toHaveBeenCalledWith(sessionKey);
+    expect(deps.agentManager.forgetSession).toHaveBeenCalledWith(sessionKey);
     expect(deps.store.delete).toHaveBeenCalledWith('session_row_1');
     expect(deps.adapter.send).toHaveBeenCalledWith('chat_1', { text: '新会话已创建，发消息开始' });
     expect(deps.adapter.send).not.toHaveBeenCalledWith('chat_1', {
@@ -89,8 +89,9 @@ describe('handleBridgeCommand lifecycle cleanup', () => {
     });
   });
 
-  it('resumes with the bot configured agent and working directory', async () => {
+  it('resumes an owned stored session with its authoritative directory', async () => {
     const deps = commandDeps({
+      existingSession: true,
       botConfig: {
         agent: 'claude-code',
         workingDirectory: '/Users/test/project',
@@ -99,15 +100,15 @@ describe('handleBridgeCommand lifecycle cleanup', () => {
 
     await runCommand('resume', ['session_123'], deps);
 
-    expect(deps.handoffService.acceptHandoff).toHaveBeenCalledWith({
+    expect(deps.handoffService.acceptHandoff).toHaveBeenCalledWith(expect.objectContaining({
       botName: 'ccbot',
       sessionId: 'session_123',
-      workDir: '/Users/test/project',
+      workDir: '/Users/test/old-project',
       agentName: 'claude-code',
       chatId: 'chat_1',
-    });
+    }), expect.objectContaining({ lockAlreadyAcquired: true }));
     expect(deps.adapter.send).toHaveBeenCalledWith('chat_1', {
-      text: expect.stringContaining('- 项目: `/Users/test/project`'),
+      text: expect.stringContaining('- 项目: `/Users/test/old-project`'),
     });
     expect(deps.adapter.send).toHaveBeenCalledWith('chat_1', {
       text: expect.stringContaining('- Agent: claude-code'),
@@ -149,7 +150,8 @@ function commandDeps(opts: { existingSession?: boolean; botConfig?: Partial<BotC
           ? {
               id: 'session_row_1',
               key: sessionKey,
-              agentName: 'codex',
+              agentName: opts.botConfig?.agent ?? 'codex',
+              agentSessionId: 'session_123',
               workingDirectory: '/Users/test/old-project',
               state: 'active' as const,
               createdAt: 0,
@@ -159,9 +161,20 @@ function commandDeps(opts: { existingSession?: boolean; botConfig?: Partial<BotC
       )),
       delete: vi.fn(async () => undefined),
       updateWorkingDirectory: vi.fn(async () => undefined),
+      updateAgentSessionId: vi.fn(async () => undefined),
+      updateState: vi.fn(async () => undefined),
+      touch: vi.fn(async () => undefined),
+      clearAgentSessionId: vi.fn(async () => undefined),
+      getOrCreate: vi.fn(async () => ({ id: 'session_row_1' })),
+      getPreferences: vi.fn(async () => ({})),
+      updatePreferences: vi.fn(async () => undefined),
+      getSessionAccess: vi.fn(async () => []),
+      listByBot: vi.fn(async () => []),
+      save: vi.fn(),
     },
     agentManager: {
       killAgent: vi.fn(),
+      forgetSession: vi.fn(),
       cancelAgent: vi.fn(),
       hasProcess: vi.fn(() => false),
       getPendingPermissionForSession: vi.fn(),
@@ -169,6 +182,8 @@ function commandDeps(opts: { existingSession?: boolean; botConfig?: Partial<BotC
     },
     handoffService: {
       acceptHandoff: vi.fn(async () => ({ success: true })),
+      tryAcquireLock: vi.fn(() => true),
+      releaseLock: vi.fn(),
       releaseHandoff: vi.fn(async () => ({
         sessionId: 'agent-session-1',
         resumeCommand: 'codex resume agent-session-1',
@@ -183,6 +198,7 @@ function commandDeps(opts: { existingSession?: boolean; botConfig?: Partial<BotC
       telegram: { token: 'token' },
       workingDirectory: '/Users/test/project',
       allowFrom: ['user_1'],
+      adminUsers: ['user_1'],
       permissionMode: 'blacklist',
       ...opts.botConfig,
     } satisfies BotConfig,
@@ -208,6 +224,7 @@ async function runCommand(
     deps.voiceSessions,
     deps.runtimeState,
     deps.botConfig,
+    { platform: 'telegram', chatType: 'private', userId: 'user_1' },
   );
 }
 

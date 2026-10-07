@@ -1,3 +1,4 @@
+import { spawn } from 'node:child_process';
 import * as lark from '@larksuiteoapi/node-sdk';
 import { extname } from 'node:path';
 import type { Readable } from 'node:stream';
@@ -13,6 +14,9 @@ import type { AbortableOptions } from '../../abort.js';
 import { throwIfAborted } from '../../abort.js';
 import { openVerifiedOutboundFile } from '../../security/outbound-file.js';
 import { assertWithinAttachmentDownloadLimit } from '../../security/download-limits.js';
+import { createPrivateSdkLogger, safeErrorFields } from '../../security/logging.js';
+import { buildChildEnv } from '../../security/child-env.js';
+import { createWebSocketProxyAgent } from '../../security/network-policy.js';
 
 export interface FeishuAdapterConfig {
   appId: string;
@@ -46,12 +50,15 @@ export class FeishuSdkBoundaryError extends Error {
 export class FeishuAdapter implements PlatformAdapter {
   name = 'feishu';
   private client: lark.Client;
-  private wsClient: lark.WSClient;
+  private wsClient?: lark.WSClient;
+  private wsAgent?: ReturnType<typeof createWebSocketProxyAgent>;
   private messageHandler?: (msg: InboundMessage) => void;
   private callbackHandler?: (cb: CallbackQuery) => void;
   private config: FeishuAdapterConfig;
   private processedMessageIds = new Set<string>();
   private botOpenId?: string;
+  private sentMessageRoutes = new Map<string, { chatId: string; threadId?: string; chatType?: string }>();
+  private chatTypes = new Map<string, string>();
 
   constructor(config: FeishuAdapterConfig) {
     this.config = config;
@@ -59,32 +66,52 @@ export class FeishuAdapter implements PlatformAdapter {
       appId: config.appId,
       appSecret: config.appSecret,
       appType: lark.AppType.SelfBuild,
-    });
-
-    this.wsClient = new lark.WSClient({
-      appId: config.appId,
-      appSecret: config.appSecret,
+      logger: createPrivateSdkLogger('feishu'),
       loggerLevel: lark.LoggerLevel.warn,
     });
   }
 
   async connect(): Promise<void> {
+    this.closeConnection();
+    const agent = createWebSocketProxyAgent();
+    const wsClient = new lark.WSClient({
+      appId: this.config.appId,
+      appSecret: this.config.appSecret,
+      loggerLevel: lark.LoggerLevel.warn,
+      logger: createPrivateSdkLogger('feishu'),
+      agent,
+    });
+    this.wsAgent = agent;
+    this.wsClient = wsClient;
     await this.resolveBotIdentity();
+    if (this.wsClient !== wsClient) return;
 
     const eventDispatcher = new lark.EventDispatcher({
       loggerLevel: lark.LoggerLevel.warn,
+      logger: createPrivateSdkLogger('feishu'),
     }).register({
       'im.message.receive_v1': (data: unknown) => this.handleMessage(data),
       'card.action.trigger': (data: unknown) => this.handleCardAction(data),
     });
 
-    await (this.wsClient.start as (params: unknown) => Promise<void>)({
-      eventDispatcher,
-    });
+    try {
+      await (wsClient.start as (params: unknown) => Promise<void>)({ eventDispatcher });
+    } catch (error) {
+      if (this.wsClient === wsClient) this.closeConnection();
+      throw privateFeishuError(error);
+    }
   }
 
   async disconnect(): Promise<void> {
-    this.wsClient.close();
+    this.closeConnection();
+  }
+
+  private closeConnection(): void {
+    const client = this.wsClient;
+    const agent = this.wsAgent;
+    this.wsClient = undefined;
+    this.wsAgent = undefined;
+    try { client?.close({ force: true }); } finally { agent?.destroy(); }
   }
 
   onMessage(handler: (msg: InboundMessage) => void): void {
@@ -97,22 +124,45 @@ export class FeishuAdapter implements PlatformAdapter {
 
   async send(chatId: string, content: OutboundContent, options: AbortableOptions = {}): Promise<string> {
     if (content.card) {
-      return this.sendCard(chatId, content.card, options);
+      return this.sendCard(chatId, content.card, { ...options, threadId: content.threadId ?? options.threadId, replyToMessageId: content.replyToMessageId ?? options.replyToMessageId });
     }
 
     const resp = await atFeishuSdkBoundary(
-      () => this.client.im.message.create({
-        params: { receive_id_type: 'chat_id' as const },
-        data: {
-          receive_id: chatId,
-          msg_type: 'text',
-          content: JSON.stringify({ text: content.text ?? '' }),
-          ...(options.idempotencyKey ? { uuid: options.idempotencyKey } : {}),
-        },
+      () => this.createMessage(chatId, 'text', JSON.stringify({ text: content.text ?? '' }), {
+        ...options,
+        threadId: content.threadId ?? options.threadId,
+        replyToMessageId: content.replyToMessageId ?? options.replyToMessageId,
       }),
       options.signal,
     );
     return requireSuccessfulFeishuMessageId(resp, 'text create');
+  }
+
+  private async createMessage(chatId: string, type: string, content: string, options: AbortableOptions): Promise<unknown> {
+    const data = { msg_type: type, content, ...(options.idempotencyKey ? { uuid: options.idempotencyKey } : {}) };
+    if (options.replyToMessageId) {
+      const response = await this.client.im.message.reply({
+        path: { message_id: options.replyToMessageId },
+        data: { ...data, reply_in_thread: Boolean(options.threadId) },
+      });
+      this.rememberSentRoute(response, chatId, options.threadId);
+      return response;
+    }
+    // A Feishu thread cannot be addressed by thread_id alone; never silently post in the main chat.
+    if (options.threadId) throw new FeishuResponseError('feishu_invalid_response', 'Feishu thread reply requires an anchor message');
+    const response = await this.client.im.message.create({
+      params: { receive_id_type: 'chat_id' as const },
+      data: { ...data, receive_id: chatId },
+    });
+    this.rememberSentRoute(response, chatId);
+    return response;
+  }
+
+  private rememberSentRoute(response: unknown, chatId: string, threadId?: string): void {
+    const messageId = readNestedString(response, ['data', 'message_id']);
+    if ((response as { code?: number } | undefined | null)?.code !== 0 || !messageId) return;
+    this.sentMessageRoutes.set(messageId, { chatId, threadId, chatType: this.chatTypes.get(chatId) });
+    if (this.sentMessageRoutes.size > 2000) this.sentMessageRoutes.delete(this.sentMessageRoutes.keys().next().value!);
   }
 
   async editMessage(_chatId: string, msgId: string, content: string): Promise<void> {
@@ -123,9 +173,9 @@ export class FeishuAdapter implements PlatformAdapter {
   }
 
   async deleteMessage(_chatId: string, msgId: string): Promise<void> {
-    await this.client.im.message.delete({
+    await atFeishuSdkBoundary(() => this.client.im.message.delete({
       path: { message_id: msgId },
-    });
+    }));
   }
 
   async sendFile(chatId: string, file: FilePayload, options: AbortableOptions = {}): Promise<void> {
@@ -139,12 +189,12 @@ export class FeishuAdapter implements PlatformAdapter {
     if (isImageFile(file.name || file.path)) {
       throwIfAborted(options.signal);
       const uploadResp = await withFeishuUploadHint(
-        this.client.im.image.create(withSignal({
+        atFeishuSdkBoundary(() => this.client.im.image.create(withSignal({
           data: {
             image_type: 'message' as const,
             image: stream,
           },
-        }, options.signal)),
+        }, options.signal)), options.signal),
         'image upload',
       );
       throwIfAborted(options.signal);
@@ -154,27 +204,20 @@ export class FeishuAdapter implements PlatformAdapter {
       if (!imageKey) return;
 
       throwIfAborted(options.signal);
-      await this.client.im.message.create(withSignal({
-        params: { receive_id_type: 'chat_id' as const },
-        data: {
-          receive_id: chatId,
-          msg_type: 'image',
-          content: JSON.stringify({ image_key: imageKey }),
-        },
-      }, options.signal));
+      await atFeishuSdkBoundary(() => this.createMessage(chatId, 'image', JSON.stringify({ image_key: imageKey }), options), options.signal);
       throwIfAborted(options.signal);
       return;
     }
 
     throwIfAborted(options.signal);
     const uploadResp = await withFeishuUploadHint(
-      this.client.im.file.create(withSignal({
+      atFeishuSdkBoundary(() => this.client.im.file.create(withSignal({
         data: {
           file_type: 'stream' as const,
           file_name: file.name,
           file: stream,
         },
-      }, options.signal)),
+      }, options.signal)), options.signal),
       'file upload',
     );
     throwIfAborted(options.signal);
@@ -184,21 +227,12 @@ export class FeishuAdapter implements PlatformAdapter {
     if (!fileKey) return;
 
     throwIfAborted(options.signal);
-    await this.client.im.message.create(withSignal({
-      params: { receive_id_type: 'chat_id' as const },
-      data: {
-        receive_id: chatId,
-        msg_type: 'file',
-        content: JSON.stringify({ file_key: fileKey }),
-      },
-    }, options.signal));
+    await atFeishuSdkBoundary(() => this.createMessage(chatId, 'file', JSON.stringify({ file_key: fileKey }), options), options.signal);
     throwIfAborted(options.signal);
   }
 
   async sendAudio(chatId: string, audioBuffer: Buffer, options: AbortableOptions = {}): Promise<void> {
     throwIfAborted(options.signal);
-    const { spawn } = await import('node:child_process');
-    const { Readable } = await import('node:stream');
     throwIfAborted(options.signal);
 
     const opusBuffer = await new Promise<Buffer | null>((resolve, reject) => {
@@ -207,7 +241,7 @@ export class FeishuAdapter implements PlatformAdapter {
         const proc = spawn('ffmpeg', [
           '-i', 'pipe:0', '-c:a', 'libopus', '-b:a', '64k',
           '-ar', '48000', '-ac', '1', '-f', 'ogg', 'pipe:1',
-        ], { stdio: ['pipe', 'pipe', 'pipe'] });
+        ], { stdio: ['pipe', 'pipe', 'pipe'], env: buildChildEnv('local-tool') });
         const abort = () => {
           proc.kill('SIGTERM');
           reject(new DOMException('Operation aborted', 'AbortError'));
@@ -241,28 +275,30 @@ export class FeishuAdapter implements PlatformAdapter {
     }
 
     const { createReadStream: createTmpRead } = await import('node:fs');
-    const { writeFile: writeTmp, rm: rmTmp } = await import('node:fs/promises');
+    const { mkdtemp, writeFile: writeTmp, rm: rmTmp } = await import('node:fs/promises');
     const { join: joinPath } = await import('node:path');
     const { tmpdir: getTmpdir } = await import('node:os');
-    const tmpPath = joinPath(getTmpdir(), `cli2im-opus-${Date.now()}.ogg`);
     throwIfAborted(options.signal);
-    await writeTmp(tmpPath, opusBuffer);
+    const tmpDirectory = await mkdtemp(joinPath(getTmpdir(), 'cli2im-opus-'));
+    const tmpPath = joinPath(tmpDirectory, 'voice.ogg');
     let uploadResp: unknown;
     let fileStream: ReturnType<typeof createTmpRead> | undefined;
     try {
+      await writeTmp(tmpPath, opusBuffer, { mode: 0o600, flag: 'wx' });
       throwIfAborted(options.signal);
-      fileStream = createTmpRead(tmpPath);
-      uploadResp = await this.client.im.file.create(withSignal({
+      const uploadStream = createTmpRead(tmpPath);
+      fileStream = uploadStream;
+      uploadResp = await atFeishuSdkBoundary(() => this.client.im.file.create(withSignal({
         data: {
           file_type: 'opus' as const,
           file_name: 'voice.opus',
-          file: fileStream,
+          file: uploadStream,
         },
-      }, options.signal));
+      }, options.signal)), options.signal);
       throwIfAborted(options.signal);
     } finally {
       fileStream?.destroy();
-      await rmTmp(tmpPath, { force: true }).catch(() => {});
+      await rmTmp(tmpDirectory, { recursive: true, force: true }).catch(() => {});
     }
 
     const fileKey = readNestedString(uploadResp, ['file_key'])
@@ -270,23 +306,16 @@ export class FeishuAdapter implements PlatformAdapter {
     if (!fileKey) return;
 
     throwIfAborted(options.signal);
-    await this.client.im.message.create(withSignal({
-      params: { receive_id_type: 'chat_id' as const },
-      data: {
-        receive_id: chatId,
-        msg_type: 'audio',
-        content: JSON.stringify({ file_key: fileKey }),
-      },
-    }, options.signal));
+    await atFeishuSdkBoundary(() => this.createMessage(chatId, 'audio', JSON.stringify({ file_key: fileKey }), options), options.signal);
     throwIfAborted(options.signal);
   }
 
   async downloadFile(messageId: string, fileKey: string, type: string, options: AbortableOptions = {}): Promise<Buffer> {
     throwIfAborted(options.signal);
-    const resp = await this.client.im.messageResource.get(withSignal({
+    const resp = await atFeishuSdkBoundary(() => this.client.im.messageResource.get(withSignal({
       path: { message_id: messageId, file_key: fileKey },
       params: { type: type === 'image' ? 'image' : 'file' },
-    }, options.signal));
+    }, options.signal)), options.signal);
     throwIfAborted(options.signal);
     const readable = await getReadableStreamFromResponse(resp);
     throwIfAborted(options.signal);
@@ -296,15 +325,7 @@ export class FeishuAdapter implements PlatformAdapter {
   async sendCard(chatId: string, card: CardPayload, options: AbortableOptions = {}): Promise<string> {
     const cardJson = this.buildCardJson(card);
     const resp = await atFeishuSdkBoundary(
-      () => this.client.im.message.create({
-        params: { receive_id_type: 'chat_id' as const },
-        data: {
-          receive_id: chatId,
-          msg_type: 'interactive',
-          content: JSON.stringify(cardJson),
-          ...(options.idempotencyKey ? { uuid: options.idempotencyKey } : {}),
-        },
-      }),
+      () => this.createMessage(chatId, 'interactive', JSON.stringify(cardJson), options),
       options.signal,
     );
     return requireSuccessfulFeishuMessageId(resp, 'card create');
@@ -397,7 +418,7 @@ export class FeishuAdapter implements PlatformAdapter {
       this.botOpenId = undefined;
       console.warn(
         `[cli2im] Failed to resolve Feishu bot identity: bot=${this.config.botName}`,
-        err,
+        safeErrorFields(err),
       );
     }
   }
@@ -408,6 +429,10 @@ export class FeishuAdapter implements PlatformAdapter {
     const event = unwrapEvent(data);
     const message = event.message;
     if (!message) return;
+    if (message.chat_type === 'p2p' || message.chat_type === 'group') {
+      this.chatTypes.set(message.chat_id, message.chat_type);
+      if (this.chatTypes.size > 2000) this.chatTypes.delete(this.chatTypes.keys().next().value!);
+    }
 
     const msgId = message.message_id;
     if (msgId && this.processedMessageIds.has(msgId)) return;
@@ -485,6 +510,8 @@ export class FeishuAdapter implements PlatformAdapter {
     this.messageHandler({
       platform: 'feishu',
       chatId: message.chat_id,
+      messageId: message.message_id,
+      threadId: message.thread_id,
       userId: sender?.sender_id?.open_id ?? '',
       userName: sender?.sender_id?.open_id,
       text,
@@ -503,20 +530,32 @@ export class FeishuAdapter implements PlatformAdapter {
     const action = asCallbackRecord(raw.action);
     const actionValue = asCallbackRecord(action.value);
     const messageId = readCallbackString(ctx.open_message_id) ?? readCallbackString(raw.open_message_id);
+    const chatId = readCallbackString(ctx.open_chat_id) ?? '';
+    const sentRoute = messageId ? this.sentMessageRoutes.get(messageId) : undefined;
     console.log(
       `[feishu] callback=card_action chat=${callbackChatCategory(ctx.chat_type ?? raw.chat_type)}`
       + ` operator=${readCallbackString(operator.open_id) || readCallbackString(raw.open_id) ? 'present' : 'absent'}`
       + ` message=${messageId ? 'present' : 'absent'} valueKeys=${Object.keys(actionValue).length}`,
     );
     if (!this.callbackHandler) return undefined;
+    if (!sentRoute || sentRoute.chatId !== chatId) {
+      // Reconstructing an old topic from button data would let it target the wrong session.
+      return { toast: { type: 'info', content: '这张卡片已失效，请发送 /status 获取新卡片。' } };
+    }
+    const chatType = sentRoute.chatType ?? this.chatTypes.get(chatId)
+      ?? readCallbackString(ctx.chat_type) ?? readCallbackString(raw.chat_type);
+    if (chatType !== 'p2p' && chatType !== 'group') {
+      return { toast: { type: 'info', content: '请先发送 /status，确认当前聊天后再操作。' } };
+    }
 
     this.callbackHandler({
       platform: 'feishu',
-      chatId: readCallbackString(ctx.open_chat_id) ?? '',
+      chatId,
       userId: readCallbackString(operator.open_id) ?? readCallbackString(raw.open_id) ?? '',
-      chatType: readCallbackString(ctx.chat_type) ?? readCallbackString(raw.chat_type),
+      chatType,
       data: JSON.stringify(action.value ?? {}),
       messageId: messageId ?? '',
+      threadId: sentRoute.threadId,
     });
 
     return undefined;
@@ -620,6 +659,7 @@ interface FeishuMessageEvent {
   };
   message?: {
     message_id?: string;
+    thread_id?: string;
     chat_id: string;
     chat_type?: string;
     message_type?: string;
@@ -690,7 +730,7 @@ function atFeishuSdkBoundary<T>(
   try {
     sdkPromise = Promise.resolve(operation());
   } catch (error) {
-    return Promise.reject(error);
+    return Promise.reject(privateFeishuError(error));
   }
 
   return new Promise<T>((resolve, reject) => {
@@ -714,7 +754,7 @@ function atFeishuSdkBoundary<T>(
     // idempotency remain the caller's recovery boundary.
     void sdkPromise.then(
       (value) => finish(() => resolve(value)),
-      (error: unknown) => finish(() => reject(error)),
+      (error: unknown) => finish(() => reject(privateFeishuError(error))),
     );
     if (signal?.aborted) abort();
   });
@@ -724,14 +764,22 @@ function feishuSdkAbortError(): DOMException {
   return new DOMException('Feishu request aborted', 'AbortError');
 }
 
+function privateFeishuError(error: unknown): Error {
+  if (error instanceof FeishuResponseError || error instanceof FeishuSdkBoundaryError) return error;
+  if (error instanceof Error && error.name === 'AbortError') return feishuSdkAbortError();
+  return Object.assign(new Error('Feishu request failed'), {
+    category: 'feishu_request_failed', ...safeErrorFields(error),
+  });
+}
+
 async function withFeishuUploadHint<T>(operation: Promise<T>, action: string): Promise<T> {
   try {
     return await operation;
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     const hint = 'Feishu file sending requires the app permission scope im:resource.';
-    if (/im:resource|permission|scope|auth|forbidden|denied/i.test(message)) {
-      throw new Error(`${action} failed. ${hint} ${message}`);
+    if (safeErrorFields(err).status === 403 || /im:resource|permission|scope|auth|forbidden|denied/i.test(message)) {
+      throw new Error(`${action} failed. ${hint}`);
     }
     throw err;
   }
@@ -755,10 +803,7 @@ async function readJsonResponse(resp: Response): Promise<unknown> {
 }
 
 function formatFeishuError(body: unknown): string {
-  if (!body || typeof body !== 'object') return String(body);
-  const code = (body as Record<string, unknown>).code;
-  const msg = (body as Record<string, unknown>).msg;
-  return JSON.stringify({ code, msg });
+  return JSON.stringify(safeErrorFields(body));
 }
 
 async function getReadableStreamFromResponse(resp: unknown): Promise<Readable> {

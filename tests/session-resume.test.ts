@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { handleCLISessionResume } from '../src/runtime/session-resume.js';
 import { HandoffService } from '../src/services/handoff.js';
+import { PreparationGuard } from '../src/runtime/preparation-guard.js';
 import type { BotConfig, CallbackQuery, SessionKey } from '../src/types.js';
 
 const validatorMock = vi.hoisted(() => ({
@@ -14,9 +15,7 @@ vi.mock('../src/security/validators.js', () => ({
   validateWorkingDirectory: validatorMock.validateWorkingDirectory,
 }));
 vi.mock('../src/session/cli-scanner.js', () => ({
-  CLISessionScanner: vi.fn(() => ({
-    scan: cliScannerMock.scan,
-  })),
+  CLISessionScanner: vi.fn(function () { return { scan: cliScannerMock.scan }; }),
 }));
 
 describe('handleCLISessionResume', () => {
@@ -27,14 +26,15 @@ describe('handleCLISessionResume', () => {
     cliScannerMock.scan.mockResolvedValue([]);
   });
 
-  it('claims the resume lock before validating callback cwd', async () => {
+  it('claims the resume lock before validating the authoritative stored cwd', async () => {
     const store = storeDeps();
+    store.getByKey.mockResolvedValue({ ...storedSession(), workingDirectory: '/etc' });
     const handoffService = lockingHandoffDeps({ success: true });
     const adapter = { send: vi.fn().mockResolvedValue('msg_1') };
 
     await handleCLISessionResume({
       callback: callback(),
-      resume: { sessionId: 'session_123', cwd: '/etc' },
+      resume: { sessionId: 'session_123', cwd: '/Users/test/forged' },
       botName: 'ccbot',
       botConfig: botConfig(),
       adapter,
@@ -231,7 +231,7 @@ describe('handleCLISessionResume', () => {
 
   it('keeps non-pty callback resume behavior unchanged', async () => {
     validatorMock.validateWorkingDirectory.mockResolvedValue(true);
-    const store = storeDeps();
+    const store = storeDeps('codex');
     const handoffService = handoffDeps({ success: true });
     const adapter = { send: vi.fn().mockResolvedValue('msg_1') };
 
@@ -259,7 +259,8 @@ describe('handleCLISessionResume', () => {
   });
 
   it('does not cancel, interrupt, spawn, or write the store when capability gating rejects resume', async () => {
-    const store = storeDeps();
+    const store = storeDeps('kimi-work', 'old-session');
+    store.getByKey.mockResolvedValue({ ...storedSession('kimi-work', 'old-session'), key: 'feishu:chat_1:kimibot' });
     const cancelAgent = vi.fn();
     const cardController = { interruptCard: vi.fn() };
     const tgStreamController = { interrupt: vi.fn() };
@@ -299,7 +300,143 @@ describe('handleCLISessionResume', () => {
     expect(store.updateState).not.toHaveBeenCalled();
     expect(store.touch).not.toHaveBeenCalled();
   });
+
+  it('ignores a forged button cwd and uses the current scope record', async () => {
+    const store = storeDeps();
+    const handoffService = handoffDeps({ success: true });
+    await handleCLISessionResume(resumeParams({ store, handoffService,
+      resume: { sessionId: 'session_123', cwd: '/Users/other/private' } }));
+    expect(handoffService.acceptHandoff).toHaveBeenCalledWith(expect.objectContaining({
+      workDir: '/Users/test/project',
+    }), expect.anything());
+  });
+
+  it('rejects another conversation session even if the button claims an allowed cwd', async () => {
+    const store = storeDeps();
+    store.getByKey.mockResolvedValue(null);
+    store.listByBot.mockResolvedValue([{ ...storedSession(), key: 'feishu:other_chat:ccbot' }]);
+    cliScannerMock.scan.mockResolvedValue([{ sessionId: 'session_123', cwd: '/Users/test/project' }]);
+    const handoffService = handoffDeps({ success: true });
+    const adapter = { send: vi.fn().mockResolvedValue('msg_1') };
+    await handleCLISessionResume(resumeParams({ store, handoffService, adapter }));
+    expect(handoffService.acceptHandoff).not.toHaveBeenCalled();
+    expect(store.updateAgentSessionId).not.toHaveBeenCalled();
+    expect(adapter.send).toHaveBeenCalledWith('chat_1', { text: 'Resume failed: session not available to this conversation' });
+  });
+
+  it('allows the owner to resume an authoritative desktop session outside the default project', async () => {
+    const store = storeDeps();
+    store.getByKey.mockResolvedValue(null);
+    cliScannerMock.scan.mockResolvedValue([{ sessionId: 'session_123', cwd: '/Users/owner/another-project' }]);
+    const handoffService = handoffDeps({ success: true });
+    await handleCLISessionResume(resumeParams({ store, handoffService,
+      botConfig: botConfig({ adminUsers: ['ou_allowed'] }) }));
+    expect(handoffService.acceptHandoff).toHaveBeenCalledWith(expect.objectContaining({
+      workDir: '/Users/owner/another-project',
+    }), expect.anything());
+  });
+
+  it('does not let an administrator resume an unknown caller-supplied session id', async () => {
+    const store = storeDeps();
+    store.getByKey.mockResolvedValue(null);
+    const handoffService = handoffDeps({ success: true });
+    await handleCLISessionResume(resumeParams({ store, handoffService,
+      botConfig: botConfig({ adminUsers: ['ou_allowed'] }) }));
+    expect(handoffService.acceptHandoff).not.toHaveBeenCalled();
+    expect(validatorMock.validateWorkingDirectory).not.toHaveBeenCalled();
+  });
+
+  it('checks callback identity again inside the queued resume handler', async () => {
+    const store = storeDeps();
+    const handoffService = handoffDeps({ success: true });
+    await handleCLISessionResume(resumeParams({ store, handoffService,
+      callback: callback({ userId: 'ou_removed' }) }));
+    expect(handoffService.tryAcquireLock).not.toHaveBeenCalled();
+    expect(store.getByKey).not.toHaveBeenCalled();
+  });
+
+  it('keeps ownership of historical sessions after /new through stored access bindings', async () => {
+    const store = storeDeps();
+    store.getByKey.mockResolvedValue(null);
+    store.getSessionAccess.mockResolvedValue([storedSession()]);
+    const handoffService = handoffDeps({ success: true });
+    await handleCLISessionResume(resumeParams({ store, handoffService }));
+    expect(handoffService.acceptHandoff).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not resume a sibling topic session in the same group', async () => {
+    const store = storeDeps();
+    store.getByKey.mockResolvedValue(null);
+    store.getSessionAccess.mockResolvedValue([{ ...storedSession(), key: 'feishu:chat_1:ccbot:topic_a' }]);
+    const handoffService = handoffDeps({ success: true });
+    await handleCLISessionResume(resumeParams({ store, handoffService,
+      callback: callback({ chatType: 'group', threadId: 'topic_b' }) }));
+    expect(handoffService.acceptHandoff).not.toHaveBeenCalled();
+  });
+
+  it('does not revive a resume when /stop arrives during the access lookup', async () => {
+    const guard = new PreparationGuard();
+    const key: SessionKey = 'feishu:chat_1:ccbot';
+    const store = storeDeps();
+    const lookup = deferred<Array<ReturnType<typeof storedSession>>>();
+    store.getSessionAccess.mockReturnValue(lookup.promise);
+    const handoffService = handoffDeps({ success: true });
+    const cancelAgent = vi.fn();
+    const adapter = { send: vi.fn().mockResolvedValue('msg') };
+    const pending = handleCLISessionResume(resumeParams({ store, handoffService, adapter,
+      ensureReady: guard.capture(key), agentManager: { cancelAgent } }));
+    await vi.waitFor(() => expect(store.getSessionAccess).toHaveBeenCalledOnce());
+    guard.cancel(key);
+    lookup.resolve([]);
+    await pending;
+    expect(handoffService.acceptHandoff).not.toHaveBeenCalled();
+    expect(cancelAgent).not.toHaveBeenCalled();
+    expect(store.updateWorkingDirectory).not.toHaveBeenCalled();
+    expect(store.updateAgentSessionId).not.toHaveBeenCalled();
+    expect(handoffService.releaseLock).toHaveBeenCalledWith(key);
+    expect(adapter.send).toHaveBeenCalledWith('chat_1', { text: 'Resume failed: request stopped or no longer available' });
+  });
+
+  it('rechecks cancellation after directory validation and before cancelling the old process', async () => {
+    const guard = new PreparationGuard();
+    const key: SessionKey = 'feishu:chat_1:ccbot';
+    const validation = deferred<boolean>();
+    validatorMock.validateWorkingDirectory.mockReturnValue(validation.promise);
+    const store = storeDeps();
+    const handoffService = handoffDeps({ success: true });
+    const cancelAgent = vi.fn();
+    const pending = handleCLISessionResume(resumeParams({ store, handoffService,
+      ensureReady: guard.capture(key), agentManager: { cancelAgent } }));
+    await vi.waitFor(() => expect(validatorMock.validateWorkingDirectory).toHaveBeenCalledOnce());
+    guard.cancel(key);
+    validation.resolve(true);
+    await pending;
+    expect(handoffService.acceptHandoff).not.toHaveBeenCalled();
+    expect(cancelAgent).not.toHaveBeenCalled();
+    expect(store.updateAgentSessionId).not.toHaveBeenCalled();
+  });
+
+  it('does not update the session pointer when cancellation arrives as handoff completes', async () => {
+    const guard = new PreparationGuard();
+    const key: SessionKey = 'feishu:chat_1:ccbot';
+    const store = storeDeps();
+    const handoffService = handoffDeps({ success: true });
+    handoffService.acceptHandoff.mockImplementation(async () => { guard.cancel(key); return { success: true }; });
+    await handleCLISessionResume(resumeParams({ store, handoffService, ensureReady: guard.capture(key) }));
+    expect(store.getOrCreate).not.toHaveBeenCalled();
+    expect(store.updateWorkingDirectory).not.toHaveBeenCalled();
+    expect(store.updateAgentSessionId).not.toHaveBeenCalled();
+  });
 });
+
+function resumeParams(overrides: Partial<Parameters<typeof handleCLISessionResume>[0]> = {}): Parameters<typeof handleCLISessionResume>[0] {
+  return {
+    callback: callback(), resume: { sessionId: 'session_123', cwd: '/Users/test/project' },
+    botName: 'ccbot', botConfig: botConfig(), adapter: { send: vi.fn().mockResolvedValue('msg_1') },
+    store: storeDeps(), agentManager: { cancelAgent: vi.fn() }, handoffService: handoffDeps({ success: true }),
+    cardController: undefined, tgStreamController: undefined, ...overrides,
+  };
+}
 
 function callback(overrides: Partial<CallbackQuery> = {}): CallbackQuery {
   return {
@@ -324,8 +461,17 @@ function botConfig(overrides: Partial<BotConfig> = {}): BotConfig {
   };
 }
 
-function storeDeps() {
+function storedSession(agentName = 'claude-code', agentSessionId = 'session_123') {
+  return { id: 'session_row_1', key: 'feishu:chat_1:ccbot' as SessionKey,
+    agentName, agentSessionId, workingDirectory: '/Users/test/project',
+    state: 'active' as const, createdAt: 0, lastActiveAt: 0 };
+}
+
+function storeDeps(agentName = 'claude-code', sessionId = 'session_123') {
   return {
+    getByKey: vi.fn<() => Promise<ReturnType<typeof storedSession> | null>>().mockResolvedValue(storedSession(agentName, sessionId)),
+    listByBot: vi.fn<() => Promise<Array<ReturnType<typeof storedSession>>>>().mockResolvedValue([]),
+    getSessionAccess: vi.fn<() => Promise<Array<ReturnType<typeof storedSession>>>>().mockResolvedValue([]),
     getOrCreate: vi.fn().mockResolvedValue({ id: 'session_row_1' }),
     updateAgentSessionId: vi.fn().mockResolvedValue(undefined),
     updateWorkingDirectory: vi.fn().mockResolvedValue(undefined),

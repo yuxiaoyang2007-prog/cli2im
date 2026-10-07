@@ -12,7 +12,7 @@ const config: AppConfig = {
       workingDirectory: '/Users/test/source',
       allowFrom: ['*'],
       permissionMode: 'blacklist',
-      relay: { enabled: true, maxConsecutiveRounds: 5 },
+      relay: { enabled: true, maxConsecutiveRounds: 5, allowFromBots: ['targetbot'] },
     },
     targetbot: {
       agent: 'target-agent',
@@ -21,7 +21,7 @@ const config: AppConfig = {
       workingDirectory: '/Users/test/target',
       allowFrom: ['*'],
       permissionMode: 'blacklist',
-      relay: { enabled: true, maxConsecutiveRounds: 5 },
+      relay: { enabled: true, maxConsecutiveRounds: 5, allowFromBots: ['sourcebot'] },
     },
   },
   agents: {
@@ -120,7 +120,38 @@ describe('relayToOtherBots', () => {
 
     expect(received).toBeDefined();
     expect(received?.isRelay).toBe(true);
+    expect(received?.relayFromBot).toBe('sourcebot');
     expect(received?.text).toBe('Bot A: here is your data trusted');
     expect(received?.text).not.toMatch(/<\s*\/?\s*cti-(?:sender|relay)\b/i);
+  });
+
+  it.each(['no-grant', 'forbidden-group', 'source-disabled', 'target-disabled', 'different-platform'])('does not deliver an unauthorized relay: %s', async (scenario) => {
+    const relayManager = new RelayManager();
+    relayManager.registerBot('sourcebot', 'chat_1', 5);
+    relayManager.registerBot('targetbot', 'chat_1', 5);
+    const modified = structuredClone(config);
+    if (scenario === 'no-grant') modified.bots.targetbot.relay!.allowFromBots = [];
+    if (scenario === 'forbidden-group') modified.bots.targetbot.groupAllowFrom = ['other_group'];
+    if (scenario === 'source-disabled') modified.bots.sourcebot.enabled = false;
+    if (scenario === 'target-disabled') modified.bots.targetbot.enabled = false;
+    if (scenario === 'different-platform') modified.bots.targetbot.platform = 'telegram';
+    const enqueue = vi.fn();
+    await relayToOtherBots('sourcebot', 'chat_1', 'private source text', {
+      relayManager, config: modified, agentManager: { getPlugin: vi.fn() } as never,
+      adapters: new Map(), messageProcessors: new Map([['targetbot', vi.fn()]]), queue: { enqueue } as never,
+    });
+    expect(enqueue).not.toHaveBeenCalled();
+  });
+
+  it('queues an admitted relay by complete target scope', async () => {
+    const relayManager = new RelayManager();
+    relayManager.registerBot('sourcebot', 'chat_1', 5);
+    relayManager.registerBot('targetbot', 'chat_1', 5);
+    const enqueue = vi.fn();
+    await relayToOtherBots('sourcebot', 'chat_1', 'source text', {
+      relayManager, config, agentManager: { getPlugin: vi.fn() } as never,
+      adapters: new Map(), messageProcessors: new Map([['targetbot', vi.fn()]]), queue: { enqueue } as never,
+    });
+    expect(enqueue).toHaveBeenCalledWith('feishu:chat_1:targetbot', expect.any(Function));
   });
 });

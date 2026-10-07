@@ -32,6 +32,12 @@ describe('parseTelegramUpdate', () => {
     expect(msg?.raw).toBeDefined();
   });
 
+  it('carries the same platform topic identity from messages and callbacks', () => {
+    const message = { message_id: 11, message_thread_id: 55, chat: { id: -1001, type: 'supergroup' }, from: { id: 42 }, text: 'hello' };
+    expect(parseTelegramUpdate({ message })).toMatchObject({ messageId: '11', threadId: '55' });
+    expect(parseTelegramCallback({ callback_query: { message, from: { id: 42 }, data: 'status' } })).toMatchObject({ messageId: '11', threadId: '55' });
+  });
+
   it('parses captions and the largest photo attachment', () => {
     const msg = parseTelegramUpdate({
       update_id: 2,
@@ -152,6 +158,7 @@ describe('TelegramAdapter', () => {
   afterEach(() => {
     vi.useRealTimers();
     vi.unstubAllGlobals();
+    vi.unstubAllEnvs();
     globalThis.fetch = originalFetch;
   });
 
@@ -271,12 +278,86 @@ describe('TelegramAdapter', () => {
 
     expect(consoleSpy).toHaveBeenCalledWith(
       'Telegram polling failed:',
-      expect.not.stringContaining('TOKEN'),
+      {},
     );
-    expect(consoleSpy).toHaveBeenCalledWith(
-      'Telegram polling failed:',
-      expect.stringContaining('<redacted-token>'),
-    );
+    expect(JSON.stringify(consoleSpy.mock.calls)).not.toMatch(/TOKEN|api.telegram/);
+  });
+
+  it('routes text and voice into the explicitly supplied topic', async () => {
+    const adapter = new TelegramAdapter({ token: 'TOKEN', botName: 'testbot' });
+    const fetchMock = vi.mocked(fetch);
+    fetchMock.mockResolvedValue(new Response(JSON.stringify({ ok: true, result: { message_id: 1 } })));
+    await adapter.send('-1001', { text: 'hello', threadId: '55', replyToMessageId: '11' });
+    const payload = JSON.parse(String(fetchMock.mock.calls[0][1]?.body));
+    expect(payload).toMatchObject({ chat_id: '-1001', message_thread_id: 55, reply_parameters: { message_id: 11 } });
+    fetchMock.mockResolvedValue(new Response(JSON.stringify({ ok: true, result: {} })));
+    await adapter.sendVoice('-1001', Buffer.from('voice'), { threadId: '55', replyToMessageId: '11' });
+    const form = fetchMock.mock.calls[1][1]?.body as FormData;
+    expect(form.get('message_thread_id')).toBe('55');
+    expect(form.get('reply_parameters')).toBe('{"message_id":11}');
+  });
+
+  it('sends recovery text verbatim without enabling Markdown parsing', async () => {
+    const adapter = new TelegramAdapter({ token: 'TOKEN', botName: 'testbot' });
+    const text = '原文 * [brackets](url) _name_ <xml> \\ # heading\n```code```';
+    await adapter.send('chat', { text, plainText: true });
+    const payload = JSON.parse(String(vi.mocked(fetch).mock.calls[0][1]?.body));
+    expect(payload.text).toBe(text);
+    expect(payload).not.toHaveProperty('parse_mode');
+  });
+
+  it('aborts an old long poll and never dispatches or reschedules it across a restart', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'cli2im-tg-generation-'));
+    vi.stubEnv('HOME', home);
+    mkdirSync(join(home, '.cli2im'));
+    const offsetPath = join(home, '.cli2im', 'telegram-offset-testbot.json');
+    writeFileSync(offsetPath, '{"offset":5}');
+    let resolveOld!: (response: Response) => void;
+    let resolveNew!: (response: Response) => void;
+    const fetchMock = vi.mocked(fetch);
+    fetchMock.mockImplementationOnce(() => new Promise((resolve) => { resolveOld = resolve; }));
+    fetchMock.mockImplementationOnce(() => new Promise((resolve) => { resolveNew = resolve; }));
+    const adapter = new TelegramAdapter({ token: 'TOKEN', botName: 'testbot' });
+    const handler = vi.fn();
+    adapter.onMessage(handler);
+    await adapter.connect();
+    await vi.advanceTimersByTimeAsync(0);
+    const oldSignal = fetchMock.mock.calls[0][1]?.signal;
+    expect(oldSignal?.aborted).toBe(false);
+    await adapter.connect();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    await adapter.disconnect();
+    expect(oldSignal?.aborted).toBe(true);
+    await adapter.connect();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    resolveOld(jsonResponse({ ok: true, result: [{ update_id: 9000, message: { message_id: 90, chat: { id: 1 }, from: { id: 2 }, text: 'stale' } }] }));
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(handler).not.toHaveBeenCalled();
+    expect(JSON.parse(readFileSync(offsetPath, 'utf8'))).toEqual({ offset: 5 });
+    resolveNew(jsonResponse({ ok: true, result: [{ update_id: 10, message: { message_id: 11, chat: { id: 1 }, from: { id: 2 }, text: 'current' } }] }));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(handler).toHaveBeenCalledWith(expect.objectContaining({ text: 'current' }));
+    expect(handler).toHaveBeenCalledOnce();
+    expect(JSON.parse(readFileSync(offsetPath, 'utf8'))).toEqual({ offset: 11 });
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    await adapter.disconnect();
+  });
+
+  it('does not echo provider descriptions, malformed response content, or URL tokens', async () => {
+    const adapter = new TelegramAdapter({ token: 'TOKEN', botName: 'testbot' });
+    const fetchMock = vi.mocked(fetch);
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({ ok: false, description: 'private-chat-content TOKEN' }), { status: 403 }));
+    await expect(adapter.send('chat', { text: 'hello' })).rejects.toThrow('Telegram sendMessage failed: HTTP 403');
+    fetchMock.mockResolvedValueOnce(new Response('private-chat-content TOKEN'));
+    await expect(adapter.send('chat', { text: 'hello' })).rejects.toThrow('Telegram returned an invalid response');
+    fetchMock.mockRejectedValueOnce(new Error('https://api.telegram.org/botTOKEN/sendMessage'));
+    const failure = await adapter.send('chat', { text: 'hello' }).catch((error) => error);
+    expect(failure.message).toBe('Telegram network request failed');
+    expect(failure).not.toHaveProperty('cause');
   });
 
   it('sends card buttons as Telegram inline keyboard callbacks', async () => {

@@ -1,3 +1,4 @@
+import { buildChildEnv } from '../security/child-env.js';
 import { EventEmitter } from 'node:events';
 import { constants } from 'node:fs';
 import { access, readFile } from 'node:fs/promises';
@@ -95,13 +96,6 @@ function stringValue(value: unknown): string {
   } catch {
     return String(value);
   }
-}
-
-function redactKimiLog(line: string): string {
-  return line
-    .replace(/(token=)[^\s]+/gi, '$1[redacted]')
-    .replace(/(Bearer\s+)[^\s]+/gi, '$1[redacted]')
-    .replace(/("apiKey"\s*:\s*")[^"]+/gi, '$1[redacted]');
 }
 
 // Resolve when `promise` settles OR after `ms`, whichever comes first. Never
@@ -498,7 +492,7 @@ export class KimiWorkPlugin implements AgentPlugin {
 
   async preflight(): Promise<{ ok: boolean; version?: string; error?: string }> {
     try {
-      const env = { ...process.env, ...this.config.env };
+      const env = buildChildEnv('kimi-work', this.config.env);
       await access('/Applications/Kimi.app', constants.R_OK);
       await access(this.config.binary, constants.X_OK);
       const nodePath = await resolveKimiNodePath(env);
@@ -666,11 +660,8 @@ export class KimiWorkPlugin implements AgentPlugin {
         generation,
         new Error(`kimi-daimon exited with code ${code}`),
       ));
-      spawned.child.stderr?.setEncoding('utf8');
-      spawned.child.stderr?.on('data', (chunk: string) => {
-        const line = chunk.trim();
-        if (line) console.log(`[kimi-work] ${redactKimiLog(line)}`);
-      });
+      // Drain without storing provider output; it may include chat content or credentials.
+      spawned.child.stderr?.resume();
       await rpc.connect();
       if (this.shared !== shared) throw new Error('kimi-daimon start superseded');
       return shared;

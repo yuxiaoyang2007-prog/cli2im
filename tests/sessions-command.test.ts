@@ -10,24 +10,16 @@ const scannerMocks = vi.hoisted(() => ({
 }));
 
 vi.mock('../src/session/cli-scanner.js', () => ({
-  CLISessionScanner: vi.fn(() => ({
-    scan: scannerMocks.cliScan,
-  })),
+  CLISessionScanner: vi.fn(function () { return { scan: scannerMocks.cliScan }; }),
 }));
 vi.mock('../src/session/codex-scanner.js', () => ({
-  CodexSessionScanner: vi.fn(() => ({
-    scan: scannerMocks.codexScan,
-  })),
+  CodexSessionScanner: vi.fn(function () { return { scan: scannerMocks.codexScan }; }),
 }));
 vi.mock('../src/session/gemini-scanner.js', () => ({
-  GeminiSessionScanner: vi.fn(() => ({
-    scan: scannerMocks.geminiScan,
-  })),
+  GeminiSessionScanner: vi.fn(function () { return { scan: scannerMocks.geminiScan }; }),
 }));
 vi.mock('../src/session/antigravity-scanner.js', () => ({
-  AntigravitySessionScanner: vi.fn(() => ({
-    scan: scannerMocks.antigravityScan,
-  })),
+  AntigravitySessionScanner: vi.fn(function () { return { scan: scannerMocks.antigravityScan }; }),
 }));
 
 const sessionKey = 'telegram:chat_1:ccbot' as SessionKey;
@@ -44,7 +36,7 @@ describe('/sessions command scanner selection', () => {
     scannerMocks.antigravityScan.mockResolvedValue([session('antigravity-session')]);
   });
 
-  it('keeps SDK Claude and Codex /sessions scanner calls unfiltered', async () => {
+  it('scans compatible histories and filters before limiting the displayed list', async () => {
     const sdkDeps = commandDeps({
       botConfig: botConfig({
         agent: 'claude-code',
@@ -52,7 +44,7 @@ describe('/sessions command scanner selection', () => {
       }),
     });
     await runCommand('sessions', [], sdkDeps);
-    expect(scannerMocks.cliScan).toHaveBeenLastCalledWith();
+    expect(scannerMocks.cliScan).toHaveBeenLastCalledWith({ limit: Number.MAX_SAFE_INTEGER });
 
     const codexDeps = commandDeps({
       botConfig: botConfig({
@@ -61,7 +53,7 @@ describe('/sessions command scanner selection', () => {
       }),
     });
     await runCommand('sessions', [], codexDeps);
-    expect(scannerMocks.codexScan).toHaveBeenLastCalledWith();
+    expect(scannerMocks.codexScan).toHaveBeenLastCalledWith({ limit: Number.MAX_SAFE_INTEGER });
   });
 
   it('treats agy default /sessions as Antigravity, not Gemini', async () => {
@@ -74,13 +66,13 @@ describe('/sessions command scanner selection', () => {
 
     await runCommand('sessions', [], deps);
 
-    expect(scannerMocks.antigravityScan).toHaveBeenCalledWith();
+    expect(scannerMocks.antigravityScan).toHaveBeenCalledWith({ limit: Number.MAX_SAFE_INTEGER });
     expect(scannerMocks.geminiScan).not.toHaveBeenCalled();
     expect(scannerMocks.cliScan).not.toHaveBeenCalled();
     expect(scannerMocks.codexScan).not.toHaveBeenCalled();
   });
 
-  it('keeps explicit Gemini /sessions requests on the Gemini scanner', async () => {
+  it('rejects alternate agent history in a bot that cannot resume it', async () => {
     const deps = commandDeps({
       botConfig: botConfig({
         agent: 'agy',
@@ -90,10 +82,42 @@ describe('/sessions command scanner selection', () => {
 
     await runCommand('sessions', ['gemini'], deps);
 
-    expect(scannerMocks.geminiScan).toHaveBeenCalledWith();
+    expect(scannerMocks.geminiScan).not.toHaveBeenCalled();
     expect(scannerMocks.antigravityScan).not.toHaveBeenCalled();
     expect(scannerMocks.cliScan).not.toHaveBeenCalled();
     expect(scannerMocks.codexScan).not.toHaveBeenCalled();
+    expect(deps.adapter.send).toHaveBeenCalledWith('chat_1', { text: '请在对应 AI 的机器人中查看历史对话' });
+  });
+
+  it('does not reveal unrelated titles to ordinary users even in the same project', async () => {
+    const deps = commandDeps({ botConfig: botConfig({ adminUsers: [] }) });
+    scannerMocks.cliScan.mockResolvedValue([{ ...session('private-session'), title: 'OTHER_USER_PRIVATE_TITLE' }, session('mine')]);
+    deps.store.listSessionAccess.mockResolvedValue([{ key: sessionKey, agentName: 'claude-code', agentSessionId: 'mine', workingDirectory: '/Users/test/project' }]);
+    await runCommand('sessions', [], deps);
+    const sent = JSON.stringify(vi.mocked(deps.adapter.send).mock.calls);
+    expect(sent).toContain('mine');
+    expect(sent).not.toContain('OTHER_USER_PRIVATE_TITLE');
+    expect(sent).not.toContain('private-session');
+  });
+
+  it('filters same-bot active sessions by scope for ordinary users', async () => {
+    const deps = commandDeps({ botConfig: botConfig({ adminUsers: [] }) });
+    deps.store.listByBot.mockResolvedValue([
+      { key: sessionKey, agentName: 'claude-code', agentSessionId: 'mine', workingDirectory: '/mine' },
+      { key: 'telegram:other:ccbot', agentName: 'claude-code', agentSessionId: 'private-id', workingDirectory: '/private-project' },
+    ]);
+    await runCommand('sessions', ['bot'], deps);
+    const sent = JSON.stringify(vi.mocked(deps.adapter.send).mock.calls);
+    expect(sent).toContain('mine');
+    expect(sent).not.toContain('private-id');
+    expect(sent).not.toContain('/private-project');
+  });
+
+  it('lets the named owner see compatible desktop histories', async () => {
+    const deps = commandDeps({ botConfig: botConfig({}) });
+    scannerMocks.cliScan.mockResolvedValue([session('desktop-session')]);
+    await runCommand('sessions', [], deps);
+    expect(JSON.stringify(vi.mocked(deps.adapter.send).mock.calls)).toContain('desktop-session');
   });
 });
 
@@ -116,6 +140,7 @@ async function runCommand(
     deps.voiceSessions,
     deps.runtimeState,
     deps.botConfig,
+    { platform: 'telegram', userId: 'user_1', chatType: 'private' },
   );
 }
 
@@ -123,11 +148,13 @@ function commandDeps(opts: { botConfig: BotConfig }) {
   return {
     adapter: adapterStub(),
     store: {
-      listByBot: vi.fn(),
+      listByBot: vi.fn<() => Promise<any[]>>().mockResolvedValue([]),
       getByKey: vi.fn(),
+      listSessionAccess: vi.fn<() => Promise<any[]>>().mockResolvedValue([]),
     },
     agentManager: {
       hasProcess: vi.fn(() => false),
+      getPlugin: vi.fn(() => ({ displayName: opts.botConfig.agent })),
     },
     handoffService: {},
     tgStreamController: undefined,
@@ -146,6 +173,7 @@ function botConfig(overrides: Partial<BotConfig>): BotConfig {
     telegram: { token: 'token' },
     workingDirectory: '/Users/test/project',
     allowFrom: ['user_1'],
+    adminUsers: ['user_1'],
     permissionMode: 'blacklist',
     ...overrides,
   };

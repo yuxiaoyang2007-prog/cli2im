@@ -37,6 +37,31 @@ function waitFor(predicate: () => boolean, timeoutMs = 500): Promise<void> {
 }
 
 describe('ClaudeCodePlugin runtime instructions (appendSystemPrompt)', () => {
+  it('filters bridge credentials at the SDK boundary and does not persist raw stderr', async () => {
+    vi.stubEnv('FEISHU_APP_SECRET', 'bridge-private-secret');
+    vi.stubEnv('ANTHROPIC_API_KEY', 'claude-auth-key');
+    const logger = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    const queryFn = vi.fn(({ options }) => (async function* () {
+      expect(options.env).not.toHaveProperty('FEISHU_APP_SECRET');
+      expect(options.env.ANTHROPIC_API_KEY).toBe('claude-auth-key');
+      options.stderr('private-chat-content bridge-private-secret');
+      yield successResult('privacy-test');
+    })());
+    const plugin = new ClaudeCodePlugin('/test/claude', queryFn as any);
+    const proc = plugin.spawn(baseOpts());
+    const events: AgentEvent[] = [];
+    proc.stdout.on('data', (event: AgentEvent) => events.push(event));
+    try {
+      proc.stdin.write(plugin.formatStdinMessage({ role: 'user', content: 'hi' }));
+      await waitFor(() => events.some((event) => event.type === 'result'));
+      expect(JSON.stringify(logger.mock.calls)).not.toMatch(/bridge-private-secret|private-chat-content/);
+    } finally {
+      proc.kill();
+      logger.mockRestore();
+      vi.unstubAllEnvs();
+    }
+  });
+
   it('appends to the claude_code preset rather than replacing the system prompt', async () => {
     let captured: any;
     const queryFn = vi.fn(({ options }) => (async function* () {

@@ -11,6 +11,7 @@ import { ToolGate } from './tool-gate.js';
 import { scanToolResult } from '../security/content-guard.js';
 import { validateWorkingDirectory } from '../security/validators.js';
 import type { Transform } from 'node:stream';
+import { safeErrorFields } from '../security/logging.js';
 
 const PERMISSION_TIMEOUT_MS = 60_000;
 const GRACEFUL_CANCEL_TIMEOUT_MS = 5_000;
@@ -45,9 +46,9 @@ export interface AgentEventContext {
 }
 
 export interface AgentManagerEvents {
-  onEvent: (sessionKey: SessionKey, event: AgentEvent, context: AgentEventContext) => void;
-  onToolBlocked: (sessionKey: SessionKey, command: string, requestId: string) => void;
-  onPermissionTimeout: (sessionKey: SessionKey, requestId: string) => void;
+  onEvent: (sessionKey: SessionKey, event: AgentEvent, context: AgentEventContext) => void | Promise<void>;
+  onToolBlocked: (sessionKey: SessionKey, command: string, requestId: string) => void | Promise<void>;
+  onPermissionTimeout: (sessionKey: SessionKey, requestId: string) => void | Promise<void>;
   onProcessExit: (
     sessionKey: SessionKey,
     code: number | null,
@@ -60,6 +61,14 @@ export type AgentProcessCleanupBinder = (signal: AbortSignal, sessionKey: Sessio
 
 function pendingPermissionKey(sessionKey: SessionKey, requestId: string): string {
   return `${sessionKey}::${requestId}`;
+}
+
+function deliverHandler(handler: () => void | Promise<void>): void {
+  try {
+    void Promise.resolve(handler()).catch(() => console.error('[agent-manager] event handler failed'));
+  } catch {
+    console.error('[agent-manager] event handler failed');
+  }
 }
 
 export class AgentManager {
@@ -86,6 +95,27 @@ export class AgentManager {
 
   listPlugins(): string[] {
     return [...this.plugins.keys()];
+  }
+
+  /** Live agent contexts, excluding pending spawn claims and terminated children. */
+  activeProcessCount(): number {
+    let count = 0;
+    for (const entry of this.contexts.values()) {
+      const context = entry.kind === 'process' ? entry : entry.previous;
+      if (context && !context.signal.aborted) count += 1;
+    }
+    return count;
+  }
+
+  isSessionInUse(agentName: string, agentSessionId: string, exceptSessionKey: SessionKey): boolean {
+    if (!agentSessionId) return false;
+    for (const [key, entry] of this.contexts) {
+      if (key === exceptSessionKey) continue;
+      const context = entry.kind === 'process' ? entry : entry.previous;
+      if (context && !context.signal.aborted && context.agentName === agentName
+        && (context.proc.sessionId || context.sessionAgentId) === agentSessionId) return true;
+    }
+    return false;
   }
 
   async shutdownPlugins(): Promise<void> {
@@ -229,6 +259,12 @@ export class AgentManager {
   }
 
   cancelAgent(sessionKey: SessionKey): void {
+    const entry = this.contexts.get(sessionKey);
+    if (entry?.kind === 'claim') {
+      // Invalidate a pending async validation before it can create a child.
+      if (entry.previous) this.contexts.set(sessionKey, entry.previous);
+      else this.contexts.delete(sessionKey);
+    }
     const ctx = this.getProcessContext(sessionKey);
     if (!ctx) return;
     this.abortContext(ctx);
@@ -255,6 +291,14 @@ export class AgentManager {
   }
 
   killAgent(sessionKey: SessionKey, expectedProc?: AgentProcess): void {
+    if (!expectedProc) {
+      const entry = this.contexts.get(sessionKey);
+      if (entry?.kind === 'claim') {
+        // An explicit /kill also cancels an in-flight start before its child exists.
+        if (entry.previous) this.contexts.set(sessionKey, entry.previous);
+        else this.contexts.delete(sessionKey);
+      }
+    }
     const ctx = this.getProcessContext(sessionKey);
     if (!ctx) return;
     if (expectedProc && ctx.proc !== expectedProc) return;
@@ -265,6 +309,26 @@ export class AgentManager {
       if (!this.isCurrentContext(sessionKey, ctx)) return;
       ctx.proc.kill('SIGKILL');
     }, 5000);
+  }
+
+  /** A new project/conversation must not reuse IDs from an old or still-exiting child. */
+  forgetSession(sessionKey: SessionKey): void {
+    const entry = this.contexts.get(sessionKey);
+    const current = entry?.kind === 'process' ? entry : entry?.previous;
+    const exiting = this.exitingContexts.get(sessionKey);
+    this.contexts.delete(sessionKey);
+    this.exitingContexts.delete(sessionKey);
+    if (exiting) this.disposeContext(exiting);
+    if (!current || current === exiting) return;
+    this.disposeContext(current);
+    let exited = false;
+    current.proc.on('exit', () => { exited = true; });
+    current.proc.kill('SIGTERM');
+    if (exited) return;
+    const timeout = setTimeout(() => {
+      if (!exited) current.proc.kill('SIGKILL');
+    }, 5000);
+    timeout.unref?.();
   }
 
   hasProcess(sessionKey: SessionKey): boolean {
@@ -414,7 +478,7 @@ export class AgentManager {
   ): void {
     ctx.proc.on('exit', (code) => {
       void this.handleProcessExit(sessionKey, ctx, handlers, code).catch((err) => {
-        console.error(`[agent-manager] process exit handler failed for ${sessionKey}:`, err);
+        console.error('[agent-manager] process exit handler failed:', safeErrorFields(err));
       });
     });
   }
@@ -475,7 +539,7 @@ export class AgentManager {
       if (event.type === 'permission_request') {
         if (opts.autoApprove) {
           proc.stdin.write(plugin.formatPermissionResponse(event.id, 'allow'));
-          handlers.onEvent(sessionKey, event, eventContext);
+          deliverHandler(() => handlers.onEvent(sessionKey, event, eventContext));
           return;
         }
 
@@ -490,7 +554,7 @@ export class AgentManager {
             this.clearPendingPermission(sessionKey, event.id, ctx);
 
             proc.stdin.write(plugin.formatPermissionResponse(event.id, 'deny'));
-            handlers.onPermissionTimeout(sessionKey, event.id);
+            deliverHandler(() => handlers.onPermissionTimeout(sessionKey, event.id));
           }, PERMISSION_TIMEOUT_MS);
 
           this.pendingPermissions.set(key, {
@@ -506,7 +570,7 @@ export class AgentManager {
           this.pendingPermissionContexts.set(key, ctx);
           ctx.pendingPermissionKeys.push(key);
 
-          handlers.onToolBlocked(sessionKey, gateResult.command ?? '', event.id);
+          deliverHandler(() => handlers.onToolBlocked(sessionKey, gateResult.command ?? '', event.id));
           return;
         }
 
@@ -528,7 +592,7 @@ export class AgentManager {
         event.output = scanToolResult(event.name, event.output);
       }
 
-      handlers.onEvent(sessionKey, event, eventContext);
+      deliverHandler(() => handlers.onEvent(sessionKey, event, eventContext));
     });
 
     ctx.watchdog = {

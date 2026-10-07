@@ -114,6 +114,31 @@ describe('AgentManager', () => {
     expect(manager.listPlugins()).toEqual(['mock-agent']);
   });
 
+  it('counts live agent contexts rather than configured platform adapters', async () => {
+    manager.registerPlugin(createMockPlugin());
+    expect(manager.activeProcessCount()).toBe(0);
+    const proc = await manager.spawnAgent('feishu:chat:bot', 'mock-agent', {
+      workingDirectory: '/Users/test/project', permissionMode: 'blacklist',
+    }, { onEvent: vi.fn(), onToolBlocked: vi.fn(), onPermissionTimeout: vi.fn(), onProcessExit: vi.fn() });
+    expect(manager.activeProcessCount()).toBe(1);
+    (proc as MockAgentProcess).emitExit(0);
+    await waitFor(() => manager.activeProcessCount() === 0);
+  });
+
+  it('finds an occupied CLI session across chats but excludes the current chat and exited processes', async () => {
+    manager.registerPlugin(createMockPlugin());
+    const proc = await manager.spawnAgent('feishu:chat-A:bot', 'mock-agent', {
+      workingDirectory: '/Users/test/project', permissionMode: 'blacklist',
+    }, { onEvent: vi.fn(), onToolBlocked: vi.fn(), onPermissionTimeout: vi.fn(), onProcessExit: vi.fn() });
+    proc.sessionId = 'cli-session';
+    expect(manager.isSessionInUse('mock-agent', 'cli-session', 'feishu:chat-B:bot')).toBe(true);
+    expect(manager.isSessionInUse('mock-agent', 'cli-session', 'feishu:chat-A:bot')).toBe(false);
+    expect(manager.isSessionInUse('other-agent', 'cli-session', 'feishu:chat-B:bot')).toBe(false);
+    expect(manager.isSessionInUse('mock-agent', '', 'feishu:chat-B:bot')).toBe(false);
+    (proc as MockAgentProcess).emitExit(0);
+    await waitFor(() => !manager.isSessionInUse('mock-agent', 'cli-session', 'feishu:chat-B:bot'));
+  });
+
   it('binds session-scoped buffer cleanup for fresh spawned contexts', async () => {
     const sessionKey = 'telegram:chat_1:ccbot' as const;
     const voiceSessions = new Map([[sessionKey, 'chat_1']]);

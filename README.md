@@ -2,7 +2,7 @@
 
 English | [中文](README.zh-CN.md)
 
-**Run Claude Code / Codex / Gemini / GLM from any IM app you already have.** When you walk away from your desk, the project doesn't stop — pick it up on your phone in Feishu or Telegram, with full streaming output, tool use, slash commands, and one-tap session resume.
+**Use Claude Code, Codex, Gemini, Antigravity, GLM, and Kimi Work through Feishu or Telegram.** Configure people, projects, and accounts per bot, with streaming replies and authorized desktop-session handoff.
 
 This is not a chatbot. CLI2IM spawns the real CLI binaries you already use, preserves all their capabilities, and adds an IM control plane on top.
 
@@ -15,7 +15,7 @@ This is not a chatbot. CLI2IM spawns the real CLI binaries you already use, pres
 You spent the morning at your work laptop driving Claude Code through a refactor. Now you're heading to the airport. With CLI2IM, you don't lose the thread:
 
 - Type `/sessions` in Feishu/Telegram from your phone
-- An interactive list pops up — every local Claude Code or Codex conversation, with title, last message preview, working directory, git branch, and time
+- An interactive list shows compatible sessions you are authorized to access, with title, working directory, git branch, and time
 - Tap **Resume** on the one you were working on
 - The agent boots back up with `--resume <id>`, bound to the IM chat. Streaming output flows into the card. Tool calls, permission prompts, file edits — all work exactly as on the terminal
 
@@ -31,9 +31,9 @@ Bidirectional handoff also works the other way: hand a session running in IM **b
 CLI2IM treats CLI agents as plugins. One YAML config registers as many bots as you want — each tied to a different agent on a different platform, all running as siblings in one daemon:
 
 - **Claude Code** for reasoning-heavy work, **Codex** for coding, **Gemini** and **Antigravity** when you want speed, **GLM (ZCode)** as a China-friendly option. Pick the agent per bot.
-- Each bot reads an **`AGENTS.md`** in its working directory and carries those instructions into every conversation. That's how a bot gets a persona: one bot can be your energy-research assistant with its own routing rules; another can be a locked-down client bot that only touches its own folder. No code — just a file per bot.
+- Each bot can use an **`AGENTS.md`** in its working directory for project instructions. Instructions do not enforce file isolation; strict separation requires separate OS accounts or an actual restricted runtime.
 
-So a single daemon can host your personal Claude Code bot, a teammate's Codex bot, and a sandboxed client bot at the same time, each behaving differently, configured entirely through YAML plus `AGENTS.md`.
+One daemon can host several bots with separate user lists and project settings. They still share the privileges of the OS account running the daemon unless separately isolated.
 
 ### 3. Your IM is already the control plane — no extra app to install
 
@@ -42,7 +42,7 @@ Your team already lives in Feishu. Or you already have Telegram on every device.
 - **Feishu**: WebSocket real-time events (no public IP, no webhook, no port forwarding). Interactive cards stream output line by line. Permission prompts and session resume show up as native card buttons. Voice messages get transcribed via DashScope; text replies can be sent back as voice.
 - **Telegram**: Long polling (works behind any NAT). MarkdownV2 formatting. Inline keyboards for permissions and resume. Voice STT supported.
 
-Compared to "AI desktop apps" (Cursor / Claude Desktop / etc.) that demand a specific client on every device, CLI2IM rides on top of the IM you and your team already have. New device? Already signed in. Phone? Already configured. Sharing with a teammate? Just add them to the group.
+To share a bot, add the person's platform user ID to that bot's allowlist. Group restrictions and mention requirements also apply; joining a group does not grant access by itself.
 
 ---
 
@@ -55,7 +55,7 @@ Compared to "AI desktop apps" (Cursor / Claude Desktop / etc.) that demand a spe
 | **Windows 10 / 11** | ✅ Supported | Working directory paths accept `C:\Users\...` (and other drives' `Users\` dirs). Run as a Windows Service via [NSSM](https://nssm.cc/) or as a scheduled task. |
 
 **Requirements**:
-- Node.js >= 20 (cross-platform)
+- Node.js 24.14+ (24 LTS) or 25.4+ for this version's proxy policy
 - At least one CLI agent installed: [Claude Code](https://docs.anthropic.com/en/docs/claude-code), [Codex CLI](https://github.com/openai/codex), or [Gemini CLI](https://github.com/google-gemini/gemini-cli)
 - A Feishu app or Telegram bot token
 
@@ -190,11 +190,11 @@ Alternatively, run with PowerShell scheduled task or `pm2` (cross-platform proce
 - **Multi-platform**: Feishu/Lark (WebSocket + interactive cards) and Telegram (long polling + inline keyboards)
 - **Streaming output**: Real-time card updates on Feishu, message edits on Telegram, with thinking block visibility toggle
 - **Permission gating**: Dangerous command detection (configurable regex patterns), interactive Allow/Deny buttons, session-level auto-approve
-- **Session resume**: Scan local CLI sessions (`~/.claude/`, `~/.codex/`), display interactive picker in IM, one tap to resume any conversation
+- **Session resume**: Scan compatible local CLI history and filter by current chat, explicitly shared roots, and administrator access; recheck access when a button is clicked
 - **Bidirectional handoff**: Move a session from CLI terminal to IM bot and back — `cli2im handoff` CLI tool included
 - **Per-bot runtime instructions**: Each bot reads an `AGENTS.md` from its working directory and injects it into every conversation — per-bot personas, routing rules, and guardrails without writing code
 - **Voice support**: Speech-to-text transcription for voice messages, text-to-speech for responses (DashScope)
-- **Security**: User allowlists, working directory validation, content filtering, rate limiting, dangerous pattern blocking
+- **Security**: Per-bot user/group lists, history access checks, directory validation, optional content checks, rate limits, and tool approval; these are not an OS sandbox
 - **Session persistence**: SQLite-backed session store with idle cleanup and state tracking
 - **Multi-bot**: Run multiple bots in one process — each bot binds to one agent and one IM platform
 
@@ -271,19 +271,42 @@ Type these in any connected IM chat:
 | Command | Description |
 |---------|-------------|
 | `/new` | Start a new session (terminates current agent) |
-| `/sessions` | List CLI sessions with interactive Resume buttons |
-| `/sessions codex` | Force list Codex CLI sessions |
+| `/sessions` | List compatible, authorized history with Resume buttons |
+| `/sessions codex` | Show authorized Codex history from a Codex bot |
 | `/resume <id>` | Resume a specific agent session by ID |
 | `/handoff` | Release session back to CLI terminal |
-| `/status` | Show current session info |
-| `/stop` | Graceful cancel (SIGTERM) |
-| `/kill` | Force terminate (SIGKILL) |
-| `/cwd <path>` | Change working directory |
+| `/status` | Control card with selected model, project, task state, and supported buttons |
+| `/stop` | Priority cancellation of the current task and pending messages |
+| `/kill` | Priority process termination and pending-message cancellation |
+| `/cwd <path>` or `/cd <path>` | Switch to an authorized directory; the next message starts a fresh conversation |
+| `/projects [alias]` | List configured/recent projects or select one |
+| `/task [name]` | List or submit a configured prompt shortcut |
+| `/result [page]` | Retrieve the last saved terminal result for this chat/topic without rerunning it |
+| `/bots [stop\|restart]` | Administrator: inspect, stop, or restart the current bot |
+| `/doctor [page]` | Administrator: inspect local runtime checks and service inventory, with unverified states marked |
 | `/thinking` | Toggle thinking block visibility (Feishu) |
 | `/fast` | Toggle fast/low-reasoning mode |
 | `/model <name>` | Set model for next agent spawn |
 | `/perm allow\|deny <id>` | Respond to a permission request |
 | `/list` | List active bot sessions |
+
+`/model <name>` saves the selection for the next agent process; `/model default` restores the default. Saving a name does not verify the provider supports it. Finish or stop an active task before switching. `/task` submits configured text to the AI rather than directly executing a shell script; the AI retains its configured tool permissions.
+
+## People, accounts, and data boundaries
+
+Use `allowFrom` for each bot's ordinary users and `adminUsers` for its owner/operators. An empty ordinary-user list denies access. Administrators can manage their bot and view compatible desktop history, so grant that role deliberately. `groupPolicy: allowlist` plus `groupAllowFrom` restricts groups as well as users; an empty group list permits private chats only. `requireMention: true` requires mentioning the bot in groups.
+
+Ordinary users can resume history already bound to the current chat/topic. `sessionRoots` explicitly shares compatible desktop history under those directories with authorized users of that bot. A project directory or `AGENTS.md` is not an OS sandbox. Full-tool agents running under the same OS account may read other files accessible to that account. Use separate `larkCliConfigDir` directories for distinct Feishu authorizations.
+
+See [config.example.yaml](config.example.yaml). Stopping one bot interrupts its work without restarting other bots; use the local CLI to start a stopped bot because it cannot receive IM commands.
+
+## Proxy, speech, and recovery
+
+On macOS, `network.mode: system` follows the system HTTP/HTTPS proxy. Linux/Windows use `environment` mode and proxy environment variables. With `required: true`, unavailable proxies pause network work without selecting direct fallback; only localhost exceptions are allowed. Application proxy settings do not enforce OS isolation or prove DNS privacy. System DNS and tools that ignore proxies still need separate verification.
+
+Per-bot `speech.stt` and `speech.tts` independently control DashScope transcription and synthesis. Those services receive the complete incoming audio or the reply text being spoken. A provider hostname in `NO_PROXY` alone is not evidence that the bridge calls that provider.
+
+Recovery stores the latest terminal reply per authorized scope, capped at 1 MiB. Replies can contain sensitive material; this is not a redacted copy. Directory/file modes are `700`/`600`, but programs under the same OS account can still read them. `/result` requires an explicit request. Restarts do not automatically rerun tasks or resend ambiguously delivered results. See [service and local-data inventory](docs/service-inventory.md).
 
 ## CLI Tool
 
@@ -295,7 +318,18 @@ cli2im handoff --bot ccbot --session <uuid> --workdir ~/projects/myapp
 
 # Check daemon status
 cli2im status
+
+# Uses an existing CLI2IM_WEB_TOKEN; do not paste its value into commands or chat.
+cli2im bots
+cli2im bots stop ccbot
+cli2im bots start ccbot
+cli2im bots restart ccbot
+cli2im doctor
 ```
+
+These commands target a running local daemon. Source changes or passing tests do not deploy an update. Back up configuration, database, and the previous build before restarting and verifying your deployment.
+
+When validating in a checkout used by a live daemon, run `CLI2IM_BUILD_DIR=dist-candidate npm run build`. Explicit candidate builds put the daemon, CLI, notification hooks, and plugin hooks under that directory without overwriting live `dist` or plugin artifacts. This does not deploy or restart the daemon.
 
 ## Agent Plugins
 

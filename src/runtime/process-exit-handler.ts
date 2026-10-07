@@ -12,6 +12,7 @@ import { persistAgentSessionIdIfCurrent } from './agent-session-id.js';
 type SessionIdStore = Pick<SessionStore, 'getByKey' | 'updateAgentSessionId'>;
 
 export interface RuntimeProcessExitHandlerDeps {
+  onExit?: () => Promise<void>;
   sessionKey: SessionKey;
   store: SessionIdStore;
   stopTyping: (chatId: string) => void;
@@ -45,9 +46,11 @@ export function createRuntimeProcessExitHandler(
     const signal = exitContext.signal;
     const isCurrent = () => exitContext.isCurrent() && getCurrentContext(sk)?.signal === signal && !signal.aborted;
 
-    console.log(`[pipeline] ${scrubLog(sk)}: process exited with code=${code}`);
+    console.log(`[pipeline] process_exited code=${code}`);
     stopTyping(chatId);
 
+    if (!isCurrent()) return;
+    await deps.onExit?.();
     if (!isCurrent()) return;
 
     try {

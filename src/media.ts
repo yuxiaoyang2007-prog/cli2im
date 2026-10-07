@@ -14,7 +14,7 @@ export async function downloadInboundAttachments(
 ): Promise<void> {
   if (!msg.attachments?.length || !adapter.downloadFile) return;
 
-  await mkdir(targetDir, { recursive: true });
+  await mkdir(targetDir, { recursive: true, mode: 0o700 });
   await ensureTargetDirGitignore(targetDir);
   for (const attachment of msg.attachments) {
     if (attachment.localPath || !attachment.fileKey || !attachment.messageId) continue;
@@ -29,7 +29,7 @@ export async function downloadInboundAttachments(
     );
     assertWithinAttachmentDownloadLimit(data.byteLength);
     const path = join(targetDir, buildAttachmentFileName(attachment));
-    await writeFile(path, data);
+    await writeFile(path, data, { mode: 0o600, flag: 'wx' });
     attachment.localPath = path;
   }
 }

@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
+import { request } from 'node:http';
 import { HttpServer, isAuthorizedBearerToken } from '../src/services/server.js';
 
 describe('isAuthorizedBearerToken', () => {
@@ -17,6 +18,39 @@ describe('isAuthorizedBearerToken', () => {
 });
 
 describe('HttpServer handoff validation', () => {
+  it('does not use an untrusted Host header as a URL parser base', async () => {
+    const server = new HttpServer('secret-token', deps({}));
+    await server.start('127.0.0.1', 0);
+    try {
+      const address = (server as unknown as { server: import('node:http').Server }).server.address() as { port: number };
+      const status = await new Promise<number>((resolve, reject) => {
+        const req = request({ hostname: '127.0.0.1', port: address.port, path: '/health', headers: { Host: '[' } }, res => {
+          res.resume(); res.on('end', () => resolve(res.statusCode!));
+        });
+        req.on('error', reject); req.end();
+      });
+      expect(status).toBe(200);
+    } finally { await server.stop(); }
+  });
+
+  it('cancels a handoff while async directory validation is pending', async () => {
+    let cancelled = false;
+    const acceptHandoff = vi.fn().mockResolvedValue({ success: true });
+    const server = new HttpServer('secret-token', {
+      ...deps({ acceptHandoff }),
+      captureHandoffReadiness: () => () => { if (cancelled) throw new Error('Cancelled'); },
+    }, {
+      botNames: ['ccbot'], agentNames: ['claude-code'], botAgents: { ccbot: 'claude-code' },
+      validateWorkDir: async () => { await Promise.resolve(); cancelled = true; return true; },
+    });
+    await server.start('127.0.0.1', 0);
+    try {
+      const response = await postHandoff(server, { botName: 'ccbot', agentName: 'claude-code', sessionId: 'session_123', workDir: '/tmp' });
+      expect(response.status).toBe(500);
+      expect(acceptHandoff).not.toHaveBeenCalled();
+    } finally { await server.stop(); }
+  });
+
   it('accepts valid handoff requests', async () => {
     const acceptHandoff = vi.fn().mockResolvedValue({ success: true });
     const server = new HttpServer('secret-token', deps({ acceptHandoff }), {

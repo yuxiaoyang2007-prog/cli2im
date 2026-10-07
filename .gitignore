@@ -1,5 +1,6 @@
 node_modules/
 dist/
+dist-candidate/
 dist.bak*/
 dist.broken*/
 *.tsbuildinfo

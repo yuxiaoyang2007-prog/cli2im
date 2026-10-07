@@ -58,7 +58,7 @@ export async function transcribeAudio(
     return data.choices?.[0]?.message?.content?.trim() || null;
   } catch (err) {
     if (isAbortError(err) || options.signal?.aborted) throw err;
-    console.error('[speech] STT failed:', err instanceof Error ? err.message : err);
+    console.error('[speech] stt_request_failed');
     return null;
   }
 }
@@ -129,7 +129,7 @@ export async function synthesizeSpeech(
     return Buffer.from(await audioRes.arrayBuffer());
   } catch (err) {
     if (isAbortError(err) || mergedOptions.signal?.aborted) throw err;
-    console.error('[speech] TTS failed:', err instanceof Error ? err.message : err);
+    console.error('[speech] tts_request_failed');
     return null;
   }
 }

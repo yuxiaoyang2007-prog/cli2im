@@ -1,3 +1,4 @@
+import { buildChildEnv } from '../security/child-env.js';
 import { PassThrough, Writable } from 'node:stream';
 import { EventEmitter } from 'node:events';
 import { query } from '@anthropic-ai/claude-agent-sdk';
@@ -29,7 +30,7 @@ async function resolveCreatedFiles(
   workingDirectory: string,
 ): Promise<FilePayload[]> {
   return resolveSafeFilePayloads(rawPaths, workingDirectory, {
-    log: (msg) => console.warn(msg.replace('[file-marker]', '[claude-created-file]')),
+    log: () => console.warn('[claude-created-file] file candidate rejected'),
   });
 }
 
@@ -566,17 +567,15 @@ export class ClaudeCodeVirtualProcess implements AgentProcess {
       permissionMode,
       allowDangerouslySkipPermissions: permissionMode === 'bypassPermissions' ? true : undefined,
       includePartialMessages: true,
-      env: { ...process.env, ...this.opts.env },
+      env: buildChildEnv('claude-code', this.opts.env),
       systemPrompt: this.opts.appendSystemPrompt
         ? { type: 'preset', preset: 'claude_code', append: this.opts.appendSystemPrompt }
         : this.opts.systemPrompt,
       effort: this.opts.reasoningEffort,
       pathToClaudeCodeExecutable: this.binary,
       canUseTool: this.canUseTool,
-      stderr: (data: string) => {
-        const trimmed = data.trim();
-        if (trimmed) console.warn('[claude-code-sdk] stderr:', trimmed);
-      },
+      // Raw CLI diagnostics can contain prompts, paths, or credentials.
+      stderr: () => undefined,
     };
   }
 
@@ -670,6 +669,7 @@ export class ClaudeCodePlugin implements AgentPlugin {
       const output = execFileSync(this.binary, ['--version'], {
         timeout: 10000,
         encoding: 'utf-8',
+        env: buildChildEnv('claude-code'),
       });
       const version = output.trim();
       return { ok: true, version };

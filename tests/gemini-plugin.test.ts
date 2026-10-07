@@ -127,7 +127,7 @@ describe('GeminiVirtualProcess', () => {
     spawnMock.mockReset();
   });
 
-  it('spawns one Gemini child for the first stdin message using -p', () => {
+  it('sends the first prompt privately over stdin', () => {
     const child = new MockChildProcess(5001);
     spawnMock.mockReturnValue(child);
     const plugin = new GeminiPlugin('/usr/local/bin/gemini');
@@ -143,13 +143,11 @@ describe('GeminiVirtualProcess', () => {
         '--approval-mode',
         'yolo',
         '--skip-trust',
-        '-p',
-        'first turn',
       ],
       expect.objectContaining({
         cwd: '/Users/test/project',
         env: expect.objectContaining({ GEMINI_TEST: '1' }),
-        stdio: ['ignore', 'pipe', 'pipe'],
+        stdio: ['pipe', 'pipe', 'pipe'],
       }),
     );
   });
@@ -191,8 +189,6 @@ describe('GeminiVirtualProcess', () => {
       '--skip-trust',
       '--resume',
       'ses_1',
-      '-p',
-      'second turn',
     ]);
   });
 
@@ -236,11 +232,12 @@ describe('GeminiVirtualProcess', () => {
     proc.stdin.write(plugin.formatStdinMessage({ role: 'user', content: 'fresh retry' }));
 
     expect(spawnMock).toHaveBeenCalledTimes(2);
-    expect(spawnMock.mock.calls[1][1]).toContain('fresh retry');
+    expect(child2.stdinChunks.join('')).toBe('fresh retry');
+    expect(spawnMock.mock.calls[1][1]).not.toContain('fresh retry');
     expect(spawnMock.mock.calls[1][1]).not.toContain('queued stale turn');
   });
 
-  it('falls back to stdin pipe when prompt exceeds 100KB', () => {
+  it('also uses stdin for prompts over 100KB', () => {
     const child = new MockChildProcess(5001);
     spawnMock.mockReturnValue(child);
     const plugin = new GeminiPlugin('/usr/local/bin/gemini');

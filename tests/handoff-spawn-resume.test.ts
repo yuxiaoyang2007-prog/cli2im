@@ -3,6 +3,8 @@ import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createHandoffSpawnResume, startAgentProcessForSession } from '../src/index.js';
+import { PreparationGuard } from '../src/runtime/preparation-guard.js';
+import { QueueCancelledError } from '../src/session/queue.js';
 import type { AgentManagerEvents } from '../src/agents/manager.js';
 import type { AgentPlugin, AgentProcess, BotConfig, Session, SessionKey } from '../src/types.js';
 
@@ -31,7 +33,7 @@ describe('handoff spawnResume store sync', () => {
       sessionKey,
       'codex',
       'agent_session_1',
-      { workingDirectory: '~/project-a', permissionMode: 'blacklist' },
+      expect.objectContaining({ workingDirectory: normalizedWorkDir, permissionMode: 'blacklist' }),
       expect.any(Object),
     );
     expect(store.getOrCreate).toHaveBeenCalledWith(sessionKey, {
@@ -79,20 +81,20 @@ describe('handoff spawnResume store sync', () => {
       sessionKey,
       'claude-code',
       'agent_session_cc',
-      {
+      expect.objectContaining({
         workingDirectory: workDir,
         permissionMode: 'blacklist',
         appendSystemPrompt: 'Resumed sessions still follow this.',
-      },
+      }),
       expect.any(Object),
     );
   });
 
-  it('keeps legacy opts for non-PTY handoff resumes', async () => {
+  it('restores the configured permissions and timeouts on handoff resume', async () => {
     const sessionKey = 'feishu:chat_1:codexbot' as SessionKey;
     const existingSession = sessionRow('row_codex', sessionKey);
     const getBotConfig = vi.fn(() => botConfig({
-      agent: 'claude-code',
+      agent: 'codex',
       permissionMode: 'bypass',
       idleTimeoutMs: 30_000,
     }));
@@ -104,9 +106,59 @@ describe('handoff spawnResume store sync', () => {
       sessionKey,
       'codex',
       'agent_session_codex',
-      { workingDirectory: '~/project-codex', permissionMode: 'blacklist' },
+      expect.objectContaining({ workingDirectory: join(homedir(), 'project-codex'), permissionMode: 'bypass', idleTimeoutMs: 30000 }),
       expect.any(Object),
     );
+  });
+
+  it('restores the bot account directory, persisted model and sandbox options', async () => {
+    const sessionKey = 'feishu:chat_1:codexbot' as SessionKey;
+    const existingSession = sessionRow('row_codex', sessionKey);
+    const getBotConfig = vi.fn(() => botConfig({ larkCliConfigDir: '/Users/test/.lark-bot-one', sandboxMode: 'workspace-write', autoApprove: false }));
+    const { spawnResume, agentManager, store } = createDeps(existingSession, getBotConfig);
+    store.getPreferences.mockResolvedValue({ model: 'selected-model' });
+    await spawnResume(sessionKey, 'codex', 'agent_session_codex', '~/project-codex');
+    expect(agentManager.resumeAgent).toHaveBeenCalledWith(sessionKey, 'codex', 'agent_session_codex',
+      expect.objectContaining({ model: 'selected-model', sandboxMode: 'workspace-write', autoApprove: false,
+        env: { LARKSUITE_CLI_CONFIG_DIR: '/Users/test/.lark-bot-one' } }), expect.anything());
+  });
+
+  it('does not resume when stopped while spawn options are being resolved', async () => {
+    const sessionKey: SessionKey = 'feishu:chat_1:codexbot';
+    const guard = new PreparationGuard();
+    const options = deferred<{ workingDirectory: string; permissionMode: 'blacklist' }>();
+    const resolver = vi.fn(() => options.promise);
+    const { spawnResume, agentManager, store } = createDeps(sessionRow('row', sessionKey), undefined,
+      resolver, key => guard.capture(key));
+    const outcome = spawnResume(sessionKey, 'codex', 'new-session', '/Users/test/project').catch(error => error);
+    await vi.waitFor(() => expect(resolver).toHaveBeenCalledOnce());
+    guard.cancel(sessionKey);
+    options.resolve({ workingDirectory: '/Users/test/project', permissionMode: 'blacklist' });
+    expect(await outcome).toBeInstanceOf(QueueCancelledError);
+    expect(agentManager.resumeAgent).not.toHaveBeenCalled();
+    expect(agentManager.killAgent).not.toHaveBeenCalled();
+    expect(store.updateWorkingDirectory).not.toHaveBeenCalled();
+    expect(store.updateAgentSessionId).not.toHaveBeenCalled();
+  });
+
+  it('kills only the process from this attempt if cancellation arrives during spawn', async () => {
+    const sessionKey: SessionKey = 'feishu:chat_1:codexbot';
+    const guard = new PreparationGuard();
+    const spawned = deferred<AgentProcess>();
+    const { spawnResume, agentManager, store } = createDeps(sessionRow('row', sessionKey));
+    agentManager.resumeAgent.mockReturnValue(spawned.promise);
+    const outcome = spawnResume(sessionKey, 'codex', 'new-session', '/Users/test/project', guard.capture(sessionKey))
+      .catch(error => error);
+    await vi.waitFor(() => expect(agentManager.resumeAgent).toHaveBeenCalledOnce());
+    guard.cancel(sessionKey);
+    const thisProcess = { pid: 991 } as AgentProcess;
+    spawned.resolve(thisProcess);
+    expect(await outcome).toBeInstanceOf(QueueCancelledError);
+    expect(agentManager.killAgent).toHaveBeenCalledExactlyOnceWith(sessionKey, thisProcess);
+    expect(store.updateWorkingDirectory).not.toHaveBeenCalled();
+    expect(store.updateAgentSessionId).not.toHaveBeenCalled();
+    expect(store.updateState).not.toHaveBeenCalled();
+    expect(store.touch).not.toHaveBeenCalled();
   });
 });
 
@@ -170,11 +222,14 @@ function createDeps(
   session: Session,
   getBotConfig?: (botName: string) => BotConfig | undefined,
   resolveSpawnOpts?: Parameters<typeof createHandoffSpawnResume>[4],
+  capturePreparation?: Parameters<typeof createHandoffSpawnResume>[6],
 ) {
   const agentManager = {
     resumeAgent: vi.fn(async () => ({ pid: 123 }) as AgentProcess),
+    killAgent: vi.fn(),
   };
   const store = {
+    getPreferences: vi.fn<() => Promise<{ model?: string }>>().mockResolvedValue({}),
     getOrCreate: vi.fn(async () => session),
     updateWorkingDirectory: vi.fn(async () => undefined),
     updateAgentSessionId: vi.fn(async () => undefined),
@@ -189,7 +244,7 @@ function createDeps(
     agentManager,
     store,
     createEventHandlers,
-    spawnResume: createHandoffSpawnResume(agentManager, store, createEventHandlers, getBotConfig, resolveSpawnOpts),
+    spawnResume: createHandoffSpawnResume(agentManager, store, createEventHandlers, getBotConfig ?? (() => botConfig()), resolveSpawnOpts, undefined, capturePreparation),
   };
 }
 

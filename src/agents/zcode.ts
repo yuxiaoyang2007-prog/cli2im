@@ -1,3 +1,4 @@
+import { buildChildEnv } from '../security/child-env.js';
 import { execFileSync } from 'node:child_process';
 import { EventEmitter } from 'node:events';
 import { PassThrough, Writable } from 'node:stream';
@@ -167,7 +168,8 @@ export class ZcodeVirtualProcess implements AgentProcess {
       onExit: (code, err) => this.handleTransportExit(code, err),
     });
     // Forward zcode stderr to cli2im's logs for debugging.
-    this.rpc.onLog((line) => console.log(`[zcode] ${line}`));
+    // Drain protocol diagnostics without persisting raw agent output.
+    this.rpc.onLog(() => undefined);
 
     this.stdin = new Writable({
       write: (chunk, _encoding, callback) => {
@@ -299,8 +301,7 @@ export class ZcodeVirtualProcess implements AgentProcess {
         // (-32031), archived, or stale. Fall back to a fresh session so the
         // user isn't permanently stuck. The old history is lost, but the bot
         // keeps working — which is the better failure mode for an IM bot.
-        const code = err instanceof ZcodeRpcError ? err.code : undefined;
-        console.warn(`[zcode] session/resume ${this.resumeSessionId} failed (${code ?? 'unknown'}: ${err instanceof Error ? err.message : err}); starting fresh session`);
+        console.warn('[zcode] session/resume failed; starting fresh session');
         this.resumeSessionId = undefined;
         const res = await this.rpc.sendRequest<ZcodeSessionCreateResult>(
           'session/create',
@@ -729,6 +730,7 @@ export class ZcodePlugin implements AgentPlugin {
       const output = execFileSync(process.execPath, [this.binary, '--version'], {
         timeout: 10000,
         encoding: 'utf-8',
+        env: buildChildEnv('zcode'),
       });
       return { ok: true, version: output.trim() };
     } catch (err) {

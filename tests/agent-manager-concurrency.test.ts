@@ -1,5 +1,5 @@
 import { describe, expect, it, vi, beforeEach } from 'vitest';
-import { AgentManager } from '../src/agents/manager.js';
+import { AgentManager, type AgentManagerEvents } from '../src/agents/manager.js';
 import { ToolGate } from '../src/agents/tool-gate.js';
 import type { AgentPlugin, AgentProcess } from '../src/types.js';
 import { EventEmitter, Readable, Transform, Writable } from 'node:stream';
@@ -257,6 +257,111 @@ describe('AgentManager concurrent start claims', () => {
 
     exitGate.resolve();
     await vi.waitFor(() => expect(manager.getLatestSessionId(sessionKey)).toBeUndefined());
+  });
+
+  it('forgets the old session immediately and ignores late output and exit callbacks', async () => {
+    validatorMock.validateWorkingDirectory.mockResolvedValue(true);
+    const handlers = handlersStub();
+    const key = 'feishu:chat:bot' as const;
+    const proc = await manager.spawnAgent(key, 'mock-agent', { workingDirectory: '/project', permissionMode: 'blacklist' }, handlers) as MockAgentProcess;
+    proc.sessionId = 'old-project-session';
+    manager.forgetSession(key);
+    expect(manager.getLatestSessionId(key)).toBeUndefined();
+    expect(manager.getProcess(key)).toBeUndefined();
+    expect(proc.kill).toHaveBeenCalledWith('SIGTERM');
+    proc.pushEvent({ type: 'result', sessionId: 'late-old-session' });
+    proc.emitExit(0);
+    expect(manager.getLatestSessionId(key)).toBeUndefined();
+    expect(handlers.onProcessExit).not.toHaveBeenCalled();
+    expect(handlers.onEvent).not.toHaveBeenCalled();
+  });
+
+  it('forgets IDs retained temporarily during an asynchronous exit handler', async () => {
+    validatorMock.validateWorkingDirectory.mockResolvedValue(true);
+    const gate = deferred<void>();
+    const key = 'feishu:chat:bot' as const;
+    const handlers = { ...handlersStub(), onProcessExit: vi.fn<AgentManagerEvents['onProcessExit']>(() => gate.promise) };
+    const proc = await manager.spawnAgent(key, 'mock-agent', { workingDirectory: '/project', permissionMode: 'blacklist' }, handlers) as MockAgentProcess;
+    proc.sessionId = 'exiting-old-project';
+    proc.emitExit(0);
+    expect(manager.getLatestSessionId(key)).toBe('exiting-old-project');
+    manager.forgetSession(key);
+    expect(manager.getLatestSessionId(key)).toBeUndefined();
+    expect(handlers.onProcessExit.mock.calls[0][2].isCurrent()).toBe(false);
+    gate.resolve();
+  });
+
+  it.each(['cancelAgent', 'killAgent', 'forgetSession'] as const)('%s invalidates a pending start claim before a child exists', async (method) => {
+    const validation = deferred<boolean>();
+    validatorMock.validateWorkingDirectory.mockReturnValue(validation.promise);
+    const key = 'feishu:chat:bot' as const;
+    const pending = manager.spawnAgent(key, 'mock-agent', { workingDirectory: '/project', permissionMode: 'blacklist' }, handlersStub());
+    manager[method](key);
+    validation.resolve(true);
+    await expect(pending).rejects.toThrow(/superseded/);
+    expect(plugin.spawn).not.toHaveBeenCalled();
+    expect(manager.getProcess(key)).toBeUndefined();
+  });
+
+  it('an immediate explicit kill prevents spawn even when directory validation resolves successfully', async () => {
+    validatorMock.validateWorkingDirectory.mockResolvedValue(true);
+    const key = 'feishu:chat:bot' as const;
+    const pending = manager.spawnAgent(key, 'mock-agent', { workingDirectory: '/project', permissionMode: 'blacklist' }, handlersStub());
+    manager.killAgent(key);
+    await expect(pending).rejects.toThrow(/superseded/);
+    expect(plugin.spawn).not.toHaveBeenCalled();
+    expect(manager.hasProcess(key)).toBe(false);
+  });
+
+  it('a kill targeted at an older process does not invalidate a replacement start claim', async () => {
+    validatorMock.validateWorkingDirectory.mockResolvedValueOnce(true);
+    const key = 'feishu:chat:bot' as const;
+    const original = await manager.spawnAgent(key, 'mock-agent', { workingDirectory: '/old', permissionMode: 'blacklist' }, handlersStub()) as MockAgentProcess;
+    const validation = deferred<boolean>();
+    validatorMock.validateWorkingDirectory.mockReturnValueOnce(validation.promise);
+    const pending = manager.spawnAgent(key, 'mock-agent', { workingDirectory: '/new', permissionMode: 'blacklist' }, handlersStub());
+    manager.killAgent(key, original);
+    validation.resolve(true);
+    const replacement = await pending as MockAgentProcess;
+    expect(manager.getProcess(key)).toBe(replacement);
+    expect(manager.hasProcess(key)).toBe(true);
+    expect(replacement.kill).not.toHaveBeenCalled();
+    manager.forgetSession(key);
+    replacement.emitExit(0);
+    original.emitExit(0);
+  });
+
+  it('cancels a pending replacement and its previous child while preserving ordinary resume identity', async () => {
+    validatorMock.validateWorkingDirectory.mockResolvedValueOnce(true);
+    const key = 'feishu:chat:bot' as const;
+    const proc = await manager.spawnAgent(key, 'mock-agent', { workingDirectory: '/project', permissionMode: 'blacklist' }, handlersStub()) as MockAgentProcess;
+    proc.sessionId = 'resume-after-stop';
+    const validation = deferred<boolean>();
+    validatorMock.validateWorkingDirectory.mockReturnValueOnce(validation.promise);
+    const replacement = manager.resumeAgent(key, 'mock-agent', 'replacement', { workingDirectory: '/project', permissionMode: 'blacklist' }, handlersStub());
+    manager.cancelAgent(key);
+    expect(manager.getLatestSessionId(key)).toBe('resume-after-stop');
+    expect(manager.isProcessActive(key)).toBe(false);
+    validation.resolve(true);
+    await expect(replacement).rejects.toThrow(/superseded/);
+    expect(plugin.resume).not.toHaveBeenCalled();
+    proc.emitExit(0);
+  });
+
+  it('catches rejected asynchronous event handlers without persisting their error content', async () => {
+    validatorMock.validateWorkingDirectory.mockResolvedValue(true);
+    const sink = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    const key = 'feishu:chat:bot' as const;
+    try {
+      const proc = await manager.spawnAgent(key, 'mock-agent', { workingDirectory: '/project', permissionMode: 'blacklist' }, {
+        ...handlersStub(), onEvent: async () => { throw new Error('private-content'); },
+      }) as MockAgentProcess;
+      proc.pushEvent({ type: 'text', content: 'hello' });
+      await vi.waitFor(() => expect(sink).toHaveBeenCalledWith('[agent-manager] event handler failed'));
+      expect(JSON.stringify(sink.mock.calls)).not.toContain('private-content');
+      manager.forgetSession(key);
+      proc.emitExit(0);
+    } finally { sink.mockRestore(); }
   });
 
   it('aborts the old event context signal when a process is replaced', async () => {

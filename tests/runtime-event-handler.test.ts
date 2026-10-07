@@ -13,6 +13,21 @@ import type { StreamingCardController } from '../src/platforms/feishu/cards.js';
 const sessionKey = 'telegram:chat_1:sourcebot' as SessionKey;
 
 describe('createRuntimeEventHandler stale continuation guard', () => {
+  it('saves only the completed turn text before final delivery, without replay', async () => {
+    const terminal = vi.fn(async () => {});
+    const stream = { appendText: vi.fn(), finalize: vi.fn(async () => {
+      expect(terminal).toHaveBeenCalled();
+    }) } as unknown as TelegramStreamController;
+    const { handler } = createHandler({ tgStream: stream, onTerminal: terminal, relayToOtherBotsFn: vi.fn() });
+    await handler(sessionKey, { type: 'text', content: 'first' }, context(() => true));
+    expect(terminal).not.toHaveBeenCalled();
+    await handler(sessionKey, { type: 'result', sessionId: 'sid' }, context(() => true));
+    expect(terminal).toHaveBeenLastCalledWith('completed', 'first');
+    await handler(sessionKey, { type: 'text', content: 'second' }, context(() => true));
+    await handler(sessionKey, { type: 'result', sessionId: 'sid' }, context(() => true));
+    expect(terminal).toHaveBeenLastCalledWith('completed', 'second');
+  });
+
   it('bails before text side effects when the context signal is already aborted', async () => {
     const adapter = adapterStub();
     const controller = new AbortController();
@@ -410,6 +425,7 @@ function createHandler(opts: {
   sendVoiceReply?: Parameters<typeof createRuntimeEventHandler>[0]['sendVoiceReply'];
   voiceSessions?: Map<SessionKey, string>;
   storeUpdate?: () => Promise<void>;
+  onTerminal?: Parameters<typeof createRuntimeEventHandler>[0]['onTerminal'];
 }) {
   const store = {
     getByKey: vi.fn(async () => ({
@@ -427,6 +443,7 @@ function createHandler(opts: {
   };
 
   const handler = createRuntimeEventHandler({
+    onTerminal: opts.onTerminal,
     sessionKey,
     store,
     voiceSessions: opts.voiceSessions ?? new Map(),
@@ -436,7 +453,7 @@ function createHandler(opts: {
     voiceResponseBuffer: { value: '' },
     stopTyping: vi.fn(),
     sendVoiceReply: opts.sendVoiceReply ?? vi.fn(),
-    relayDeps: {} as RelayDeps,
+    relayDeps: { config: { bots: { sourcebot: { relay: { enabled: true } } } } } as unknown as RelayDeps,
     relayToOtherBotsFn: opts.relayToOtherBotsFn,
   });
 

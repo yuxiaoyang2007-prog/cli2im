@@ -1,9 +1,10 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { loadConfig, substituteEnvVars } from '../src/config/loader.js';
-import { writeFileSync, mkdirSync, rmSync, realpathSync } from 'node:fs';
+import { loadConfig, loadRuntimeConfig, substituteEnvVars } from '../src/config/loader.js';
+import { writeFileSync, mkdirSync, rmSync, realpathSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import type { AppConfig } from '../src/types.js';
+import { stringify } from 'yaml';
 
 describe('substituteEnvVars', () => {
   it('replaces ${VAR} with env value', () => {
@@ -61,6 +62,93 @@ ${notificationYaml}
 
   afterEach(() => {
     rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  function loadAccessFixture(botChanges: Record<string, unknown> = {}, topLevelChanges: Record<string, unknown> = {}): AppConfig {
+    const fixture = {
+      bots: { testbot: { agent: 'codex', platform: 'telegram', telegram: { token: 'test-token' },
+        workingDirectory: tmpDir, allowFrom: ['user'], permissionMode: 'blacklist', ...botChanges } },
+      agents: { codex: { binary: '/usr/local/bin/codex' } },
+      server: { host: '127.0.0.1', port: 3900, token: 'test-token' }, dangerousPatterns: [],
+      ...topLevelChanges,
+    };
+    const path = join(tmpDir, 'access-config.yaml');
+    writeFileSync(path, stringify(fixture));
+    return loadConfig(path);
+  }
+
+  it('loads explicit access grants and operational settings', () => {
+    const result = loadAccessFixture({ enabled: true, adminUsers: [123, 'user'], allowPublic: false,
+      sessionRoots: [tmpDir], projects: { demo: tmpDir }, shortcuts: { review: { prompt: 'Review current changes', description: 'Review' } },
+      debounceMs: 1000, speech: { stt: true, tts: false }, relay: { enabled: true, allowFromBots: ['trusted'] } },
+    { network: { mode: 'system', required: true, noProxy: ['localhost', '127.0.0.1'] } });
+    expect(result.bots.testbot.adminUsers).toEqual(['123', 'user']);
+    expect(result.bots.testbot.sessionRoots).toEqual([realpathSync(tmpDir)]);
+    expect(result.network?.required).toBe(true);
+  });
+
+  it.each([
+    { enabled: 'yes' }, { allowPublic: 'yes' }, { allowFrom: 'user' }, { adminUsers: ['*'] },
+    { groupAllowFrom: ['*'] }, { sessionRoots: ['/'] }, { debounceMs: -1 }, { debounceMs: '100' },
+    { projects: { test: 3 } }, { shortcuts: { test: { prompt: '' } } }, { speech: { tts: 'yes' } },
+    { relay: { enabled: true, allowFromBots: ['*'] } },
+  ])('rejects invalid access and operational config %j', (changes) => {
+    expect(() => loadAccessFixture(changes)).toThrow();
+  });
+
+  it('keeps empty and legacy wildcard lists parseable without granting public access', () => {
+    expect(loadAccessFixture({ allowFrom: [] }).bots.testbot.allowFrom).toEqual([]);
+    expect(loadAccessFixture({ allowFrom: ['*'] }).bots.testbot.allowPublic).toBeUndefined();
+  });
+
+  it.each([
+    { mode: 'direct', required: true }, { mode: 'system', required: 'yes' },
+    { mode: 'system', required: true, noProxy: 'localhost' },
+  ])('rejects malformed network config %j', (network) => {
+    expect(() => loadAccessFixture({}, { network })).toThrow('Config error: network');
+  });
+
+  it('isolates an invalid bot at runtime while retaining strict validation and source bytes', () => {
+    const valid = loadAccessFixture();
+    const path = join(tmpDir, 'runtime-config.yaml');
+    writeFileSync(path, stringify({ ...valid, bots: {
+      ...valid.bots, broken: { ...valid.bots.testbot, telegram: { token: '' }, adminUsers: ['secret-user'] },
+      malformed: null,
+    } }));
+    const before = readFileSync(path, 'utf8');
+    expect(() => loadConfig(path)).toThrow('missing telegram token');
+    const { config, botErrors } = loadRuntimeConfig(path);
+    expect(Object.keys(config.bots)).toEqual(['testbot']);
+    expect(botErrors).toEqual({ broken: 'Invalid bot configuration', malformed: 'Invalid bot configuration' });
+    expect(JSON.stringify(botErrors)).not.toContain('secret-user');
+    expect(readFileSync(path, 'utf8')).toBe(before);
+  });
+
+  it('disables notification delivery to an isolated bot without breaking healthy bots', () => {
+    const valid = loadAccessFixture();
+    const path = join(tmpDir, 'runtime-notifications.yaml');
+    writeFileSync(path, stringify({ ...valid, bots: { ...valid.bots,
+      broken: { ...valid.bots.testbot, platform: 'feishu', feishu: { appId: 'app', appSecret: '' } } },
+    notifications: { codex: { enabled: true, botName: 'broken', completionSource: 'structured' } } }));
+    const { config, botErrors } = loadRuntimeConfig(path);
+    expect(config.notifications?.codex.enabled).toBe(false);
+    expect(config.bots.testbot).toBeDefined();
+    expect(config.bots.broken).toBeUndefined();
+    expect(botErrors.broken).toBe('Invalid bot configuration');
+  });
+
+  it('runtime tolerance does not mask invalid global config', () => {
+    const valid = loadAccessFixture();
+    const path = join(tmpDir, 'runtime-global.yaml');
+    writeFileSync(path, stringify({ ...valid, server: { port: 3900 } }));
+    expect(() => loadRuntimeConfig(path)).toThrow('server.token');
+  });
+
+  it('does not include YAML source or secret values in parse errors', () => {
+    const path = join(tmpDir, 'runtime-yaml.yaml');
+    writeFileSync(path, 'bots: [private-secret');
+    expect(() => loadRuntimeConfig(path)).toThrow('Config error: invalid YAML');
+    try { loadRuntimeConfig(path); } catch (error) { expect(String(error)).not.toContain('private-secret'); }
   });
 
   it('accepts a valid Codex notification config', () => {

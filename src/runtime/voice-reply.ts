@@ -45,18 +45,18 @@ export async function sendVoiceReply({
 
       if (typeof voiceAdapter.sendVoice === 'function') {
         await voiceAdapter.sendVoice(chatId, audioBuffer, { signal });
-        console.log(`[voice] TTS voice sent for ${scrubLog(sessionKey)}`);
+        console.log('[voice] tts_delivery=success');
         return;
       }
       if (typeof voiceAdapter.sendAudio === 'function') {
         await voiceAdapter.sendAudio(chatId, audioBuffer, { signal });
-        console.log(`[voice] TTS voice sent for ${scrubLog(sessionKey)}`);
+        console.log('[voice] tts_delivery=success');
         return;
       }
     }
   } catch (err) {
     if (isAbortError(err) || signal?.aborted) return;
-    console.error(`[voice] TTS failed for ${scrubLog(sessionKey)}:`, scrubLog(err));
+    console.error('[voice] tts_delivery=failed');
   }
 
   if (!isActive()) return;

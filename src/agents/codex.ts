@@ -1,3 +1,4 @@
+import { buildChildEnv } from '../security/child-env.js';
 import { randomUUID } from 'node:crypto';
 import { mkdir, readdir, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -277,7 +278,7 @@ export class CodexPlugin implements AgentPlugin {
   async preflight(): Promise<{ ok: boolean; version?: string; error?: string }> {
     try {
       const { execFileSync } = await import('node:child_process');
-      const output = execFileSync(this.binary, ['--version'], { timeout: 10000, encoding: 'utf-8' });
+      const output = execFileSync(this.binary, ['--version'], { timeout: 10000, encoding: 'utf-8', env: buildChildEnv('codex') });
       return { ok: true, version: output.trim() };
     } catch (err) {
       return { ok: false, error: err instanceof Error ? err.message : String(err) };
@@ -516,14 +517,8 @@ function createCodexClientOptions(opts: SpawnOpts, binary?: string): Record<stri
   if (apiKey) options.apiKey = apiKey;
   if (baseUrl) options.baseUrl = baseUrl;
 
-  if (opts.env && Object.keys(opts.env).length > 0) {
-    const fullEnv: Record<string, string> = {};
-    for (const [k, v] of Object.entries(process.env)) {
-      if (v !== undefined) fullEnv[k] = v;
-    }
-    Object.assign(fullEnv, opts.env);
-    options.env = fullEnv;
-  }
+  // Always pass an explicit environment; the SDK otherwise inherits all bridge secrets.
+  options.env = buildChildEnv('codex', opts.env);
   return options;
 }
 
@@ -595,7 +590,7 @@ export function formatNonImageAttachment(attachment: NonNullable<UserMessage['at
 async function base64ImageToTempFile(base64Data: string, mimeType: string | undefined, tempFiles: string[]): Promise<string> {
   const ext = extensionForMime(mimeType);
   const path = join(tmpdir(), `cli2im-codex-${randomUUID()}${ext}`);
-  await writeFile(path, Buffer.from(base64Data, 'base64'));
+  await writeFile(path, Buffer.from(base64Data, 'base64'), { mode: 0o600, flag: 'wx' });
   tempFiles.push(path);
   return path;
 }
@@ -642,7 +637,7 @@ async function resolveMarkedFiles(text: string, workingDirectory?: string): Prom
   const candidates = extractFileMarkerCandidates(text);
   if (candidates.length === 0) return [];
   return resolveSafeFilePayloads(candidates, workingDirectory, {
-    log: (msg) => console.warn(msg),
+    log: () => console.warn('[codex-created-file] file candidate rejected'),
   });
 }
 

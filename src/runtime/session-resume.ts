@@ -1,11 +1,13 @@
-import { realpath } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-import { CLISessionScanner } from '../session/cli-scanner.js';
+import { CLISessionScanner, type CLISession } from '../session/cli-scanner.js';
 import { CodexSessionScanner } from '../session/codex-scanner.js';
 import { GeminiSessionScanner } from '../session/gemini-scanner.js';
+import { AntigravitySessionScanner } from '../session/antigravity-scanner.js';
 import { buildHandoffNotification } from '../platforms/feishu/markdown.js';
 import { validateWorkingDirectory } from '../security/validators.js';
+import { canAccessSession, getBotAccessRejection } from '../security/access-policy.js';
+import { buildSessionKey } from '../types.js';
 import type { AgentManager } from '../agents/manager.js';
 import type { HandoffService } from '../services/handoff.js';
 import type { SessionStore } from '../session/store.js';
@@ -22,7 +24,14 @@ export async function handleCLISessionResume(params: {
   botName: string;
   botConfig: BotConfig;
   adapter: Pick<PlatformAdapter, 'send'>;
-  store: Pick<SessionStore, 'getOrCreate' | 'updateAgentSessionId' | 'updateWorkingDirectory' | 'updateState' | 'touch'>;
+  store: Pick<SessionStore, 'getOrCreate' | 'updateAgentSessionId' | 'updateWorkingDirectory' | 'updateState' | 'touch'>
+    & Partial<Pick<SessionStore, 'getByKey' | 'listByBot'>>
+    & { getSessionAccess?: (agentName: string, agentSessionId: string) => Promise<Array<{
+      key: SessionKey; agentName: string; agentSessionId: string; workingDirectory: string;
+    }>> };
+  scanSessions?: (agentName: string) => Promise<CLISession[]>;
+  /** Captured by the caller before queueing; invalidated by stop/reset/shutdown. */
+  ensureReady?: () => void;
   agentManager: Pick<AgentManager, 'cancelAgent'>;
   handoffService: Pick<HandoffService, 'acceptHandoff' | 'tryAcquireLock' | 'releaseLock'>;
   cardController: { interruptCard(sessionKey: SessionKey): void } | undefined;
@@ -32,33 +41,68 @@ export async function handleCLISessionResume(params: {
   if (!callback.chatId) {
     throw new Error('Missing chat id in callback');
   }
+  if (getBotAccessRejection(callback, botConfig)) {
+    await adapter.send(callback.chatId, { text: 'Resume failed: session not available to this conversation' });
+    return;
+  }
+  const ensureReady = () => {
+    params.ensureReady?.();
+    if (getBotAccessRejection(callback, botConfig)) throw new Error('Session no longer available');
+  };
+  try {
+    ensureReady();
+  } catch {
+    await adapter.send(callback.chatId, { text: 'Resume failed: request stopped or no longer available' });
+    return;
+  }
 
   const platform = callback.platform ?? 'feishu';
-  const sessionKey: SessionKey = `${platform}:${callback.chatId}:${botName}`;
+  const sessionKey = buildSessionKey(platform, callback.chatId, botName, callback.threadId);
   if (!handoffService.tryAcquireLock(sessionKey)) {
     await adapter.send(callback.chatId, { text: 'Resume failed: Resume already in progress' });
     return;
   }
 
   try {
-    let workDir = resume.cwd;
-    if (botConfig.agent === 'agy') {
-      // Antigravity does not persist a per-conversation cwd; it always runs in
-      // the bot's working directory, so resume there rather than scanning the
-      // Gemini CLI store (which holds unrelated sessions).
-      workDir = botConfig.workingDirectory || homedir();
-    } else if (!workDir) {
-      const scanner = botConfig.agent === 'gemini'
-        ? new GeminiSessionScanner(join(homedir(), '.gemini'))
-        : botConfig.agent === 'codex'
-          ? new CodexSessionScanner(join(homedir(), '.codex'))
-          : new CLISessionScanner(join(homedir(), '.claude'));
-      const sessions = await scanner.scan();
-      const match = sessions.find((s) => s.sessionId === resume.sessionId);
-      workDir = match?.cwd || homedir();
+    ensureReady();
+    // A card is an untrusted reference, not proof of session ownership or cwd.
+    const current = await store.getByKey?.(sessionKey);
+    ensureReady();
+    const bindings = await store.getSessionAccess?.(botConfig.agent, resume.sessionId) ?? [];
+    ensureReady();
+    const botSessions = await store.listByBot?.(botName) ?? [];
+    ensureReady();
+    const candidates = [current, ...bindings, ...botSessions]
+      .filter((session) => session?.agentSessionId === resume.sessionId && session.agentName === botConfig.agent);
+    let stored = candidates.find((session) => session?.key === sessionKey);
+    if (!stored) {
+      for (const candidate of candidates) {
+        const allowed = candidate && await canAccessSession({ bot: botConfig, actor: callback, sessionKey, session: candidate });
+        ensureReady();
+        if (allowed) {
+          stored = candidate;
+          break;
+        }
+      }
     }
+    const scanned = stored ? undefined : (await (params.scanSessions ?? scanAgentSessions)(botConfig.agent))
+      .find((session) => session.sessionId === resume.sessionId);
+    ensureReady();
+    const record = stored ?? (scanned && { ...scanned, agentName: botConfig.agent });
+    const allowed = record && await canAccessSession({ bot: botConfig, actor: callback, sessionKey, session: record });
+    ensureReady();
+    if (!allowed) {
+      await adapter.send(callback.chatId, { text: 'Resume failed: session not available to this conversation' });
+      return;
+    }
+    // Antigravity records have no cwd. Only an admin or a previously bound scope
+    // can reach here; a configured shared root cannot authorize a cwd-less record.
+    const workDir = stored?.workingDirectory || scanned?.cwd
+      || (botConfig.agent === 'agy' ? botConfig.workingDirectory : '');
 
-    if (!(await validateWorkingDirectory(workDir))) {
+    const validWorkDir = await validateWorkingDirectory(workDir);
+    ensureReady();
+    if (!validWorkDir) {
       await adapter.send(callback.chatId, { text: `Resume failed: invalid cwd \`${workDir}\`` });
       return;
     }
@@ -71,14 +115,18 @@ export async function handleCLISessionResume(params: {
       agentName,
       chatId: callback.chatId,
       platform: callback.platform,
+      threadId: callback.threadId,
     }, {
       lockAlreadyAcquired: true,
+      ...(params.ensureReady ? { ensureReady } : {}),
       beforeProceed: () => {
+        ensureReady();
         agentManager.cancelAgent(sessionKey);
         params.cardController?.interruptCard(sessionKey);
         params.tgStreamController?.interrupt(sessionKey);
       },
     });
+    ensureReady();
 
     if (!result.success) {
       await adapter.send(callback.chatId, { text: `Resume failed: ${result.error}` });
@@ -89,10 +137,15 @@ export async function handleCLISessionResume(params: {
       agentName,
       workingDirectory: workDir,
     });
-    await store.updateAgentSessionId(session.id, resume.sessionId);
+    ensureReady();
     await store.updateWorkingDirectory(session.id, workDir);
+    ensureReady();
+    await store.updateAgentSessionId(session.id, resume.sessionId);
+    ensureReady();
     await store.updateState(session.id, 'active');
+    ensureReady();
     await store.touch(session.id);
+    ensureReady();
 
     await adapter.send(callback.chatId, {
       text: buildHandoffNotification({
@@ -101,30 +154,19 @@ export async function handleCLISessionResume(params: {
         agentName,
       }),
     });
+  } catch {
+    await adapter.send(callback.chatId, { text: 'Resume failed: request stopped or no longer available' }).catch(() => {});
   } finally {
     handoffService.releaseLock(sessionKey);
   }
 }
 
-async function cwdMatchesBotWorkingDirectory(cwd: string, workingDirectory: string): Promise<boolean> {
-  const [cwdRealpath, workingDirectoryRealpath] = await Promise.all([
-    resolveComparablePath(cwd),
-    resolveComparablePath(workingDirectory),
-  ]);
-  return !!cwdRealpath && cwdRealpath === workingDirectoryRealpath;
-}
-
-async function resolveComparablePath(path: string): Promise<string | undefined> {
-  if (!path) return undefined;
-  try {
-    return await realpath(expandHome(path));
-  } catch {
-    return undefined;
-  }
-}
-
-function expandHome(path: string): string {
-  if (path === '~') return homedir();
-  if (path.startsWith('~/')) return join(homedir(), path.slice(2));
-  return path;
+/** Scan the matching CLI only. Filtering/authorization must happen before display. */
+export async function scanAgentSessions(agentName: string): Promise<CLISession[]> {
+  const options = { limit: Number.MAX_SAFE_INTEGER };
+  if (agentName === 'agy') return new AntigravitySessionScanner(join(homedir(), '.gemini', 'antigravity-cli')).scan(options);
+  if (agentName === 'gemini') return new GeminiSessionScanner(join(homedir(), '.gemini')).scan(options);
+  if (agentName === 'codex') return new CodexSessionScanner(join(homedir(), '.codex')).scan(options);
+  if (agentName === 'claude-code') return new CLISessionScanner(join(homedir(), '.claude')).scan(options);
+  return [];
 }

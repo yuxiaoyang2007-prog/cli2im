@@ -1,10 +1,10 @@
-import { loadConfig } from './config/loader.js';
+import { loadRuntimeConfig } from './config/loader.js';
 import { SessionStore } from './session/store.js';
 import { CLISessionScanner } from './session/cli-scanner.js';
 import { CodexSessionScanner } from './session/codex-scanner.js';
 import { GeminiSessionScanner } from './session/gemini-scanner.js';
 import { AntigravitySessionScanner } from './session/antigravity-scanner.js';
-import { ChatQueue } from './session/queue.js';
+import { ChatQueue, MessageBatcher, QueueCancelledError } from './session/queue.js';
 import { AgentManager, type AgentManagerEvents } from './agents/manager.js';
 import { ToolGate } from './agents/tool-gate.js';
 import { ClaudeCodePlugin } from './agents/claude-code.js';
@@ -39,14 +39,14 @@ import {
   downloadInboundAttachments,
   expandHome,
 } from './media.js';
-import { initContentGuard } from './security/content-guard.js';
+import { initContentGuard, contentGuardStatus } from './security/content-guard.js';
 import {
   handlePermissionCallback,
   isCallbackAuthorized,
   parsePermissionCallbackData,
   parseSessionResumeCallback,
 } from './runtime/callbacks.js';
-import { handleCLISessionResume } from './runtime/session-resume.js';
+import { handleCLISessionResume, scanAgentSessions } from './runtime/session-resume.js';
 import { transcribeAudio } from './services/speech.js';
 import { sendVoiceReply } from './runtime/voice-reply.js';
 import type {
@@ -72,6 +72,19 @@ import { join, relative, isAbsolute } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { readFile, realpath, stat, lstat } from 'node:fs/promises';
 import { CodexNotificationService } from './notifications/service.js';
+import { buildSessionKey } from './types.js';
+import { canAccessSession, getBotAccessRejection, isBotAdmin } from './security/access-policy.js';
+import { configureNetworkPolicy, refreshNetworkPolicy, assertNetworkReady, networkPolicyStatus } from './security/network-policy.js';
+import { BotLifecycle } from './runtime/bot-lifecycle.js';
+import { buildControlPanel, parseControlAction } from './runtime/control-panel.js';
+import { ProjectRegistry, buildProjectPanel, parseProjectAction } from './runtime/projects.js';
+import { bindReplyRoute, type ReplyRoute } from './runtime/reply-route.js';
+import { RecoveryStore } from './runtime/result-recovery.js';
+import { TaskTracker } from './runtime/task-tracker.js';
+import { textPage } from './runtime/text-page.js';
+import { PreparationGuard } from './runtime/preparation-guard.js';
+import { saveBotEnabled } from './config/runtime-update.js';
+import { runDoctor, formatDoctorReport, formatServiceInventory } from './services/doctor.js';
 
 const CONFIG_PATH = process.env.CLI2IM_CONFIG ?? join(homedir(), '.cli2im', 'config.yaml');
 const startedAt = Date.now();
@@ -80,10 +93,25 @@ interface RuntimeCommandState {
   fastModeBySession: Map<SessionKey, boolean>;
 }
 
+export interface BridgeControls {
+  defaultModel?: string;
+  queue?: ChatQueue;
+  lifecycle?: BotLifecycle;
+  runPrompt?: (prompt: string) => Promise<void>;
+  doctor?: () => Promise<string>;
+  capturePreparation?: (key: SessionKey) => () => void;
+  cancelScope?: (key: SessionKey) => void;
+  readResult?: (key: SessionKey) => Promise<import('./runtime/result-recovery.js').RecoveredResult | null>;
+  controlBot?: (name: string, action: 'start' | 'stop' | 'restart') => Promise<void>;
+}
+
+
 export interface BridgeCommandSender {
   platform: string;
   chatType?: string;
   userId: string;
+  threadId?: string;
+  messageId?: string;
 }
 
 export function logInboundMessageSummary(
@@ -108,11 +136,12 @@ export function logInboundMessageSummary(
 async function main(): Promise<void> {
   console.log('[cli2im] Starting...');
 
-  const config = loadConfig(CONFIG_PATH);
+  const { config, botErrors } = loadRuntimeConfig(CONFIG_PATH);
+  for (const name of Object.keys(botErrors)) console.warn(`[config] bot=${scrubLog(name)} status=invalid_disabled`);
+  await configureNetworkPolicy(config.network);
   console.log(`[cli2im] Loaded config with ${Object.keys(config.bots).length} bot(s)`);
-  if (config.contentGuard?.enabled !== false) {
-    initContentGuard({ blockThreshold: config.contentGuard?.blockThreshold });
-  }
+  initContentGuard({ enabled: config.contentGuard?.enabled !== false, blockThreshold: config.contentGuard?.blockThreshold });
+  console.log(`[security] content_guard=${contentGuardStatus()}`);
 
   const dataDir = getCli2imDataDir();
   const mediaDir = join(dataDir, 'media');
@@ -121,7 +150,16 @@ async function main(): Promise<void> {
   ensurePrivateDirectorySync(join(dataDir, 'logs'));
 
   const store = await SessionStore.create(config.session.dbPath.replace('~', homedir()));
+  await store.markInterruptedTasks();
   const queue = new ChatQueue();
+  const preparation = new PreparationGuard();
+  const recovery = new RecoveryStore(join(dataDir, 'recovery'));
+  const busyTasks = new TaskTracker();
+  const lifecycle = new BotLifecycle();
+  const routes = new Map<SessionKey, ReplyRoute>();
+  const cardScopes = new Map<string, { threadId?: string }>();
+  const senders = new Map<SessionKey, InboundMessage>();
+  const batchers = new Map<string, MessageBatcher>();
   const toolGate = new ToolGate(config.dangerousPatterns);
   const typingTimers = new Map<string, ReturnType<typeof setInterval>>();
   const relayManager = new RelayManager();
@@ -141,6 +179,15 @@ async function main(): Promise<void> {
       tgStreamController: telegramStreams.get(botName),
     });
   });
+
+  function captureReadiness(key: SessionKey): () => void {
+    const check = preparation.capture(key);
+    return () => {
+      check();
+      if (!lifecycle.status(key.split(':')[2]).acceptsMessages) throw new QueueCancelledError();
+      assertNetworkReady();
+    };
+  }
 
   function startTyping(chatId: string, adapter: PlatformAdapter): void {
     stopTyping(chatId);
@@ -195,7 +242,7 @@ async function main(): Promise<void> {
         botName,
       });
       adapters.set(botName, adapter);
-      telegramStreams.set(botName, new TelegramStreamController(adapter, config.streaming.intervalMs));
+      telegramStreams.set(botName, new TelegramStreamController(adapter, config.streaming.intervalMs, key => routes.get(key) ?? {}));
     }
   }
 
@@ -244,15 +291,27 @@ async function main(): Promise<void> {
         const resolvedBotName = findBotNameForConfig(params.botConfig);
         return resolveBotSpawnOpts({
           ...params,
+          env: { ...config.agents[params.botConfig.agent]?.env,
+            ...(params.botConfig.larkCliConfigDir ? { LARKSUITE_CLI_CONFIG_DIR: params.botConfig.larkCliConfigDir } : {}),
+            ...params.env },
+          model: params.model ?? config.agents[params.botConfig.agent]?.defaultModel,
+          reasoningEffort: params.reasoningEffort ?? config.agents[params.botConfig.agent]?.defaultEffort,
           sandboxExtraRoots: config.sandboxExtraRoots,
           otherProtectedRoots: resolvedBotName ? await collectOtherProtectedRoots(resolvedBotName) : [],
         });
       },
+      key => {
+        const sender = senders.get(key);
+        return sender ? buildSenderEnv({ channel: sender.platform, userId: sender.userId, userName: sender.userName, chatId: sender.chatId, chatType: sender.chatType }) : {};
+      },
+      captureReadiness,
     ),
     getSession: async (sessionKey) => store.getByKey(sessionKey),
     updateState: async (id, state) => store.updateState(id, state),
     getAgentCapabilities: (agentName) => agentManager.getPlugin(agentName)?.capabilities,
     getBotAgent: (botName) => config.bots[botName]?.agent,
+    getBotPlatform: (botName) => config.bots[botName]?.platform,
+    isSessionBusy: (agentName, id, key) => agentManager.isSessionInUse(agentName, id, key),
   });
 
   function createEventHandlers(sessionKey: SessionKey): AgentManagerEvents {
@@ -260,11 +319,20 @@ async function main(): Promise<void> {
     const chatId = sessionKey.split(':')[1];
     const cardController = cardControllers.get(botName);
     const tgStream = telegramStreams.get(botName);
-    const adapter = adapters.get(botName);
+    const rawAdapter = adapters.get(botName);
+    const adapter = rawAdapter && bindReplyRoute(rawAdapter, routes.get(sessionKey) ?? {});
     const voiceResponseBuffer = { value: '' };
 
     return {
       onEvent: createRuntimeEventHandler({
+        onTerminal: async (state, text) => {
+          const completion = busyTasks.finish(sessionKey);
+          // Claim completion before any disk wait. A later turn keeps its running state.
+          const saved = recovery.save(sessionKey, { status: state === 'completed' ? 'completed' : 'error', text })
+            .catch(() => console.error('[recovery] result_save_failed'));
+          await store.updatePreferences(sessionKey, { taskState: completion.remaining ? 'running' : state, taskUpdatedAt: Date.now() }, completion.isCurrent);
+          await saved;
+        },
         sessionKey,
         store,
         voiceSessions,
@@ -306,6 +374,11 @@ async function main(): Promise<void> {
         }
       },
       onProcessExit: createRuntimeProcessExitHandler({
+        onExit: async () => {
+          busyTasks.cancel(sessionKey);
+          if ((await store.getPreferences(sessionKey)).taskState === 'running')
+            await store.updatePreferences(sessionKey, { taskState: 'interrupted', taskUpdatedAt: Date.now() });
+        },
         sessionKey,
         store,
         stopTyping,
@@ -325,31 +398,88 @@ async function main(): Promise<void> {
     const processMessage = createMessageProcessor(botName, botConfig, adapter);
     messageProcessors.set(botName, processMessage);
 
-    adapter.onMessage((msg: InboundMessage) => {
-      void queue.enqueue(msg.chatId, () => processMessage(msg)).catch(() => {
+    const batcher = new MessageBatcher(queue, { delayMs: botConfig.debounceMs ?? 800 });
+    batchers.set(botName, batcher);
+    const admit = async (msg: InboundMessage, isCallback = false) => {
+      if (!lifecycle.status(botName).acceptsMessages) return;
+      if (getBotAccessRejection(msg, botConfig)
+        || getGroupMessageSkipReason(msg, botConfig, getAdapterBotOpenId(adapter))) return;
+      const key = buildSessionKey(msg.platform, msg.chatId, botName, msg.threadId);
+      try {
+        if (!isCallback && !await recovery.acceptIncoming(msg.platform, botName, msg.messageId ? `${msg.chatId}:${msg.messageId}` : '')) return;
+        if (!lifecycle.status(botName).acceptsMessages) return;
+        if (['stop', 'kill'].includes(parseBridgeCommand(msg.text)?.command ?? '')) {
+          preparation.cancel(key);
+          busyTasks.cancel(key);
+        }
+        await batcher.enqueue(key, msg, processMessage);
+      }
+      catch (error) {
+        if (error instanceof QueueCancelledError) return;
         console.error('[pipeline] message_processing_failed');
-      });
-    });
+        busyTasks.cancel(key);
+        await store.updatePreferences(key, { taskState: 'failed', taskUpdatedAt: Date.now() }).catch(() => {});
+        await bindReplyRoute(adapter, routes.get(key) ?? {}).send(msg.chatId, { text: '任务未完成，请查看 /status；程序没有自动重跑。' }).catch(() => {});
+      }
+    };
+    adapter.onMessage(msg => { void admit(msg); });
 
-    adapter.onCallback?.(createCallbackHandler({
-      botName,
-      botConfig,
-      adapter,
-      store,
-      agentManager,
-      handoffService,
-      queue,
-      cardController: cardControllers.get(botName),
-      tgStreamController: telegramStreams.get(botName),
-    }));
+    const callbackHandler = createCallbackHandler({
+      botName, botConfig, adapter, store, agentManager, handoffService, queue, capturePreparation: captureReadiness,
+      cardController: cardControllers.get(botName), tgStreamController: telegramStreams.get(botName),
+      handleControl: async (callback, text) => admit({
+        platform: callback.platform, chatId: callback.chatId, userId: callback.userId,
+        chatType: callback.chatType, messageId: callback.messageId, threadId: callback.threadId,
+        text, mentions: getAdapterBotOpenId(adapter) ? [getAdapterBotOpenId(adapter)!] : [],
+      }, true),
+    });
+    adapter.onCallback?.(callback => {
+      if (!lifecycle.status(botName).acceptsMessages || !isCallbackAuthorized(callback, botConfig)) return;
+      const scope = cardScopes.get(`${botName}:${callback.chatId}:${callback.messageId}`);
+      if (scope) {
+        if (callback.threadId && callback.threadId !== scope.threadId) return;
+        callback.threadId = scope.threadId;
+      }
+      const key = buildSessionKey(callback.platform, callback.chatId, botName, callback.threadId);
+      senders.set(key, { platform: callback.platform, chatId: callback.chatId, userId: callback.userId, chatType: callback.chatType, messageId: callback.messageId, threadId: callback.threadId, text: '' });
+      routes.set(key, callback.threadId ? { threadId: callback.threadId, replyToMessageId: callback.messageId } : {});
+      callbackHandler(callback);
+    });
+    lifecycle.register(botName, {
+      start: async () => { assertNetworkReady(); await adapter.connect(); },
+      stop: async () => {
+        preparation.cancelBot(botName);
+        for (const key of queue.keys()) if (key.split(':')[2] === botName) queue.cancelPending(key);
+        for (const key of busyTasks.keys()) if (key.split(':')[2] === botName) busyTasks.cancel(key);
+        for (const key of batcher.keys()) batcher.cancel(key);
+        for (const session of await store.listByBot(botName)) {
+          queue.cancelPending(session.key);
+          agentManager.cancelAgent(session.key);
+          cardControllers.get(botName)?.interruptCard(session.key);
+          clearSessionScopedBuffers(session.key, { voiceSessions, tgStreamController: telegramStreams.get(botName) });
+          if ((await store.getPreferences(session.key)).taskState === 'running') {
+            await store.updatePreferences(session.key, { taskState: 'interrupted', taskUpdatedAt: Date.now() });
+          }
+        }
+        await adapter.disconnect();
+      },
+    }, { enabled: botConfig.enabled !== false });
   }
 
   function createMessageProcessor(
     botName: string,
     botConfig: BotConfig,
-    adapter: PlatformAdapter,
+    baseAdapter: PlatformAdapter,
   ): (msg: InboundMessage) => Promise<void> {
     return async (msg) => {
+      const scopedKey = buildSessionKey(msg.platform, msg.chatId, botName, msg.threadId);
+      if (!lifecycle.status(botName).acceptsMessages) throw new QueueCancelledError();
+      senders.set(scopedKey, msg);
+      routes.set(scopedKey, msg.threadId ? { threadId: msg.threadId, replyToMessageId: msg.messageId } : {});
+      const adapter = bindReplyRoute(baseAdapter, routes.get(scopedKey) ?? {}, messageId => {
+        cardScopes.set(`${botName}:${msg.chatId}:${messageId}`, { threadId: msg.threadId });
+        if (cardScopes.size > 5000) cardScopes.delete(cardScopes.keys().next().value!);
+      });
       // Lazy relay registration on first group message
       if (msg.chatType === 'group' && botConfig.relay?.enabled) {
         relayManager.registerBot(botName, msg.chatId, botConfig.relay.maxConsecutiveRounds ?? 10);
@@ -381,6 +511,10 @@ async function main(): Promise<void> {
       }
 
       if (ctx.bridgeCommand) {
+        if (['stop', 'kill'].includes(ctx.bridgeCommand.command)) {
+          preparation.cancel(scopedKey);
+          busyTasks.cancel(scopedKey);
+        }
         await handleBridgeCommand(
           ctx.bridgeCommand,
           ctx.sessionKey,
@@ -399,13 +533,28 @@ async function main(): Promise<void> {
             platform: msg.platform,
             chatType: msg.chatType,
             userId: msg.userId,
+            threadId: msg.threadId,
+            messageId: msg.messageId,
           },
           notificationService,
+          { defaultModel: config.agents[botConfig.agent]?.defaultModel, queue, lifecycle,
+            runPrompt: prompt => processMessagePrompt(botName, msg, prompt),
+            doctor: diagnose, controlBot, readResult: key => recovery.read(key),
+            capturePreparation: captureReadiness,
+            cancelScope: key => { preparation.cancel(key); busyTasks.cancel(key); },
+          },
         );
         return;
       }
 
+      assertNetworkReady();
       const sessionKey = ctx.sessionKey;
+      const checkPreparation = preparation.capture(sessionKey);
+      const ensureReady = () => {
+        checkPreparation();
+        if (!lifecycle.status(botName).acceptsMessages) throw new QueueCancelledError();
+        assertNetworkReady();
+      };
       const workingDirectory = (
         botConfig.userOverrides?.[msg.userId]?.workingDirectory
         ?? botConfig.workingDirectory
@@ -415,15 +564,24 @@ async function main(): Promise<void> {
         workingDirectory,
       });
 
-      await store.touch(session.id);
-
+      ensureReady();
+      const previousTask = await store.getPreferences(sessionKey);
+      if (previousTask.taskState === 'interrupted') {
+        await adapter.send(msg.chatId, { text: '上次任务在中途停止，没有自动重跑。这条新消息会继续当前对话。' });
+      }
+      ensureReady();
       let shouldStartNewProcess = false;
       if (config.newMessageBehavior === 'interrupt' && agentManager.hasProcess(sessionKey)) {
+        busyTasks.cancel(sessionKey);
         agentManager.cancelAgent(sessionKey);
         shouldStartNewProcess = true;
         cardControllers.get(botName)?.interruptCard(sessionKey);
         telegramStreams.get(botName)?.interrupt(sessionKey);
       }
+      busyTasks.begin(sessionKey);
+      await store.updatePreferences(sessionKey, { taskState: 'running', taskUpdatedAt: Date.now() });
+      await store.touch(session.id);
+      ensureReady();
 
       const sender: import('./types.js').SenderInfo = msg.isRelay
         ? {
@@ -444,17 +602,20 @@ async function main(): Promise<void> {
       const senderHeader = buildSenderHeader(sender);
       await downloadInboundAttachments(msg, adapter, join(expandHome(session.workingDirectory), 'inbox'));
 
+      ensureReady();
       let pendingVoiceChatId: string | undefined;
-      if (msg.isVoice) {
+      if (msg.isVoice && botConfig.speech?.stt !== false) {
         const audioAttachment = msg.attachments?.find(a => a.type === 'audio' && a.localPath);
         if (audioAttachment?.localPath) {
           const audioBuffer = await readFile(audioAttachment.localPath);
           const format = audioAttachment.mimeType?.includes('ogg') ? 'ogg' : 'mp3';
+          ensureReady();
           const transcript = await transcribeAudio(audioBuffer, format);
+          ensureReady();
           if (transcript) {
             msg.text = sanitizeVoiceTranscript(transcript);
             msg.attachments = msg.attachments?.filter(a => a !== audioAttachment);
-            pendingVoiceChatId = msg.chatId;
+            if (botConfig.speech?.tts !== false) pendingVoiceChatId = msg.chatId;
             console.log(`[voice] stt=success textLength=${msg.text.length}`);
           } else {
             console.warn('[voice] stt=failed fallback=attachment');
@@ -462,16 +623,15 @@ async function main(): Promise<void> {
         }
       }
 
-      const relayDirective = msg.isRelay
-        ? '<cti-relay>CRITICAL: This is an automated bot-to-bot relay. Rules: (1) Do NOT use brainstorming, planning, or design skills. (2) Do NOT ask questions or seek confirmation. (3) Keep your response under 200 words. (4) If the task is done, say "DONE" and stop. (5) If reviewing code, give only actionable findings — no praise, no summary.</cti-relay>\n\n'
-        : '';
-      const messageText = senderHeader + relayDirective + msg.text;
+      ensureReady();
+      const messageText = senderHeader + msg.text;
       const userMessage = await buildUserMessageForAgent(
         botConfig.agent,
         messageText,
         msg.attachments,
       );
 
+      ensureReady();
       const cardController = cardControllers.get(botName);
       if (!cardController && adapter) {
         startTyping(msg.chatId, adapter);
@@ -481,9 +641,11 @@ async function main(): Promise<void> {
         msg.chatId,
         sessionKey,
         botConfig.agent,
-        isNewProcess ? 'Starting...' : undefined,
+        isNewProcess ? '正在开始…' : undefined,
+        routes.get(sessionKey),
       );
 
+      ensureReady();
       if (isNewProcess) {
         console.log(`[pipeline] ${scrubLog(botName)}: agent=${scrubLog(botConfig.agent)} action=spawn`);
         const handlers = createEventHandlers(sessionKey);
@@ -498,7 +660,7 @@ async function main(): Promise<void> {
           botConfig,
           workingDirectory: session.workingDirectory,
           env: spawnEnv,
-          model: config.agents[botConfig.agent]?.defaultModel,
+          model: (await store.getPreferences(sessionKey)).model ?? config.agents[botConfig.agent]?.defaultModel,
           autoApprove: botConfig.autoApprove,
           turnTimeoutMs: botConfig.turnTimeoutMs,
           idleTimeoutMs: botConfig.idleTimeoutMs,
@@ -509,6 +671,7 @@ async function main(): Promise<void> {
           initialPrompt: messageText,
         });
 
+        ensureReady();
         const plugin = agentManager.getPlugin(botConfig.agent);
         const latestId = agentManager.getLatestSessionId(sessionKey) ?? session.agentSessionId;
         if (latestId && plugin?.capabilities.sessionResume) {
@@ -524,9 +687,11 @@ async function main(): Promise<void> {
           agentName: botConfig.agent,
           spawnOpts,
           handlers,
+          ensureReady,
         });
       }
 
+      ensureReady();
       if (pendingVoiceChatId) {
         commitVoiceSessionWhenContextReady(sessionKey, pendingVoiceChatId, {
           voiceSessions,
@@ -534,7 +699,7 @@ async function main(): Promise<void> {
           getContextSignal: (key) => agentManager.getContextSignal(key),
         });
       }
-      await sendAgentMessageOrNotify({
+      const delivered = await sendAgentMessageOrNotify({
         agentManager,
         adapter,
         chatId: msg.chatId,
@@ -542,18 +707,64 @@ async function main(): Promise<void> {
         agentName: botConfig.agent,
         message: userMessage,
       });
+      if (!delivered) {
+        busyTasks.cancel(sessionKey);
+        await store.updatePreferences(sessionKey, { taskState: 'failed', taskUpdatedAt: Date.now() });
+      }
     };
   }
 
+  async function processMessagePrompt(botName: string, original: InboundMessage, prompt: string): Promise<void> {
+    const processor = messageProcessors.get(botName);
+    if (processor) await processor({ ...original, text: prompt });
+  }
+
+  let configUpdate = Promise.resolve();
+  async function controlBot(name: string, action: 'start' | 'stop' | 'restart'): Promise<void> {
+    if (!config.bots[name]) throw new Error('Unknown bot');
+    if (action !== 'stop') assertNetworkReady();
+    if (action === 'restart') { await lifecycle.restart(name, 'cancel'); return; }
+    const enabled = action === 'start';
+    const update = configUpdate.catch(() => {}).then(() => saveBotEnabled(CONFIG_PATH, name, enabled));
+    configUpdate = update;
+    await update;
+    config.bots[name].enabled = enabled;
+    await lifecycle.setEnabled(name, enabled, 'cancel');
+  }
+  async function diagnose(): Promise<string> {
+    const network = networkPolicyStatus();
+    const report = await runDoctor({ config, lifecycle: lifecycle.list(),
+      getPlugin: name => agentManager.getPlugin(name),
+      network: { state: network.ready ? 'ok' : 'error', detail: `${network.mode}; ${network.dns}` },
+      contentGuard: contentGuardStatus(), speechKeyConfigured: Boolean(process.env.DASHSCOPE_STT_API_KEY || process.env.DASHSCOPE_API_KEY),
+      activeTasks: busyTasks.size(),
+    });
+    return formatDoctorReport(report) + '\n\n' + formatServiceInventory(report.services);
+  }
+
   const httpServer = new HttpServer(config.server.token, {
-    acceptHandoff: (req) => handoffService.acceptHandoff(req),
+    captureHandoffReadiness: req => {
+      if (typeof req.botName !== 'string' || !config.bots[req.botName]) return () => {};
+      const key = buildSessionKey(config.bots[req.botName].platform, typeof req.chatId === 'string' ? req.chatId : 'default', req.botName, typeof req.threadId === 'string' ? req.threadId : undefined);
+      return captureReadiness(key);
+    },
+    acceptHandoff: (req, requestReady) => {
+      if (!lifecycle.status(req.botName).acceptsMessages) return Promise.resolve({ success: false, error: 'Bot not running' });
+      const platform = req.platform ?? config.bots[req.botName].platform;
+      const key = buildSessionKey(platform, req.chatId ?? 'default', req.botName, req.threadId);
+      if (req.threadId) {
+        if (platform === 'feishu' && !routes.get(key)?.replyToMessageId) return Promise.resolve({ success: false, error: '请先在目标话题发送 /status，再接管' });
+        if (platform === 'telegram') routes.set(key, { threadId: req.threadId });
+      }
+      return handoffService.acceptHandoff(req, { ensureReady: requestReady ?? captureReadiness(key) });
+    },
+    getBotStatus: () => lifecycle.list(),
+    controlBot,
+    doctor: diagnose,
     releaseHandoff: (sessionKey) => handoffService.releaseHandoff(sessionKey as SessionKey),
     getStatus: () => ({
       uptime: Date.now() - startedAt,
-      activeSessions: [...adapters.keys()].reduce(
-        (count) => count + (agentManager.listPlugins().length > 0 ? 1 : 0),
-        0,
-      ),
+      activeSessions: busyTasks.size(),
       bots: Object.keys(config.bots),
     }),
   }, {
@@ -580,24 +791,39 @@ async function main(): Promise<void> {
 
   for (const [botName, adapter] of adapters) {
     try {
-      await adapter.connect();
-      console.log(`[cli2im] Bot "${scrubLog(botName)}" connected to ${scrubLog(adapter.name)}`);
+      await lifecycle.start(botName);
+      console.log(`[cli2im] Bot "${scrubLog(botName)}" state=${lifecycle.status(botName).state} platform=${scrubLog(adapter.name)}`);
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      console.error(`[cli2im] Failed to connect bot "${scrubLog(botName)}": ${scrubLog(message)}`);
+      console.error(`[cli2im] Bot "${scrubLog(botName)}" connection_failed`);
     }
   }
 
   await startNotificationServiceBeforeReady(notificationService);
 
+  let networkChecking = false;
+  let shuttingDown = false;
+  const networkTimer = config.network ? setInterval(() => {
+    if (networkChecking || shuttingDown) return;
+    networkChecking = true;
+    void (async () => {
+      const state = await refreshNetworkPolicy(async () => { await lifecycle.stopAll('cancel'); });
+      if (!state.ready || shuttingDown) { await lifecycle.stopAll('cancel'); return; }
+      for (const bot of lifecycle.list()) {
+        if (shuttingDown) return;
+        if (config.bots[bot.name].enabled !== false && !bot.acceptsMessages) await lifecycle.start(bot.name).catch(() => {});
+      }
+    })().catch(() => console.error('[network] refresh_failed')).finally(() => { networkChecking = false; });
+  }, 10000) : undefined;
+
   const shutdown = async () => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    if (networkTimer) clearInterval(networkTimer);
     console.log('[cli2im] Shutting down...');
     await httpServer.stop();
     await notificationService?.stop();
     await agentManager.shutdownPlugins();
-    for (const adapter of adapters.values()) {
-      await adapter.disconnect();
-    }
+    await lifecycle.stopAll('cancel');
     store.save();
     store.close();
     process.exit(0);
@@ -630,7 +856,29 @@ export async function handleBridgeCommand(
   botConfig: BotConfig,
   commandSender?: BridgeCommandSender,
   notificationService?: CodexNotificationService,
+  controls: BridgeControls = {},
 ): Promise<void> {
+  const actor = { userId: commandSender?.userId ?? '', chatId, chatType: commandSender?.chatType };
+  const visibleSessions = async () => {
+    const sessions = await store.listByBot(botName);
+    return (await Promise.all(sessions.map(async session =>
+      await canAccessSession({ bot: botConfig, actor, sessionKey, session }) ? session : null)))
+      .filter((session): session is NonNullable<typeof session> => session !== null);
+  };
+  const projects = new ProjectRegistry({
+    projects: botConfig.projects, shortcuts: botConfig.shortcuts,
+    validateDirectory: async (candidate) => {
+      const path = await resolveStrictDirectory(candidate);
+      if (isBotAdmin(botConfig, actor.userId)) return path;
+      const roots = [botConfig.userOverrides?.[actor.userId]?.workingDirectory ?? botConfig.workingDirectory,
+        ...Object.values(botConfig.projects ?? {})];
+      const canonicalRoots = await Promise.all(roots.map(root => resolveStrictDirectory(root).catch(() => '')));
+      if (!isPathWithinAnyRoot(path, canonicalRoots.filter(Boolean))) throw new Error('这个目录不在当前机器人的项目范围内');
+      return path;
+    },
+    loadRecent: async key => (await store.getPreferences(key as SessionKey)).recentDirectories ?? [],
+    saveRecent: async (key, recentDirectories) => store.updatePreferences(key as SessionKey, { recentDirectories }),
+  });
   switch (cmd.command) {
     case 'notify-me': {
       if (
@@ -656,26 +904,90 @@ export async function handleBridgeCommand(
     }
 
     case 'new': {
-      agentManager.killAgent(sessionKey);
+      controls.cancelScope?.(sessionKey);
+      agentManager.forgetSession(sessionKey);
       clearSessionScopedBuffers(sessionKey, { voiceSessions, tgStreamController });
       const existingSession = await store.getByKey(sessionKey);
       if (existingSession) await store.delete(existingSession.id);
+      await store.updatePreferences(sessionKey, { taskState: undefined });
+      store.save();
       await adapter.send(chatId, { text: '新会话已创建，发消息开始' });
       break;
     }
 
+    case 'help':
     case 'status': {
       const session = await store.getByKey(sessionKey);
-      const hasProcess = agentManager.hasProcess(sessionKey);
-      const lines = [
-        `**Bot:** ${botName}`,
-        `**Agent:** ${session?.agentName ?? 'none'}`,
-        `**Session:** \`${session?.agentSessionId ?? 'none'}\``,
-        `**Working Dir:** \`${session?.workingDirectory ?? 'none'}\``,
-        `**Process:** ${hasProcess ? 'Running' : 'Idle'}`,
-        `**State:** ${session?.state ?? 'none'}`,
-      ];
-      await adapter.send(chatId, { text: lines.join('\n') });
+      const prefs = await store.getPreferences(sessionKey);
+      const running = prefs.taskState === 'running';
+      const supported = ['/new', '/projects', '/status', '/stop'];
+      if (agentManager.getPlugin(botConfig.agent)?.capabilities.sessionResume) supported.push('/sessions');
+      await adapter.send(chatId, { card: buildControlPanel({
+        botName, agentName: botConfig.agent, model: prefs.model ?? controls.defaultModel,
+        projectName: session?.workingDirectory ?? botConfig.workingDirectory, running,
+        queued: controls.queue?.status(sessionKey).pending,
+        error: prefs.taskState === 'interrupted' ? '上次任务中途停止，未自动重跑' : undefined,
+        supportedCommands: supported,
+      }) });
+      break;
+    }
+    case 'projects': {
+      if (cmd.args.length) {
+        await handleBridgeCommand({ command: 'cwd', args: [cmd.args.join(' ')] }, sessionKey, botName, chatId,
+          adapter, store, agentManager, handoffService, cardController, tgStreamController,
+          voiceSessions, runtimeState, botConfig, commandSender, notificationService, controls);
+      } else await adapter.send(chatId, { card: buildProjectPanel(await projects.list(sessionKey)) });
+      break;
+    }
+    case 'task': {
+      if (!cmd.args[0]) {
+        const shortcuts = projects.listShortcuts();
+        await adapter.send(chatId, { text: shortcuts.length ? shortcuts.map(item => `/task ${item.name} · ${item.description}`).join('\n') : '尚未配置快捷任务' });
+        break;
+      }
+      try {
+        const shortcut = await projects.resolveShortcut(sessionKey, cmd.args[0]);
+        if (shortcut.directory) {
+          if ((await store.getPreferences(sessionKey)).taskState === 'running') throw new Error('请先停止当前任务再切换项目');
+          controls.cancelScope?.(sessionKey);
+          agentManager.forgetSession(sessionKey);
+          const current = await store.getOrCreate(sessionKey, { agentName: botConfig.agent, workingDirectory: shortcut.directory });
+          await store.updateWorkingDirectory(current.id, shortcut.directory);
+          await store.clearAgentSessionId(current.id);
+          store.save();
+        }
+        if (!controls.runPrompt) throw new Error('当前入口不支持快捷任务');
+        await controls.runPrompt(shortcut.prompt);
+      } catch (error) { await adapter.send(chatId, { text: error instanceof Error ? error.message : '快捷任务失败' }); }
+      break;
+    }
+    case 'result': {
+      const result = await controls.readResult?.(sessionKey);
+      const text = result
+        ? `上次保存的结果（${formatDateTime(result.savedAt)}）：\n${result.text || '任务已结束，没有可恢复的文字。'}${result.truncated ? '\n结果过长，这里只保留前 1 MiB。' : ''}`
+        : '当前对话还没有保存的结果。';
+      await adapter.send(chatId, { text: textPage(text, cmd.args[0], 'result'), plainText: true });
+      break;
+    }
+    case 'doctor': {
+      if (!isBotAdmin(botConfig, actor.userId)) { await adapter.send(chatId, { text: '只有该机器人的管理员可以查看运行诊断' }); break; }
+      const report = controls.doctor ? await controls.doctor() : '运行诊断未接入';
+      await adapter.send(chatId, { text: textPage(report, cmd.args[0], 'doctor'), plainText: true });
+      break;
+    }
+    case 'bots': {
+      if (!isBotAdmin(botConfig, actor.userId) || !controls.lifecycle) {
+        await adapter.send(chatId, { text: '只有该机器人的管理员可以管理启停' }); break;
+      }
+      const [action, target = botName] = cmd.args;
+      if (target !== botName) { await adapter.send(chatId, { text: '请通过目标机器人或本机管理命令操作，避免跨机器人更改' }); break; }
+      if (!action) { await adapter.send(chatId, { text: `${botName}: ${controls.lifecycle.status(botName).state}` }); break; }
+      if (!['start','stop','restart'].includes(action)) { await adapter.send(chatId, { text: '用法：/bots start|stop|restart' }); break; }
+      await adapter.send(chatId, { text: `正在${action === 'stop' ? '停止' : action === 'start' ? '启动' : '重启'}当前机器人，当前任务会中断。` });
+      if (controls.controlBot) { await controls.controlBot(botName, action as 'start' | 'stop' | 'restart'); break; }
+      if (action === 'stop') await controls.lifecycle.stop(botName, 'cancel');
+      else if (action === 'start') await controls.lifecycle.start(botName);
+      else await controls.lifecycle.restart(botName, 'cancel');
       break;
     }
 
@@ -711,6 +1023,7 @@ export async function handleBridgeCommand(
       agentManager.cancelAgent(sessionKey);
       cardController?.interruptCard(sessionKey);
       clearSessionScopedBuffers(sessionKey, { voiceSessions, tgStreamController });
+      await store.updatePreferences(sessionKey, { taskState: 'interrupted', taskUpdatedAt: Date.now() });
       await adapter.send(chatId, { text: '已发送中断信号' });
       break;
     }
@@ -719,65 +1032,56 @@ export async function handleBridgeCommand(
       agentManager.killAgent(sessionKey);
       cardController?.interruptCard(sessionKey);
       clearSessionScopedBuffers(sessionKey, { voiceSessions, tgStreamController });
+      await store.updatePreferences(sessionKey, { taskState: 'interrupted', taskUpdatedAt: Date.now() });
       await adapter.send(chatId, { text: '已强制终止进程' });
       break;
     }
 
     case 'cwd': {
-      const newDir = cmd.args[0];
+      const newDir = cmd.args.join(' ');
       if (!newDir) {
         await adapter.send(chatId, { text: '用法: /cwd <path>' });
         break;
       }
       let resolvedNewDir: string;
       try {
-        resolvedNewDir = await resolveStrictDirectory(newDir);
+        resolvedNewDir = await projects.select(sessionKey, newDir);
       } catch {
         await adapter.send(chatId, { text: `无效路径: \`${newDir}\`` });
         break;
       }
       clearSessionScopedBuffers(sessionKey, { voiceSessions, tgStreamController });
-      const session = await store.getByKey(sessionKey);
-      if (session) {
-        await store.updateWorkingDirectory(session.id, resolvedNewDir);
-        agentManager.killAgent(sessionKey);
-        await adapter.send(chatId, { text: `工作目录已切换到 \`${newDir}\`，下次消息生效` });
-      } else {
-        await adapter.send(chatId, { text: '当前没有会话，发消息后会使用默认目录创建' });
-      }
+      controls.cancelScope?.(sessionKey);
+      agentManager.forgetSession(sessionKey);
+      const session = await store.getOrCreate(sessionKey, { agentName: botConfig.agent, workingDirectory: resolvedNewDir });
+      await store.updateWorkingDirectory(session.id, resolvedNewDir);
+      await store.clearAgentSessionId(session.id);
+      await store.updatePreferences(sessionKey, { taskState: 'interrupted' });
+      store.save();
+      await adapter.send(chatId, { text: `工作目录已切换到 ${resolvedNewDir}，下一条消息会新建该项目的对话` });
       break;
     }
 
+    case 'switch':
     case 'resume': {
       const sessionId = cmd.args[0];
-      if (!sessionId) {
-        await adapter.send(chatId, { text: '用法: /resume <sessionId>' });
-        break;
+      if (!sessionId || !commandSender) {
+        await adapter.send(chatId, { text: '用法：/resume <历史对话编号>' }); break;
       }
-      const result = await handoffService.acceptHandoff({
-        botName,
-        sessionId,
-        workDir: botConfig.workingDirectory,
-        agentName: botConfig.agent,
-        chatId,
+      await handleCLISessionResume({
+        callback: { ...commandSender, chatId, data: '', messageId: commandSender.messageId ?? '' },
+        resume: { sessionId, cwd: '' }, botName, botConfig, adapter, store, agentManager, handoffService,
+        cardController, tgStreamController, ensureReady: controls.capturePreparation?.(sessionKey),
       });
-      if (result.success) {
-        await adapter.send(chatId, {
-          text: buildHandoffNotification({
-            sessionId,
-            workDir: botConfig.workingDirectory,
-            agentName: botConfig.agent,
-          }),
-        });
-      } else {
-        await adapter.send(chatId, { text: `Resume failed: ${result.error}` });
-      }
+      store.save();
       break;
     }
 
     case 'handoff': {
       try {
         const result = await handoffService.releaseHandoff(sessionKey);
+        controls.cancelScope?.(sessionKey);
+        await store.updatePreferences(sessionKey, { taskState: 'interrupted', taskUpdatedAt: Date.now() });
         agentManager.cancelAgent(sessionKey);
         clearSessionScopedBuffers(sessionKey, { voiceSessions, tgStreamController });
         await adapter.send(chatId, {
@@ -830,7 +1134,7 @@ export async function handleBridgeCommand(
     }
 
     case 'list': {
-      const sessions = await store.listByBot(botName);
+      const sessions = await visibleSessions();
       if (sessions.length === 0) {
         await adapter.send(chatId, { text: '没有活跃会话' });
         break;
@@ -846,7 +1150,7 @@ export async function handleBridgeCommand(
       const sub = cmd.args[0];
 
       if (sub === 'bot') {
-        const sessions = await store.listByBot(botName);
+        const sessions = await visibleSessions();
         if (sessions.length === 0) {
           await adapter.send(chatId, { text: '没有活跃会话' });
           break;
@@ -868,17 +1172,16 @@ export async function handleBridgeCommand(
         break;
       }
 
-      const useAntigravity = sub === 'antigravity' || sub === 'agy' || (!sub && botConfig.agent === 'agy');
-      const useGemini = sub === 'gemini' || (!sub && botConfig.agent === 'gemini');
-      const useCodex = sub === 'codex' || (!sub && botConfig.agent === 'codex');
-      const agentLabel = useAntigravity ? 'Antigravity' : useGemini ? 'Gemini' : useCodex ? 'Codex' : 'Claude Code';
-      const sessions = useAntigravity
-        ? await new AntigravitySessionScanner(join(homedir(), '.gemini', 'antigravity-cli')).scan()
-        : useGemini
-          ? await new GeminiSessionScanner(join(homedir(), '.gemini')).scan()
-          : useCodex
-            ? await new CodexSessionScanner(join(homedir(), '.codex')).scan()
-            : await new CLISessionScanner(join(homedir(), '.claude')).scan();
+      const requestedAgent = ({ codex: 'codex', gemini: 'gemini', agy: 'agy', antigravity: 'agy', claude: 'claude-code' } as Record<string,string>)[sub ?? ''] ?? botConfig.agent;
+      if (requestedAgent !== botConfig.agent) { await adapter.send(chatId, { text: '请在对应 AI 的机器人中查看历史对话' }); break; }
+      const agentLabel = agentManager.getPlugin(botConfig.agent)?.displayName ?? botConfig.agent;
+      const bindings = await store.listSessionAccess(sessionKey);
+      const scanned = await scanAgentSessions(botConfig.agent);
+      const sessions = (await Promise.all(scanned.map(async candidate => {
+        const binding = bindings.find(item => item.agentName === botConfig.agent && item.agentSessionId === candidate.sessionId);
+        return await canAccessSession({ bot: botConfig, actor, sessionKey,
+          session: binding ?? { ...candidate, agentName: botConfig.agent } }) ? candidate : null;
+      }))).filter((session): session is NonNullable<typeof session> => session !== null).slice(0, 20);
 
       if (sessions.length === 0) {
         await adapter.send(chatId, { text: `没有找到 ${agentLabel} CLI 会话` });
@@ -892,23 +1195,21 @@ export async function handleBridgeCommand(
       break;
     }
 
-    case 'switch': {
-      const targetId = cmd.args[0];
-      if (!targetId) {
-        await adapter.send(chatId, { text: '用法: /switch <sessionId>' });
-        break;
-      }
-      await adapter.send(chatId, { text: `切换到会话 \`${targetId}\`（下次消息生效）` });
-      break;
-    }
-
     case 'model': {
       const model = cmd.args[0];
       if (!model) {
-        await adapter.send(chatId, { text: '用法: /model <model-name>' });
-        break;
+        const selected = (await store.getPreferences(sessionKey)).model ?? controls.defaultModel ?? 'AI 默认模型';
+        await adapter.send(chatId, { text: `当前选择：${selected}。用法：/model <模型名>；/model default 恢复默认。` }); break;
       }
-      await adapter.send(chatId, { text: `模型已切换为 \`${model}\`（下次 spawn 生效）` });
+      if (!/^[A-Za-z0-9][A-Za-z0-9_.:/\[\]-]{0,127}$/.test(model)) {
+        await adapter.send(chatId, { text: '模型名格式无效' }); break;
+      }
+      if ((await store.getPreferences(sessionKey)).taskState === 'running') {
+        await adapter.send(chatId, { text: '请等待当前任务完成，或先 /stop 再切换模型' }); break;
+      }
+      await store.updatePreferences(sessionKey, { model: model === 'default' ? undefined : model });
+      agentManager.killAgent(sessionKey);
+      await adapter.send(chatId, { text: `模型选择已保存：${model === 'default' ? '默认模型' : model}；下一条消息启动时使用。模型是否可用由该 AI 服务确认。` });
       break;
     }
 
@@ -929,6 +1230,8 @@ export function createCallbackHandler(params: {
   cardController?: StreamingCardController;
   tgStreamController?: TelegramStreamController;
   handleSessionResume?: typeof handleCLISessionResume;
+  capturePreparation?: (key: SessionKey) => () => void;
+  handleControl?: (callback: import('./types.js').CallbackQuery, text: string) => Promise<void>;
 }): (callback: import('./types.js').CallbackQuery) => void {
   const {
     botName,
@@ -944,6 +1247,13 @@ export function createCallbackHandler(params: {
   } = params;
 
   return (callback) => {
+    const control = parseControlAction(callback.data);
+    const project = parseProjectAction(callback.data);
+    if (control || project) {
+      if (!isCallbackAuthorized(callback, botConfig)) return;
+      void params.handleControl?.(callback, control ?? `/projects ${project}`).catch(() => console.error('[pipeline] control_failed'));
+      return;
+    }
     const permission = parsePermissionCallbackData(callback.data);
     if (permission) {
       if (!isCallbackAuthorized(callback, botConfig)) {
@@ -962,18 +1272,21 @@ export function createCallbackHandler(params: {
         return;
       }
 
-      void queue.enqueue(callback.chatId, () =>
+      const callbackKey = buildSessionKey(callback.platform, callback.chatId, botName, callback.threadId);
+      const ensureReady = params.capturePreparation?.(callbackKey);
+      void queue.enqueue(callbackKey, () =>
         handleSessionResume({
           callback,
           resume,
           botName,
           botConfig,
-          adapter,
+          adapter: bindReplyRoute(adapter, callback.threadId ? { threadId: callback.threadId, replyToMessageId: callback.messageId } : {}),
           store,
           agentManager,
           handoffService,
           cardController,
           tgStreamController,
+          ensureReady,
         })
       ).catch((err) => {
         console.error('[pipeline] callback=session_resume_failed');
@@ -1135,7 +1448,7 @@ function isPathWithinAnyRoot(path: string, roots: string[]): boolean {
 }
 
 export function createHandoffSpawnResume(
-  agentManager: Pick<AgentManager, 'resumeAgent'>,
+  agentManager: Pick<AgentManager, 'resumeAgent'> & Partial<Pick<AgentManager, 'killAgent'>>,
   store: Pick<
     SessionStore,
     'getOrCreate' | 'updateWorkingDirectory' | 'updateAgentSessionId' | 'updateState' | 'touch'
@@ -1143,26 +1456,36 @@ export function createHandoffSpawnResume(
   createEventHandlers: (sessionKey: SessionKey) => AgentManagerEvents,
   getBotConfig?: (botName: string) => BotConfig | undefined,
   resolveSpawnOpts?: BotSpawnOptsResolver,
+  resolveSenderEnv?: (key: SessionKey) => Record<string, string>,
+  capturePreparation?: (key: SessionKey) => () => void,
 ): (
   sessionKey: SessionKey,
   agentName: string,
   sessionId: string,
   workDir: string,
+  ensureReady?: () => void,
 ) => Promise<{ pid: number; sessionId: string }> {
-  return async (sessionKey, agentName, sessionId, workDir) => {
+  return async (sessionKey, agentName, sessionId, workDir, checkRequest) => {
+    const localCheck = capturePreparation?.(sessionKey);
+    const ensureReady = () => { checkRequest?.(); localCheck?.(); assertNetworkReady(); };
+    ensureReady();
     const handlers = createEventHandlers(sessionKey);
     const botName = sessionKey.split(':')[2];
     const botConfig = getBotConfig?.(botName);
-    // Handoff/manual resume keeps the minimal "legacy" opts on purpose (see the
-    // "keeps legacy opts" test) — it deliberately does NOT re-derive
-    // permission/sandbox/timeouts from bot config. But the per-bot AGENTS.md
-    // runtime instructions must survive resume, otherwise they silently vanish
-    // for handed-off / card-resumed sessions and stop applying mid-conversation.
-    const spawnOpts: SpawnOpts = {
-      workingDirectory: workDir,
-      permissionMode: 'blacklist',
-      appendSystemPrompt: await readAgentsInstructions(botConfig?.agentsFile, expandHome(workDir)),
-    };
+    assertNetworkReady();
+    if (!botConfig) throw new Error('Unknown bot');
+    const session = await store.getOrCreate(sessionKey, { agentName, workingDirectory: expandHome(workDir) });
+    ensureReady();
+    const prefs = 'getPreferences' in store ? await (store as SessionStore).getPreferences(sessionKey) : {};
+    ensureReady();
+    const spawnOpts = await (resolveSpawnOpts ?? resolveBotSpawnOpts)({
+      botConfig, workingDirectory: workDir,
+      env: { ...(botConfig.larkCliConfigDir ? { LARKSUITE_CLI_CONFIG_DIR: botConfig.larkCliConfigDir } : {}), ...resolveSenderEnv?.(sessionKey) },
+      model: prefs.model,
+      autoApprove: botConfig.autoApprove, sandboxMode: botConfig.sandboxMode,
+      turnTimeoutMs: botConfig.turnTimeoutMs, idleTimeoutMs: botConfig.idleTimeoutMs,
+    });
+    ensureReady();
     const proc = await agentManager.resumeAgent(
       sessionKey,
       agentName,
@@ -1170,12 +1493,21 @@ export function createHandoffSpawnResume(
       spawnOpts,
       handlers,
     );
-    const normalizedWorkDir = expandHome(workDir);
-    const session = await store.getOrCreate(sessionKey, { agentName, workingDirectory: normalizedWorkDir });
-    await store.updateWorkingDirectory(session.id, normalizedWorkDir);
-    await store.updateAgentSessionId(session.id, sessionId);
-    await store.updateState(session.id, 'active');
-    await store.touch(session.id);
+    try {
+      ensureReady();
+      const normalizedWorkDir = expandHome(workDir);
+      await store.updateWorkingDirectory(session.id, normalizedWorkDir);
+      ensureReady();
+      await store.updateAgentSessionId(session.id, sessionId);
+      ensureReady();
+      await store.updateState(session.id, 'active');
+      ensureReady();
+      await store.touch(session.id);
+      ensureReady();
+    } catch (error) {
+      agentManager.killAgent?.(sessionKey, proc);
+      throw error;
+    }
     return { pid: proc.pid, sessionId };
   };
 }
@@ -1188,6 +1520,7 @@ export async function startAgentProcessForSession(params: {
   agentName: string;
   spawnOpts: SpawnOpts;
   handlers: AgentManagerEvents;
+  ensureReady?: () => void;
 }): Promise<void> {
   const {
     agentManager,
@@ -1205,10 +1538,12 @@ export async function startAgentProcessForSession(params: {
     if (latestId !== session.agentSessionId) {
       await store.updateAgentSessionId(session.id, latestId);
     }
+    params.ensureReady?.();
     await agentManager.resumeAgent(sessionKey, agentName, latestId, spawnOpts, handlers);
     return;
   }
 
+  params.ensureReady?.();
   await agentManager.spawnAgent(sessionKey, agentName, spawnOpts, handlers);
 }
 
@@ -1223,12 +1558,12 @@ function getAdapterBotOpenId(adapter: PlatformAdapter): string | undefined {
 
 function getSessionBotName(sessionKey: SessionKey): string | undefined {
   const parts = sessionKey.split(':');
-  return parts[parts.length - 1];
+  return parts[2];
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   main().catch((err) => {
-    console.error('[cli2im] Fatal error:', err);
+    console.error('[cli2im] Fatal error; inspect /doctor and configuration validity');
     process.exit(1);
   });
 }

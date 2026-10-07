@@ -17,6 +17,11 @@ async function main(): Promise<void> {
     return;
   }
 
+  if (command === 'bots' || command === 'doctor') {
+    await handleManagement(command, args.slice(1));
+    return;
+  }
+
   if (command === 'status') {
     await handleStatus();
     return;
@@ -79,6 +84,23 @@ async function handleHandoff(args: string[]): Promise<void> {
   }
 }
 
+async function handleManagement(command: string, args: string[]): Promise<void> {
+  const token = process.env.CLI2IM_WEB_TOKEN;
+  if (!token) throw new Error('CLI2IM_WEB_TOKEN is required');
+  const [action, name] = args;
+  if (action && (command !== 'bots' || !['start', 'stop', 'restart'].includes(action) || !name)) {
+    throw new Error('Usage: cli2im bots [start|stop|restart <bot-name>]');
+  }
+  const response = await fetch(`http://${DEFAULT_HOST}:${DEFAULT_PORT}/api/${command}`, {
+    method: action ? 'POST' : 'GET',
+    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+    ...(action ? { body: JSON.stringify({ name, action }) } : {}),
+  });
+  if (!response.ok) throw new Error(`Management request failed (${response.status})`);
+  const result = await response.json();
+  console.log(typeof result === 'string' ? result : JSON.stringify(result, null, 2));
+}
+
 async function handleStatus(): Promise<void> {
   const resp = await fetch(`http://${DEFAULT_HOST}:${DEFAULT_PORT}/health`);
   const status = (await resp.json()) as {
@@ -100,6 +122,8 @@ cli2im - CLI tool for CLI2IM bridge
 Commands:
   handoff   Transfer a CLI session to CLI2IM
   status    Show CLI2IM daemon status
+  bots      List bots, or start/stop/restart one bot
+  doctor    Inspect local runtime and configured services
   help      Show this help
 
 Handoff:

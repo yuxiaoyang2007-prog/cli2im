@@ -1,6 +1,8 @@
 export interface AbortableOptions {
   signal?: AbortSignal;
   idempotencyKey?: string;
+  threadId?: string;
+  replyToMessageId?: string;
 }
 
 export function throwIfAborted(signal?: AbortSignal): void {

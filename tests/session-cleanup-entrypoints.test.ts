@@ -46,6 +46,7 @@ describe('session-scoped cleanup across spawn/resume entrypoints', () => {
       tgStreamController: harness.tgStreamController,
     });
 
+    expect(harness.manager.hasProcess(sessionKey)).toBe(true);
     harness.tgStreamController.interrupt.mockClear();
     harness.voiceSessions.set(sessionKey, 'chat_1');
 
@@ -195,6 +196,10 @@ function botConfig(): BotConfig {
 
 function storeDeps() {
   return {
+    getByKey: vi.fn().mockResolvedValue({
+      id: 'session_row_1', key: 'feishu:chat_1:ccbot', agentName: 'mock-agent', agentSessionId: 'session_123',
+      workingDirectory: '/Users/test/project', state: 'active', createdAt: 0, lastActiveAt: 0,
+    }),
     getOrCreate: vi.fn().mockResolvedValue({ id: 'session_row_1' }),
     updateAgentSessionId: vi.fn().mockResolvedValue(undefined),
     updateWorkingDirectory: vi.fn().mockResolvedValue(undefined),

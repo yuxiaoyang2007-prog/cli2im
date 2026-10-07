@@ -66,7 +66,7 @@ const opts: SpawnOpts = {
 describe('KimiWorkPlugin', () => {
   let child: FakeChild;
   let rpc: FakeRpc;
-  let startDaimon: ReturnType<typeof vi.fn>;
+  let startDaimon: ReturnType<typeof vi.fn<KimiWorkPluginDeps['startDaimon']>>;
   let plugin: KimiWorkPlugin;
   let rpcQueue: FakeRpc[];
 

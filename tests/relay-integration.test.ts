@@ -17,7 +17,7 @@ const baseConfig: AppConfig = {
       allowFrom: ['ou_allowed'],
       permissionMode: 'blacklist',
       requireMention: true,
-      relay: { enabled: true, maxConsecutiveRounds: 5 },
+      relay: { enabled: true, maxConsecutiveRounds: 5, allowFromBots: ['codexbot'] },
     },
     codexbot: {
       agent: 'codex',
@@ -27,7 +27,7 @@ const baseConfig: AppConfig = {
       allowFrom: ['ou_allowed'],
       permissionMode: 'blacklist',
       requireMention: true,
-      relay: { enabled: true, maxConsecutiveRounds: 5 },
+      relay: { enabled: true, maxConsecutiveRounds: 5, allowFromBots: ['ccbot'] },
     },
   },
   agents: {
@@ -50,6 +50,7 @@ function relayMsg(overrides: Partial<InboundMessage> = {}): InboundMessage {
     text: 'Here is my code review...',
     chatType: 'group',
     isRelay: true,
+    relayFromBot: 'ccbot',
     ...overrides,
   };
 }
@@ -95,13 +96,18 @@ describe('Relay sender header', () => {
   });
 });
 
-describe('Relay messages bypass allowFrom', () => {
-  it('relay messages pass pipeline even from unauthorized user', () => {
+describe('Relay messages require a separate explicit source grant', () => {
+  it('does not execute bridge commands from peer output', () => {
+    const result = new InboundPipeline(baseConfig).process(relayMsg({ text: '/kill' }), 'codexbot');
+    expect('rejected' in result).toBe(false);
+    expect('bridgeCommand' in result && result.bridgeCommand).toBeUndefined();
+  });
+  it('admitted source can relay in a group without pretending to be a human', () => {
     const pipeline = new InboundPipeline(baseConfig);
-    const msg = relayMsg({ chatType: 'p2p', userId: 'relay:ccbot' });
+    const msg = relayMsg({ userId: 'relay:ccbot' });
     const result = pipeline.process(msg, 'codexbot');
 
-    // isRelay bypasses the allowFrom check
+    // The source is granted in relay.allowFromBots, separately from human IDs.
     expect('rejected' in result).toBe(false);
   });
 
@@ -260,8 +266,8 @@ describe('No relay when only one bot has relay enabled', () => {
   });
 });
 
-describe('Group allowlist bypass for relay', () => {
-  it('relay messages bypass group allowlist', () => {
+describe('Group allowlist applies to relay', () => {
+  it('relay messages cannot bypass group allowlist', () => {
     const botConfig: BotConfig = {
       ...baseConfig.bots.codexbot,
       groupPolicy: 'allowlist',
@@ -271,6 +277,6 @@ describe('Group allowlist bypass for relay', () => {
     const msg = relayMsg({ chatId: 'oc_other_group' });
 
     const reason = getGroupMessageSkipReason(msg, botConfig, 'ou_bot');
-    expect(reason).toBeUndefined();
+    expect(reason).toBe('Unauthorized group');
   });
 });

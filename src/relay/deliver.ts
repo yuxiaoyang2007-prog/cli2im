@@ -8,6 +8,8 @@ import type { AgentManager } from '../agents/manager.js';
 import type { ChatQueue } from '../session/queue.js';
 import { stripCtiTags } from '../security/validators.js';
 import type { AbortableOptions } from '../abort.js';
+import { getGroupAccessRejection } from '../security/access-policy.js';
+import { buildSessionKey } from '../types.js';
 
 export interface RelayDeps {
   relayManager: RelayManager;
@@ -29,8 +31,15 @@ export async function relayToOtherBots(
   const { signal } = options;
 
   if (signal?.aborted) return;
-  const targets = relayManager.getRelayTargets(sourceBotName, chatId);
-  console.log(`[relay] ${sourceBotName} → targets=${JSON.stringify(targets)} textLen=${text.length}`);
+  const sourceConfig = config.bots[sourceBotName];
+  const group = { chatId, chatType: 'group' };
+  if (!sourceConfig?.relay?.enabled || sourceConfig.enabled === false || getGroupAccessRejection(group, sourceConfig)) return;
+  const targets = relayManager.getRelayTargets(sourceBotName, chatId).filter((name) => {
+    const target = config.bots[name];
+    return target?.enabled !== false && target?.relay?.enabled && target.platform === sourceConfig.platform
+      && target.relay.allowFromBots?.includes(sourceBotName) && !getGroupAccessRejection(group, target);
+  });
+  console.log(`[relay] targets=${targets.length} textLen=${text.length}`);
   if (targets.length === 0) return;
 
   if (signal?.aborted) return;
@@ -64,12 +73,13 @@ export async function relayToOtherBots(
       text: relayText,
       chatType: 'group',
       isRelay: true,
+      relayFromBot: sourceBotName,
     };
 
     const processor = messageProcessors.get(targetBotName);
     if (processor) {
       if (signal?.aborted) return;
-      await queue.enqueue(chatId, async () => {
+      await queue.enqueue(buildSessionKey(targetBotConfig.platform, chatId, targetBotName), async () => {
         if (signal?.aborted) return;
         await processor(syntheticMsg);
       });

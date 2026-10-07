@@ -1,4 +1,4 @@
-import { beforeEach, describe, it, expect, vi } from 'vitest';
+import { afterEach, beforeEach, describe, it, expect, vi } from 'vitest';
 import {
   CodexPlugin,
   formatNonImageAttachment,
@@ -11,10 +11,12 @@ import type { AgentEvent } from '../src/types.js';
 const codexSdkMock = vi.hoisted(() => ({
   startThread: vi.fn(),
   resumeThread: vi.fn(),
+  construct: vi.fn(),
 }));
 
 vi.mock('@openai/codex-sdk', () => ({
   Codex: class MockCodex {
+    constructor(options: Record<string, unknown>) { codexSdkMock.construct(options); }
     startThread(options?: Record<string, unknown>) {
       return codexSdkMock.startThread(options) ?? { runStreamed: vi.fn() };
     }
@@ -29,6 +31,21 @@ describe('CodexPlugin', () => {
   beforeEach(() => {
     codexSdkMock.startThread.mockClear();
     codexSdkMock.resumeThread.mockClear();
+    codexSdkMock.construct.mockClear();
+  });
+  afterEach(() => vi.unstubAllEnvs());
+
+  it('always passes a filtered SDK environment even without explicit agent env', async () => {
+    vi.stubEnv('FEISHU_APP_SECRET', 'private-bridge-secret');
+    vi.stubEnv('OPENAI_API_KEY', 'codex-auth-key');
+    const plugin = new CodexPlugin('/usr/local/bin/codex');
+    const proc = plugin.spawn({ workingDirectory: '/project', permissionMode: 'blacklist' });
+    await vi.waitFor(() => expect(codexSdkMock.construct).toHaveBeenCalled());
+    const options = codexSdkMock.construct.mock.calls[0][0];
+    expect(options.env).not.toHaveProperty('FEISHU_APP_SECRET');
+    expect(options.env.OPENAI_API_KEY).toBe('codex-auth-key');
+    expect(options.apiKey).toBe('codex-auth-key');
+    proc.kill();
   });
 
   it('declares SDK-backed capabilities', () => {

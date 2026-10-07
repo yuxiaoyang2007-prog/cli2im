@@ -35,7 +35,7 @@ describe('parsePermissionCallbackData', () => {
 });
 
 describe('createCallbackHandler', () => {
-  it('logs only fixed callback summaries across the Feishu adapter and ignored pipeline path', () => {
+  it('logs only fixed callback summaries across the Feishu adapter and ignored pipeline path', async () => {
     const secrets = {
       chatId: 'oc_callback_secret_7f3c',
       userId: 'ou_callback_secret_91ad',
@@ -49,7 +49,13 @@ describe('createCallbackHandler', () => {
 
     try {
       const adapter = new FeishuAdapter({ appId: 'app', appSecret: 'secret', botName: 'ccbot' });
-      adapter.onCallback(createCallbackHandler(callbackDeps({ adapter })));
+      vi.spyOn(adapter.getClient().im.message, 'create').mockResolvedValue({
+        code: 0, data: { message_id: secrets.messageId },
+      } as never);
+      await adapter.send(secrets.chatId, { text: 'test callback origin' });
+      adapter.onCallback(createCallbackHandler(callbackDeps({ adapter,
+        botConfig: botConfig({ allowFrom: [secrets.userId] }),
+      })));
 
       (adapter as unknown as { handleCardAction(data: unknown): unknown }).handleCardAction({
         context: {
@@ -104,7 +110,7 @@ describe('createCallbackHandler', () => {
     handler(callback);
 
     expect(queue.enqueue).toHaveBeenCalledTimes(1);
-    expect(queue.enqueue).toHaveBeenCalledWith('chat_1', expect.any(Function));
+    expect(queue.enqueue).toHaveBeenCalledWith('feishu:chat_1:ccbot', expect.any(Function));
     expect(handleSessionResume).not.toHaveBeenCalled();
 
     const task = (queue.enqueue as any).mock.calls[0][1] as () => Promise<void>;
@@ -119,7 +125,7 @@ describe('createCallbackHandler', () => {
       },
       botName: 'ccbot',
       botConfig: deps.botConfig,
-      adapter,
+      adapter: expect.objectContaining({ name: adapter.name, send: expect.any(Function) }),
     }));
   });
 
@@ -213,6 +219,7 @@ describe('handlePermissionCallback', () => {
       platform: 'telegram',
       chatId: 'chat_1',
       userId: 'ou_allowed',
+      chatType: 'private',
       data,
       messageId: 'msg_1',
     };
@@ -374,7 +381,7 @@ describe('isCallbackAuthorized', () => {
   it('accepts group callbacks from allowed users', () => {
     const callback: CallbackQuery = {
       platform: 'feishu',
-      chatId: 'oc_any_group',
+      chatId: 'oc_group_allowed',
       userId: 'ou_allowed',
       chatType: 'group',
       data: 'resume:session_1',
@@ -408,6 +415,23 @@ describe('isCallbackAuthorized', () => {
     };
 
     expect(isCallbackAuthorized(callback, botConfig({ groupPolicy: 'allowlist' }))).toBe(false);
+  });
+
+  it('applies a populated group list even when groupPolicy was not set', () => {
+    expect(isCallbackAuthorized({ platform: 'feishu', chatId: 'other_group', userId: 'ou_allowed',
+      chatType: 'group', data: 'resume:session', messageId: 'message' }, botConfig())).toBe(false);
+  });
+
+  it('does not allow an absent chat type to bypass a group restriction', () => {
+    expect(isCallbackAuthorized({ platform: 'feishu', chatId: 'other_group', userId: 'ou_allowed',
+      data: 'resume:session', messageId: 'message' }, botConfig())).toBe(false);
+  });
+
+  it('routes permission decisions only to the current topic', () => {
+    const manager = { approvePermission: vi.fn().mockReturnValue(true), denyPermission: vi.fn() };
+    expect(handlePermissionCallback({ platform: 'feishu', chatId: 'oc_group_allowed', userId: 'ou_allowed',
+      chatType: 'group', threadId: 'topic-a', data: 'perm:allow:req_1', messageId: 'message' }, manager, botConfig(), 'ccbot')).toBe(true);
+    expect(manager.approvePermission).toHaveBeenCalledWith('feishu:oc_group_allowed:ccbot:topic-a', 'req_1');
   });
 
   it('rejects callbacks with empty userId even when allowFrom contains wildcard', () => {

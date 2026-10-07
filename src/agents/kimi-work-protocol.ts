@@ -1,3 +1,4 @@
+import { buildChildEnv } from '../security/child-env.js';
 import { spawn, type ChildProcess } from 'node:child_process';
 import { createRequire } from 'node:module';
 import { access, mkdir } from 'node:fs/promises';
@@ -367,7 +368,7 @@ export interface SpawnedKimiDaimon extends KimiDaimonReady {
 }
 
 export async function spawnKimiDaimon(opts: SpawnKimiDaimonOpts): Promise<SpawnedKimiDaimon> {
-  const env = { ...process.env, ...opts.env };
+  const env = buildChildEnv('kimi-work', opts.env);
   const nodePath = await resolveKimiNodePath(env);
   const shareDir = env.KIMI_SHARE_DIR || join(homedir(), '.cli2im', 'kimi-work');
   const configPath = env.DAIMON_CONFIG_PATH || join(shareDir, 'config.json');

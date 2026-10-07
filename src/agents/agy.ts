@@ -1,6 +1,8 @@
+import { buildChildEnv } from '../security/child-env.js';
 import { execFileSync, spawn as spawnProcess, type ChildProcess } from 'node:child_process';
 import { EventEmitter } from 'node:events';
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
+import { existsSync, mkdtempSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { PassThrough, Transform, Writable } from 'node:stream';
@@ -14,7 +16,7 @@ import type {
 } from '../types.js';
 
 // Antigravity CLI (`agy`) is a print-mode agent: each turn is a fresh
-// `agy --print=<prompt>` process. Unlike the Gemini CLI it does NOT emit
+// `agy --print` process receiving its prompt through stdin. Unlike the Gemini CLI it does NOT emit
 // stream-json on stdout — stdout is the plain-text answer, and on resume it
 // REPLAYS the whole conversation's assistant messages. So instead of parsing
 // stdout we read the per-conversation transcript that agy writes to
@@ -24,11 +26,8 @@ import type {
 // "seek past existing history" technique the PTY spike used to avoid replay.
 
 const AGY_DATA_DIR = join(homedir(), '.gemini', 'antigravity-cli');
-const PROMPT_ARG_MAX_BYTES = 100 * 1024;
 const TRANSCRIPT_READ_RETRIES = 6;
 const TRANSCRIPT_READ_DELAY_MS = 150;
-
-let turnLogCounter = 0;
 
 interface TranscriptRecord {
   type?: string;
@@ -94,7 +93,7 @@ function readPlannerDelta(conversationId: string, sinceStep: number): { text: st
   return { text: parts.join('\n\n').trim(), maxStep: maxStepOf(records), found: parts.length > 0 };
 }
 
-function messageToPrompt(message: UserMessage): string {
+function messageToPrompt(message: UserMessage, imageDirectory: () => string): string {
   if (typeof message.content === 'string') return message.content;
 
   const textParts: string[] = [];
@@ -104,11 +103,10 @@ function messageToPrompt(message: UserMessage): string {
     if (block.type === 'text') {
       textParts.push(block.text);
     } else if (block.type === 'image') {
-      const ext = block.source.media_type.split('/')[1] ?? 'png';
-      const dir = join(tmpdir(), 'cli2im-agy-images');
-      mkdirSync(dir, { recursive: true });
-      const filePath = join(dir, `img-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${ext}`);
-      writeFileSync(filePath, Buffer.from(block.source.data, 'base64'));
+      const ext = imageExtension(block.source.media_type);
+      const dir = imageDirectory();
+      const filePath = join(dir, `img-${randomUUID()}.${ext}`);
+      writeFileSync(filePath, Buffer.from(block.source.data, 'base64'), { mode: 0o600, flag: 'wx' });
       imagePaths.push(filePath);
     }
   }
@@ -121,12 +119,12 @@ function messageToPrompt(message: UserMessage): string {
   return textParts.join('\n');
 }
 
-function buildAgyBaseArgs(opts: SpawnOpts): string[] {
+function buildAgyBaseArgs(opts: SpawnOpts, imageDirectory?: string): string[] {
   const args: string[] = ['--dangerously-skip-permissions'];
 
   // Let agy read the bot's working directory (and any pasted images).
   args.push('--add-dir', opts.workingDirectory);
-  args.push('--add-dir', join(tmpdir(), 'cli2im-agy-images'));
+  if (imageDirectory) args.push('--add-dir', imageDirectory);
 
   if (opts.model) {
     args.push('--model', opts.model);
@@ -156,6 +154,7 @@ export class AgyVirtualProcess implements AgentProcess {
   // conversation. -1 means "emit everything" (a brand-new conversation).
   private consumedStep = -1;
   private statusEmitted = false;
+  private imageDirectory?: string;
 
   constructor(
     private readonly binary: string,
@@ -199,6 +198,7 @@ export class AgyVirtualProcess implements AgentProcess {
   }
 
   private handleStdinChunk(chunk: Buffer | string | Uint8Array): void {
+    if (this.terminated) return;
     this.inputBuffer += Buffer.isBuffer(chunk) ? chunk.toString('utf8') : String(chunk);
     const lines = this.inputBuffer.split('\n');
     this.inputBuffer = lines.pop() ?? '';
@@ -213,7 +213,10 @@ export class AgyVirtualProcess implements AgentProcess {
         continue;
       }
       if (payload.type === 'user') {
-        this.enqueue(messageToPrompt(payload.message));
+        this.enqueue(messageToPrompt(payload.message, () => {
+          this.imageDirectory ??= mkdtempSync(join(tmpdir(), 'cli2im-agy-images-'));
+          return this.imageDirectory;
+        }));
       }
     }
   }
@@ -230,49 +233,50 @@ export class AgyVirtualProcess implements AgentProcess {
   private runTurn(prompt: string): void {
     if (this.terminated) return;
 
-    const logPath = join(tmpdir(), 'cli2im-agy-logs', `turn-${process.pid}-${++turnLogCounter}.log`);
-    mkdirSync(join(tmpdir(), 'cli2im-agy-logs'), { recursive: true });
+    const turnDirectory = mkdtempSync(join(tmpdir(), 'cli2im-agy-turn-'));
+    const logPath = join(turnDirectory, 'turn.log');
+    writeFileSync(logPath, '', { mode: 0o600, flag: 'wx' });
 
-    const args = buildAgyBaseArgs(this.opts);
+    const args = buildAgyBaseArgs(this.opts, this.imageDirectory);
     args.push('--log-file', logPath);
     if (this.conversationId) {
       args.push('--conversation', this.conversationId);
     }
 
-    // Prefer passing the prompt inline (handles leading '-' and newlines via
-    // the `--print=` form); fall back to stdin only for very large prompts.
-    const promptBytes = Buffer.byteLength(prompt, 'utf8');
-    const useStdinPrompt = promptBytes > PROMPT_ARG_MAX_BYTES;
-    if (useStdinPrompt) {
-      args.push('--print');
-    } else {
-      args.push(`--print=${prompt}`);
-    }
+    // agy supports stdin in print mode. Never expose a user's prompt in ps output.
+    args.push('--print');
 
-    const child = spawnProcess(this.binary, args, {
-      cwd: this.opts.workingDirectory,
-      env: { ...process.env, ...this.opts.env },
-      stdio: [useStdinPrompt ? 'pipe' : 'ignore', 'pipe', 'pipe'],
-    });
+    let child: ChildProcess;
+    try {
+      child = spawnProcess(this.binary, args, {
+        cwd: this.opts.workingDirectory,
+        env: buildChildEnv('agy', this.opts.env),
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
+    } catch (error) {
+      rmSync(turnDirectory, { recursive: true, force: true });
+      throw error;
+    }
 
     this.activeChild = child;
     this.stderrBuffer = '';
 
-    if (useStdinPrompt) {
-      if (!child.stdin) {
-        this.stdout.write({ type: 'error', message: 'agy stdin is unavailable' } satisfies AgentEvent);
-        this.activeChild = undefined;
-        return;
-      }
-      child.stdin.write(prompt);
-      child.stdin.end();
+    this.attachChild(child, logPath, turnDirectory);
+    if (!child.stdin) {
+      child.kill('SIGTERM');
+      this.stdout.write({ type: 'error', message: 'agy stdin is unavailable' } satisfies AgentEvent);
+      return;
     }
-
-    this.attachChild(child, logPath);
+    child.stdin.on('error', () => {
+      this.stdout.write({ type: 'error', message: 'agy prompt input failed' } satisfies AgentEvent);
+    });
+    child.stdin.end(prompt);
   }
 
-  private attachChild(child: ChildProcess, logPath: string): void {
+  private attachChild(child: ChildProcess, logPath: string, turnDirectory: string): void {
     if (!child.stdout || !child.stderr) {
+      child.once('close', () => rmSync(turnDirectory, { recursive: true, force: true }));
+      child.kill('SIGTERM');
       this.stdout.write({ type: 'error', message: 'agy stdio is unavailable' } satisfies AgentEvent);
       this.activeChild = undefined;
       return;
@@ -290,7 +294,10 @@ export class AgyVirtualProcess implements AgentProcess {
     });
 
     child.on('close', (code) => {
-      void this.onTurnComplete(code, logPath, stdoutTail);
+      // Read before cleanup: the log is needed only to find the conversation ID.
+      const logText = existsSync(logPath) ? readFileSync(logPath, 'utf8') : '';
+      rmSync(turnDirectory, { recursive: true, force: true });
+      void this.onTurnComplete(code, logText, stdoutTail);
     });
 
     child.on('error', (err) => {
@@ -302,7 +309,7 @@ export class AgyVirtualProcess implements AgentProcess {
     });
   }
 
-  private async onTurnComplete(code: number | null, logPath: string, stdoutTail: string): Promise<void> {
+  private async onTurnComplete(code: number | null, logText: string, stdoutTail: string): Promise<void> {
     this.activeChild = undefined;
 
     if (this.terminated) {
@@ -310,7 +317,6 @@ export class AgyVirtualProcess implements AgentProcess {
       return;
     }
 
-    const logText = existsSync(logPath) ? readFileSync(logPath, 'utf8') : '';
     const conversationId = parseConversationId(logText) ?? this.conversationId;
 
     if (!conversationId) {
@@ -332,6 +338,11 @@ export class AgyVirtualProcess implements AgentProcess {
     for (let i = 0; i < TRANSCRIPT_READ_RETRIES && !delta.found; i++) {
       await sleep(TRANSCRIPT_READ_DELAY_MS);
       delta = readPlannerDelta(conversationId, this.consumedStep);
+    }
+
+    if (this.terminated) {
+      this.emitExit(code);
+      return;
     }
 
     if (delta.found && delta.text) {
@@ -362,9 +373,14 @@ export class AgyVirtualProcess implements AgentProcess {
   private emitExit(code: number | null): void {
     if (this.exitEmitted) return;
     this.exitEmitted = true;
+    if (this.imageDirectory) rmSync(this.imageDirectory, { recursive: true, force: true });
     this.stdout.end();
     this.eventEmitter.emit('exit', code);
   }
+}
+
+function imageExtension(mimeType: string): string {
+  return ({ 'image/jpeg': 'jpg', 'image/webp': 'webp', 'image/gif': 'gif' } as Record<string, string>)[mimeType] ?? 'png';
 }
 
 function sleep(ms: number): Promise<void> {
@@ -393,6 +409,7 @@ export class AgyPlugin implements AgentPlugin {
       const output = execFileSync(this.binary, ['--version'], {
         timeout: 10000,
         encoding: 'utf-8',
+        env: buildChildEnv('agy'),
       });
       return { ok: true, version: output.trim() };
     } catch (err) {

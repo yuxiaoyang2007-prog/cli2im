@@ -1,4 +1,6 @@
 import type { BotConfig, CallbackQuery, SessionKey } from '../types.js';
+import { getBotAccessRejection } from '../security/access-policy.js';
+import { buildSessionKey } from '../types.js';
 
 type PermissionDecision = 'allow' | 'allow_session' | 'deny';
 
@@ -19,18 +21,7 @@ export interface SessionResumeCallbackData {
 }
 
 export function isCallbackAuthorized(callback: CallbackQuery, botConfig: BotConfig): boolean {
-  if (typeof callback.userId !== 'string' || callback.userId.length === 0) return false;
-
-  const isGroup = isGroupCallback(callback);
-  const normalizedAllowList = botConfig.allowFrom.map(String);
-  const userAllowed = normalizedAllowList.includes('*') || normalizedAllowList.includes(callback.userId);
-  if (!userAllowed) return false;
-
-  if (isGroup && botConfig.groupPolicy === 'allowlist') {
-    return (botConfig.groupAllowFrom ?? []).map(String).includes(callback.chatId);
-  }
-
-  return true;
+  return !getBotAccessRejection(callback, botConfig);
 }
 
 export function parsePermissionCallbackData(rawData: string): PermissionCallbackData | null {
@@ -64,7 +55,7 @@ export function handlePermissionCallback(
 }
 
 function buildCallbackSessionKey(callback: CallbackQuery, botName: string): SessionKey {
-  return `${callback.platform}:${callback.chatId}:${botName}`;
+  return buildSessionKey(callback.platform, callback.chatId, botName, callback.threadId);
 }
 
 export function parseSessionResumeCallback(rawData: string): SessionResumeCallbackData | null {
@@ -129,10 +120,4 @@ function parseResumeObject(rawData: string): SessionResumeCallbackData | null {
 
 function isPermissionDecision(value: string | undefined): value is PermissionDecision {
   return value === 'allow' || value === 'allow_session' || value === 'deny';
-}
-
-function isGroupCallback(callback: CallbackQuery): boolean {
-  return callback.chatType === 'group'
-    || callback.chatType === 'supergroup'
-    || callback.chatType === 'channel';
 }

@@ -4,6 +4,11 @@ import { join, dirname } from 'node:path';
 import { createRequire } from 'node:module';
 
 const require = createRequire(import.meta.url);
+const buildDir = process.env.CLI2IM_BUILD_DIR || 'dist';
+// Explicit candidate builds must not overwrite the live plugin's hook artifacts.
+const pluginBuildDir = process.env.CLI2IM_BUILD_DIR
+  ? join(buildDir, 'plugins', 'codex-task-notifier', 'dist')
+  : join('plugins', 'codex-task-notifier', 'dist');
 
 async function main() {
   await build({
@@ -12,8 +17,8 @@ async function main() {
     platform: 'node',
     target: 'node22',
     format: 'esm',
-    outfile: 'dist/index.js',
-    external: ['sql.js', '@larksuiteoapi/node-sdk', '@openai/codex-sdk', '@anthropic-ai/claude-agent-sdk'],
+    outfile: join(buildDir, 'index.js'),
+    external: ['sql.js', '@larksuiteoapi/node-sdk', '@openai/codex-sdk', '@anthropic-ai/claude-agent-sdk', 'content-guard'],
     sourcemap: true,
     banner: { js: "import { createRequire as _cR } from 'module'; const require = _cR(import.meta.url);" },
   });
@@ -24,7 +29,7 @@ async function main() {
     platform: 'node',
     target: 'node22',
     format: 'esm',
-    outfile: 'dist/cli2im.js',
+    outfile: join(buildDir, 'cli2im.js'),
     sourcemap: true,
     banner: { js: "#!/usr/bin/env node" },
   });
@@ -35,10 +40,10 @@ async function main() {
     platform: 'node',
     target: 'node22',
     format: 'esm',
-    outfile: 'dist/codex-notify-hook.js',
+    outfile: join(buildDir, 'codex-notify-hook.js'),
     banner: { js: '#!/usr/bin/env node' },
   });
-  chmodSync('dist/codex-notify-hook.js', 0o755);
+  chmodSync(join(buildDir, 'codex-notify-hook.js'), 0o755);
 
   await build({
     entryPoints: ['src/notifications/lifecycle-hook-client.ts'],
@@ -46,7 +51,7 @@ async function main() {
     platform: 'node',
     target: 'node22',
     format: 'esm',
-    outfile: 'plugins/codex-task-notifier/dist/lifecycle-hook.js',
+    outfile: join(pluginBuildDir, 'lifecycle-hook.js'),
     banner: { js: '#!/usr/bin/env node' },
   });
   await build({
@@ -55,17 +60,17 @@ async function main() {
     platform: 'node',
     target: 'node22',
     format: 'esm',
-    outfile: 'plugins/codex-task-notifier/dist/mcp-server.js',
+    outfile: join(pluginBuildDir, 'mcp-server.js'),
     banner: { js: '#!/usr/bin/env node' },
   });
-  chmodSync('plugins/codex-task-notifier/dist/lifecycle-hook.js', 0o755);
-  chmodSync('plugins/codex-task-notifier/dist/mcp-server.js', 0o755);
+  chmodSync(join(pluginBuildDir, 'lifecycle-hook.js'), 0o755);
+  chmodSync(join(pluginBuildDir, 'mcp-server.js'), 0o755);
 
   const sqlJsDir = dirname(require.resolve('sql.js/dist/sql-wasm.wasm'));
-  mkdirSync('dist', { recursive: true });
-  cpSync(join(sqlJsDir, 'sql-wasm.wasm'), 'dist/sql-wasm.wasm');
+  mkdirSync(buildDir, { recursive: true });
+  cpSync(join(sqlJsDir, 'sql-wasm.wasm'), join(buildDir, 'sql-wasm.wasm'));
 
-  console.log('Build complete');
+  console.log(`Build complete: ${buildDir}`);
 }
 
 main().catch((error) => {
