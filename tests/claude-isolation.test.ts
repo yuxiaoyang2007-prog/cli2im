@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { mkdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { mkdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import * as nodeFs from 'node:fs';
 import { join } from 'node:path';
 import { isolationFixture } from './helpers/isolation.js';
@@ -8,7 +8,7 @@ import { ClaudeCodePlugin, ClaudeCodeVirtualProcess } from '../src/agents/claude
 import { PROVIDER_CREDENTIAL } from '../src/isolation/admission.js';
 import { loadConfig } from '../src/config/loader.js';
 import { stringify } from 'yaml';
-import { RUNTIME_READ } from '../src/isolation/policy.js';
+import { buildIsolationPolicy, RUNTIME_READ } from '../src/isolation/policy.js';
 import { protectedWriteDenied } from '../src/isolation/probe.js';
 
 vi.mock('node:fs', async importOriginal => ({ ...await importOriginal<typeof import('node:fs')>() }));
@@ -199,17 +199,20 @@ describe('slice 6 Claude isolation', () => {
   it.each([false, true])('pins Claude spawn and resume to the policy executable only when isolated=%s', async isolated => {
     const query = vi.fn(() => (async function* () {})());
     const plugin = new ClaudeCodePlugin('claude', query as any);
-    const policy = f.policy();
+    const alias = join(f.root, 'trusted-alias'); symlinkSync('/usr/bin', alias);
+    const PATH = `${f.root}/missing-bin:${alias}:/bin`;
+    const policy = buildIsolationPolicy({ config: f.config, botName: 'bot', workspace: f.workspace, paths: f.paths,
+      binaryPath: '/bin/cat', effectiveEnv: { PATH } });
     mkdirSync(join(f.workspace, 'bin')); writeFileSync(join(f.workspace, 'bin/claude'), 'workspace shadow');
     for (const resume of [false, true]) {
       const options = { workingDirectory: f.workspace, permissionMode: 'blacklist' as const,
-        env: { HOME: f.paths.home, PATH: isolated ? '/usr/bin:/bin' : 'bin:/usr/bin:/bin' }, ...(isolated ? { isolation: policy } : {}) };
+        env: { HOME: f.paths.home, PATH: isolated ? PATH : 'bin:/usr/bin:/bin' }, ...(isolated ? { isolation: policy } : {}) };
       const proc = resume ? plugin.resume('existing-session', options) : plugin.spawn(options);
       try {
         proc.stdin.write(plugin.formatStdinMessage({ role: 'user', content: 'fixture' }));
         await vi.waitFor(() => expect(query).toHaveBeenCalledTimes(resume ? 2 : 1));
         expect((query.mock.calls as any).at(-1)[0].options.pathToClaudeCodeExecutable).toBe(isolated ? policy.binaryPath : 'claude');
-        expect((query.mock.calls as any).at(-1)[0].options.env.PATH).toBe(options.env.PATH);
+        expect((query.mock.calls as any).at(-1)[0].options.env.PATH).toBe(isolated ? ['/usr/bin', '/bin'].map(p => realpathSync.native(p)).join(':') : options.env.PATH);
       } finally { proc.kill(); }
     }
   });

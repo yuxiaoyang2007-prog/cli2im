@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { existsSync, mkdirSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { spawnSync } from 'node:child_process';
 import { EventEmitter } from 'node:events';
 import { PassThrough, Transform } from 'node:stream';
 import { isolationFixture } from './helpers/isolation.js';
@@ -76,6 +77,38 @@ describe('slice 5 admission and provenance', () => {
       }
       expect(binary()).toEqual(identity);
     }
+  });
+  it.each(['claude-code', 'codex'] as const)('canonical PATH survives workspace bin/node creation after VERIFIED for %s', async agent => {
+    f.bot.agent = agent; f.config.agents[agent] = { binary: '/bin/cat' };
+    const trusted = join(f.paths.installDir, 'bin'); mkdirSync(trusted);
+    symlinkSync(process.execPath, join(trusted, 'node'));
+    const alias = join(f.workspace, 'trusted-alias'); symlinkSync(trusted, alias);
+    const missing = join(f.workspace, 'bin');
+    const opts: SpawnOpts = { workingDirectory: f.workspace, permissionMode: 'blacklist',
+      env: { HOME: f.paths.home, PATH: `${missing}:${alias}:/usr/bin:/bin` } };
+    const expectedPath = [trusted, '/usr/bin', '/bin'].map(p => realpathSync.native(p)).join(':');
+    const runCheck = vi.fn(async input => {
+      expect(input.env.PATH).toBe(expectedPath);
+      expect(agentChildEnv(agent, createCheckOptions(agent, { ...input.opts, isolation: input.policy }, input.env,
+        'http://127.0.0.1:12345').opts).PATH).toBe(expectedPath);
+      return record(input.policy.fingerprint);
+    });
+    const runtime = new IsolationRuntime({ config: f.config, paths: f.paths, verification, store,
+      memory: new MemoryStore(f.paths.memoryDir), inheritedEnv: {}, sdkVersions: { fixture: '1' }, invalidate: vi.fn(), runCheck });
+    opts.isolation = await runtime.prepare(key, principal, f.workspace, opts, {});
+    expect(verification.state('bot', f.workspace, opts.isolation.fingerprint, binary())).toBe('VERIFIED');
+    expect(opts.env!.PATH).toBe(expectedPath);
+    mkdirSync(missing); writeFileSync(join(missing, 'node'), '#!/bin/sh\nexit 99\n', { mode: 0o700 });
+    const recorder = runtime.captureRecorder(key); recorder('resume-session');
+    for (const sessionId of [undefined, 'resume-session']) {
+      await expect(runtime.assert(key, sessionId)).resolves.toBeUndefined();
+      const env = agentChildEnv(agent, opts);
+      expect(env.PATH).toBe(expectedPath);
+      const child = spawnSync('/usr/bin/env', ['node', '-p', '"trusted-node"'], { cwd: f.workspace, env, encoding: 'utf8' });
+      expect(child.status).toBe(0); expect(child.stdout.trim()).toBe('trusted-node');
+    }
+    await runtime.check(key);
+    expect(runCheck).toHaveBeenCalledTimes(2);
   });
   it('persists 600 records, detects binary/policy staleness and fails closed without overwriting corruption', () => {
     const p = f.policy();

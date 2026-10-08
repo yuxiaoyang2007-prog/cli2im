@@ -1,9 +1,10 @@
 import { createHash } from 'node:crypto';
-import { lstatSync, readdirSync, readFileSync, readlinkSync, statSync } from 'node:fs';
+import { lstatSync, readdirSync, readFileSync, readlinkSync, realpathSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { basename, delimiter, dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { canonicalPath } from '../runtime/execution-scope.js';
+import { expandHome } from '../media.js';
 import { getCli2imDataDir } from '../util/data-dir.js';
 import type { AppConfig, BotConfig, SpawnOpts } from '../types.js';
 import { compileClaudeSettings, validateClaudePlugins } from './claude.js';
@@ -76,31 +77,59 @@ export function isolationWritablePaths(config: Pick<AppConfig, 'bots'>, paths: P
   return normalized(scopes(config, paths).flatMap(s => s.writable));
 }
 export function isolationSearchPathDenied(config: Pick<AppConfig, 'bots'>, paths: PolicyPaths): string[] {
-  return normalized([...isolationWritablePaths(config, paths), join(paths.dataDir, 'inbox')]);
+  // Resolve configured roots before JS normalization can fold symlink targets.
+  const roots = Object.values(config.bots).flatMap(bot => [bot.workingDirectory,
+    ...Object.values(bot.userOverrides ?? {}).flatMap(value => value.workingDirectory ? [value.workingDirectory] : []),
+    ...(bot.isolation?.writable ?? [])]);
+  // Also deny the canonical roots actually granted by the sandbox; link/.. can resolve differently.
+  roots.push(...isolationWritablePaths(config, paths), join(paths.dataDir, 'inbox'));
+  return [...new Set(roots.map(nativeSearchPathRoot))].sort();
 }
-/** Preserve lookup spelling, but check both literal and canonical containment. */
+/** Denied directories can be created later; resolve their existing ancestors natively. */
+function nativeSearchPathRoot(path: string): string {
+  path = expandHome(path);
+  try { return realpathSync.native(path); }
+  catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if ((code !== 'ENOENT' && code !== 'ENOTDIR') || dirname(path) === path) {
+      throw new Error('UNSUPPORTED: Isolation PATH denied directory cannot be resolved');
+    }
+    return join(nativeSearchPathRoot(dirname(path)), basename(path));
+  }
+}
+/** Return only existing real directories, in lookup order, for the child PATH. */
 export function validateIsolationSearchPath(value: string | undefined, denied: string[]): string[] {
   const entries = (value ?? '').split(delimiter);
-  if (entries.some(entry => {
-    const segments = entry.split('/');
-    // Reject before canonicalPath can fold segments ahead of symlink resolution.
-    if (!entry || !isAbsolute(entry) || segments.some(segment => segment === '.' || segment === '..')) return true;
-    const literal = '/' + segments.filter(Boolean).join('/');
-    const canonical = canonicalPath(entry);
-    return denied.some(root => {
-      const deniedRoot = canonicalPath(root);
-      return contains(deniedRoot, literal) || contains(deniedRoot, canonical);
-    });
-  })) {
+  if (entries.some(entry => !entry || !isAbsolute(entry) || entry.split('/').some(segment => segment === '.' || segment === '..'))) {
     throw new Error('UNSUPPORTED: Isolation PATH contains an empty, relative, dot-segment or agent-writable entry');
   }
-  return entries;
+  const compare = (path: string) => process.platform === 'darwin' ? path.toLowerCase() : path;
+  const roots = denied.map(root => compare(nativeSearchPathRoot(root)));
+  const canonical = entries.flatMap(entry => {
+    let directory: string;
+    try {
+      directory = realpathSync.native(entry);
+      if (!statSync(directory).isDirectory()) return [];
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === 'ENOENT' || code === 'ENOTDIR') return [];
+      throw new Error('UNSUPPORTED: Isolation PATH directory cannot be resolved');
+    }
+    if (roots.some(root => overlap(root, compare(directory)))) {
+      throw new Error('UNSUPPORTED: Isolation PATH overlaps an agent-writable or inbox directory');
+    }
+    return [directory];
+  });
+  // PATH='' would re-enable lookup in the agent-writable current directory.
+  if (!canonical.length) throw new Error('UNSUPPORTED: Isolation PATH has no existing trusted directories');
+  return canonical;
 }
-export function assertIsolationSearchPath(env: NodeJS.ProcessEnv, policy: IsolationPolicy): void {
+export function assertIsolationSearchPath(env: NodeJS.ProcessEnv, policy: IsolationPolicy): string {
   const entries = validateIsolationSearchPath(env.PATH, policy.searchPathDenied);
   if (stableJSON(entries) !== stableJSON(policy.searchPath)) {
     throw new Error('UNSUPPORTED: Isolation PATH differs from the verified policy');
   }
+  return entries.join(delimiter);
 }
 function unsafeWorkspace(path: string, paths: PolicyPaths): boolean {
   const home = canonicalPath(paths.home);

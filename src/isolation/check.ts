@@ -45,7 +45,7 @@ export function forbiddenCodexCapability(name: string): boolean {
 
 /** Executes the exact production plugin, binding its evidence to the production fingerprint. */
 export async function runIsolationCheck(input: IsolationCheckInput, deps: CheckDependencies = {}): Promise<VerificationRecord> {
-  try { assertIsolationSearchPath(input.env, input.policy); }
+  try { input = { ...input, env: { ...input.env, PATH: assertIsolationSearchPath(input.env, input.policy) } }; }
   catch {
     return { bot: input.bot, scopeKey: input.policy.scopeKey, policyFingerprint: input.policy.fingerprint,
       agentBinary: input.binary, status: 'UNSUPPORTED', checks: [{ name: 'environment.path', status: 'UNSUPPORTED' }],

@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { chmodSync, copyFileSync, existsSync, statSync, readdirSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, copyFileSync, existsSync, statSync, readdirSync, mkdirSync, realpathSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
 import { createServer } from 'node:http';
@@ -45,7 +45,7 @@ describe('slice 7 Codex isolation', () => {
     binary = join(f.root, 'fake-codex.cjs');
     // A local scripted executable: no socket, authentication, or model requests.
     writeFileSync(binary, `#!${process.execPath}\nconst fs = require('node:fs');\nlet prompt = ''; process.stdin.on('data', x => prompt += x); process.stdin.on('end', () => {
-      fs.writeFileSync(process.env.CAPTURE, JSON.stringify({ args: process.argv.slice(2), prompt, tmpdir: process.env.TMPDIR, codexHome: process.env.CODEX_HOME, developerDir: process.env.DEVELOPER_DIR, envKeys: Object.keys(process.env) }));
+      fs.writeFileSync(process.env.CAPTURE, JSON.stringify({ args: process.argv.slice(2), prompt, tmpdir: process.env.TMPDIR, codexHome: process.env.CODEX_HOME, developerDir: process.env.DEVELOPER_DIR, path: process.env.PATH, envKeys: Object.keys(process.env) }));
       for (const event of ${JSON.stringify(records)}) process.stdout.write(JSON.stringify(event) + '\\n');
     });\n`);
     chmodSync(binary, 0o700);
@@ -170,7 +170,9 @@ describe('slice 7 Codex isolation', () => {
     const trusted = join(trustedBin, 'fixture-codex.cjs');
     writeFileSync(trusted, readFileSync(binary, 'utf8').replace(/^#!.*\n/, '#!/usr/bin/env node\n'), { mode: 0o700 });
     symlinkSync(process.execPath, join(trustedBin, 'node'));
-    const options = opts(); options.env!.PATH = `${trustedBin}:/usr/bin:/bin`;
+    const alias = join(f.root, 'trusted-alias'); symlinkSync(trustedBin, alias);
+    const options = opts(); options.env!.PATH = `${f.root}/missing-bin:${alias}:/usr/bin:/bin`;
+    const expectedPath = [trustedBin, '/usr/bin', '/bin'].map(p => realpathSync.native(p)).join(':');
     const verified = identifyBinary('fixture-codex.cjs', options.env!.PATH);
     expect(verified.realpath).toBe(trusted);
     options.isolation = buildIsolationPolicy({ config: f.config, botName: 'bot', workspace: f.workspace, paths: f.paths, binaryPath: verified.realpath, effectiveEnv: options.env! });
@@ -181,12 +183,17 @@ describe('slice 7 Codex isolation', () => {
     copyFileSync(shadow, join(shadowBin, 'node')); chmodSync(join(shadowBin, 'node'), 0o700);
     const plugin = new CodexPlugin('fixture-codex.cjs');
     await turn(plugin, options);
+    const capturedPath = () => JSON.parse(readFileSync(join(f.root, 'capture.json'), 'utf8')).path;
+    expect(capturedPath()).toBe(expectedPath);
     const resumed = await turn(plugin, options, 'existing-thread');
+    expect(capturedPath()).toBe(expectedPath);
     resumed.proc.stdin.write(plugin.formatStdinMessage({ role: 'user', content: 'later turn' }));
     await vi.waitFor(() => expect(resumed.events.filter(e => e.type === 'result')).toHaveLength(2));
     expect(JSON.parse(readFileSync(join(f.root, 'capture.json'), 'utf8')).args.slice(-2)).toEqual(['fixture-thread', '-']);
+    expect(capturedPath()).toBe(expectedPath);
     const check = createCheckOptions('codex', options, options.env!, 'http://127.0.0.1:12345');
     await turn(plugin, check.opts);
+    expect(capturedPath()).toBe(expectedPath);
     expect(existsSync(marker)).toBe(false);
     expect(sdk.construct).not.toHaveBeenCalled();
     await turn(plugin, { ...options, isolation: undefined });

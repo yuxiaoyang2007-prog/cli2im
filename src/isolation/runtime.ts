@@ -1,4 +1,5 @@
 import { isolatedCodexHome, prepareCodexHome, isolationEnvironment } from './codex.js';
+import { delimiter } from 'node:path';
 import { sdkIdentity } from './sdk-identity.js';
 import { prepareTemporaryDirectory } from './sbx-read.js';
 import type { AppConfig, SessionKey, SpawnOpts } from '../types.js';
@@ -57,8 +58,8 @@ export class IsolationRuntime {
       opts.env = isolationEnvironment({ ...opts.env, ...(bot.agent === 'codex' ? { CODEX_HOME: isolatedCodexHome(this.deps.paths.dataDir, botName) } : {}), ...(bot.agent === 'claude-code' ? { CLAUDE_CODE_TMPDIR: tmpdir } : { TMPDIR: tmpdir }) });
       const env = buildChildEnv(bot.agent as ChildProvider, opts.env, this.deps.inheritedEnv ?? process.env);
       assertNoProviderCredentials(env);
-      validateIsolationSearchPath(env.PATH, isolationSearchPathDenied(this.deps.config, this.deps.paths));
-      const binary = identifyBinary(this.deps.config.agents[bot.agent]?.binary ?? '', env.PATH);
+      const searchPath = validateIsolationSearchPath(env.PATH, isolationSearchPathDenied(this.deps.config, this.deps.paths)).join(delimiter);
+      const binary = identifyBinary(this.deps.config.agents[bot.agent]?.binary ?? '', searchPath);
       const input: Parameters<typeof buildIsolationPolicy>[0] = { config: this.deps.config, botName, workspace: scopeKey, paths: this.deps.paths,
         binaryPath: binary.realpath, effectiveEnv: env, identityMapping, sdkVersions: this.deps.sdkVersions ?? sdkIdentity(bot.agent),
         // Production launch values only: no prompt, session ID, ephemeral probe flags or credential values.
@@ -68,6 +69,7 @@ export class IsolationRuntime {
       const expected = { bot: botName, principal, scope: canonicalPolicyWorkspace(opts.workingDirectory), policyFingerprint: policy.fingerprint,
         memoryGeneration: await this.deps.memory.generation(principal) };
       if (inspectOnly) return policy;
+      opts.env = { ...opts.env, PATH: searchPath };
       if (policy.codexHome) prepareCodexHome(policy.codexHome);
       const previous = this.bindings.get(key);
       if (previous && !canResumeIsolated({ ...previous.expected, agentSessionId: '' }, expected)) this.deps.replaceProcess?.(key);
@@ -90,8 +92,8 @@ export class IsolationRuntime {
       const bot = this.deps.config.bots[binding.expected.bot];
       const env = isolationEnvironment(buildChildEnv(bot.agent as ChildProvider, binding.opts.env, this.deps.inheritedEnv ?? process.env), binding.policy);
       assertNoProviderCredentials(env);
-      validateIsolationSearchPath(env.PATH, isolationSearchPathDenied(this.deps.config, this.deps.paths));
-      const binary = identifyBinary(this.deps.config.agents[bot.agent].binary, env.PATH);
+      const searchPath = validateIsolationSearchPath(env.PATH, isolationSearchPathDenied(this.deps.config, this.deps.paths)).join(delimiter);
+      const binary = identifyBinary(this.deps.config.agents[bot.agent].binary, searchPath);
       const currentPolicy = buildIsolationPolicy({ ...binding.input, binaryPath: binary.realpath, effectiveEnv: env,
         production: productionParameters(binding.opts, env), sdkVersions: this.deps.sdkVersions ?? sdkIdentity(bot.agent) });
       if (currentPolicy.fingerprint !== binding.policy.fingerprint) {
@@ -116,7 +118,7 @@ export class IsolationRuntime {
     }
   }
   private async checkBinding(binding: Binding, env: Record<string, string>, binary: AgentBinary, force = false): Promise<void> {
-    assertIsolationSearchPath(env, binding.policy);
+    env = { ...env, PATH: assertIsolationSearchPath(env, binding.policy) };
     if (!this.deps.runCheck) return;
     const bot = binding.expected.bot;
     const state = this.deps.verification.state(bot, binding.policy.scopeKey, binding.policy.fingerprint, binary);
@@ -143,7 +145,7 @@ export class IsolationRuntime {
     if (!binding) return;
     const bot = this.deps.config.bots[binding.expected.bot];
     const env = isolationEnvironment(buildChildEnv(bot.agent as ChildProvider, binding.opts.env, this.deps.inheritedEnv ?? process.env), binding.policy);
-    try { assertIsolationSearchPath(env, binding.policy); }
+    try { env.PATH = assertIsolationSearchPath(env, binding.policy); }
     catch (error) { throw this.revokePreparation(binding.expected.bot, error); }
     assertNoProviderCredentials(env);
     const binary = identifyBinary(this.deps.config.agents[bot.agent].binary, env.PATH);

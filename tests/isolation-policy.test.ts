@@ -1,8 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { mkdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { mkdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { isolationFixture } from './helpers/isolation.js';
-import { assertAgentsFile, buildIsolationPolicy, fingerprint, scopeHash, validateIsolationConfig } from '../src/isolation/policy.js';
+import { assertAgentsFile, assertIsolationSearchPath, buildIsolationPolicy, fingerprint, isolationSearchPathDenied, scopeHash, validateIsolationConfig, validateIsolationSearchPath } from '../src/isolation/policy.js';
+import { compileClaudeSettings } from '../src/isolation/claude.js';
 import { assertNoProviderCredentials } from '../src/isolation/admission.js';
 import { buildReadProfile } from '../src/isolation/sbx-read.js';
 import { resolveBotSpawnOpts } from '../src/index.js';
@@ -16,26 +17,111 @@ describe('slice 5 isolation policy', () => {
     expect(() => buildIsolationPolicy({ config: f.config, botName: 'bot', workspace: f.workspace, paths: f.paths,
       binaryPath: '/bin/cat', effectiveEnv: { PATH } })).toThrow(/^UNSUPPORTED:.*PATH/);
   });
-  it.each(['workspace', 'grant', 'inbox'])('PATH resolution rejects symlink traversal through %s by literal and canonical containment', kind => {
+  it.each(['workspace', 'grant', 'inbox'])('PATH resolution rejects symlink targets containing .. through %s', kind => {
     f.bot.workingDirectory = f.workspace; f.bot.userOverrides = undefined;
     const root = kind === 'workspace' ? f.workspace : kind === 'inbox' ? f.policy().inbox : join(f.root, 'grant');
     if (kind === 'grant') f.bot.isolation!.writable = [root];
     mkdirSync(join(root, 'deep/a'), { recursive: true });
+    mkdirSync(join(root, 'bin'));
+    mkdirSync(join(f.root, 'trusted'));
+    mkdirSync(join(f.root, 'bin'));
     symlinkSync(join(root, 'deep/a'), join(root, 'up'));
-    symlinkSync(join(f.root, 'outside'), join(root, 'out'));
-    symlinkSync(root, join(f.root, 'alias'));
-    for (const entry of [`${root}/up/../../bin`, `${root}//out//`, `${root}//out//missing-bin/`,
-      join(f.root, 'alias'), join(f.root, 'alias', 'missing-bin')]) {
-      expect(() => buildIsolationPolicy({ config: f.config, botName: 'bot', workspace: f.workspace, paths: f.paths,
-        binaryPath: '/bin/cat', effectiveEnv: { PATH: `${entry}:/usr/bin:/bin` } }), entry).toThrow(/^UNSUPPORTED:.*PATH/);
-    }
+    const entry = join(f.root, 'trusted', 'search');
+    symlinkSync(`${root}/up/../../bin`, entry);
+    expect(realpathSync.native(entry)).toBe(realpathSync.native(join(root, 'bin')));
+    expect(() => buildIsolationPolicy({ config: f.config, botName: 'bot', workspace: f.workspace, paths: f.paths,
+      binaryPath: '/bin/cat', effectiveEnv: { PATH: `${entry}:/usr/bin:/bin` } })).toThrow(/^UNSUPPORTED:.*PATH/);
   });
-  it('PATH resolution preserves safe spelling, repeated slashes and trusted external symlinks', () => {
-    symlinkSync(join(f.root, 'outside'), join(f.root, 'trusted-alias'));
-    const entries = [`${f.root}//trusted-alias//missing-bin/`, `${f.root}/outside/.bin`, `${f.root}/outside/...`, '/usr//bin/', '/bin'];
+  it('PATH resolution rewrites trusted symlinks and repeated slashes and drops missing or non-directory entries', () => {
+    const outside = join(f.root, 'outside');
+    symlinkSync(outside, join(f.root, 'trusted-alias'));
+    mkdirSync(join(outside, '.bin')); mkdirSync(join(outside, '...'));
+    writeFileSync(join(outside, 'file'), 'not a directory');
+    const entries = [`${f.root}//trusted-alias//`, `${outside}/missing-bin`, `${outside}/file`, `${outside}/file/bin`,
+      `${outside}/.bin`, `${outside}/...`, '/usr//bin/', '/bin'];
     const policy = buildIsolationPolicy({ config: f.config, botName: 'bot', workspace: f.workspace, paths: f.paths,
       binaryPath: '/bin/cat', effectiveEnv: { PATH: entries.join(':') } });
-    expect(policy.searchPath).toEqual(entries);
+    expect(policy.searchPath).toEqual([outside, `${outside}/.bin`, `${outside}/...`, '/usr/bin', '/bin'].map(p => realpathSync.native(p)));
+  });
+  it('PATH resolution rejects an empty result rather than enabling cwd lookup', () => {
+    expect(() => validateIsolationSearchPath(join(f.root, 'missing-bin'), [])).toThrow(/^UNSUPPORTED:.*PATH/);
+  });
+  it.each(['workspace', 'inbox', 'missing-grant'])('PATH resolution rejects ancestors of %s', kind => {
+    f.bot.workingDirectory = f.workspace; f.bot.userOverrides = undefined;
+    if (kind === 'missing-grant') f.bot.isolation!.writable = [join(f.root, 'outside', 'future-grant')];
+    const entry = kind === 'workspace' ? f.root : kind === 'inbox' ? f.paths.dataDir : join(f.root, 'outside');
+    expect(() => buildIsolationPolicy({ config: f.config, botName: 'bot', workspace: f.workspace, paths: f.paths,
+      binaryPath: '/bin/cat', effectiveEnv: { PATH: `${entry}:/usr/bin` } })).toThrow(/^UNSUPPORTED:.*PATH/);
+  });
+  it('PATH resolution canonicalizes denied symlink targets with native semantics', () => {
+    f.bot.workingDirectory = f.workspace; f.bot.userOverrides = undefined;
+    mkdirSync(join(f.root, 'outside', 'deep'));
+    symlinkSync(join(f.root, 'outside', 'deep'), join(f.root, 'via'));
+    symlinkSync('via/..', join(f.root, 'grant'));
+    f.bot.isolation!.writable = [join(f.root, 'grant')];
+    expect(() => validateIsolationSearchPath(`${f.root}/outside:/usr/bin`, isolationSearchPathDenied(f.config, f.paths))).toThrow(/^UNSUPPORTED:.*PATH/);
+  });
+  it.each([
+    ['codex', 'configured-dotdot'], ['codex', 'target-dotdot'],
+    ['claude-code', 'configured-dotdot'], ['claude-code', 'target-dotdot'],
+  ])('PATH denies actual allowed-user writable scopes for %s with %s', (agent, spelling) => {
+    f.bot.agent = agent;
+    mkdirSync(join(f.root, 'outside', 'deep'));
+    mkdirSync(join(f.root, 'outside', 'alice', 'bin'), { recursive: true });
+    symlinkSync(join(f.root, 'outside', 'deep'), join(f.root, 'via'));
+    const configured = `${f.root}/via/../alice`;
+    symlinkSync('via/../alice', join(f.root, 'workspace-link'));
+    f.bot.userOverrides!.alice.workingDirectory = spelling === 'configured-dotdot'
+      ? configured : join(f.root, 'workspace-link');
+    expect(f.bot.allowFrom).toContain('alice');
+    const nativeWorkspace = realpathSync.native(f.bot.userOverrides!.alice.workingDirectory!);
+    expect(nativeWorkspace).toBe(join(f.root, 'outside', 'alice'));
+    const policy = f.policy();
+    expect(policy.workspace).toBe(f.workspace);
+    expect(policy.writable).toContain(f.workspace);
+    expect(nativeWorkspace).not.toBe(policy.workspace);
+    if (agent === 'claude-code') {
+      expect(compileClaudeSettings(policy, f.paths.home).sandbox.filesystem.allowWrite).toContain(policy.workspace);
+    }
+    expect(policy.searchPathDenied).toEqual(expect.arrayContaining(policy.writable));
+    for (const root of [policy.workspace, nativeWorkspace]) {
+      mkdirSync(join(root, 'bin'), { recursive: true });
+      expect(policy.searchPathDenied).toContain(realpathSync.native(root));
+      for (const entry of [root, join(root, 'bin')]) {
+        const effectiveEnv = { PATH: `${entry}:/usr/bin:/bin` };
+        expect(() => buildIsolationPolicy({ config: f.config, botName: 'bot', workspace: f.workspace,
+          paths: f.paths, binaryPath: '/bin/cat', effectiveEnv })).toThrow(/^UNSUPPORTED:.*PATH overlaps/);
+        expect(() => assertIsolationSearchPath(effectiveEnv, policy)).toThrow(/^UNSUPPORTED:.*PATH overlaps/);
+      }
+    }
+  });
+  it.each(['configured-dotdot', 'target-dotdot'])('PATH denies actual writable grants with %s', spelling => {
+    f.bot.workingDirectory = f.workspace; f.bot.userOverrides = undefined;
+    mkdirSync(join(f.root, 'outside', 'deep'));
+    mkdirSync(join(f.root, 'outside', 'grant'));
+    mkdirSync(join(f.root, 'grant'));
+    symlinkSync(join(f.root, 'outside', 'deep'), join(f.root, 'via'));
+    symlinkSync('via/../grant', join(f.root, 'grant-link'));
+    const grant = spelling === 'configured-dotdot' ? `${f.root}/via/../grant` : join(f.root, 'grant-link');
+    f.bot.isolation!.writable = [grant];
+    const policy = f.policy();
+    expect(policy.writable).toContain(join(f.root, 'grant'));
+    expect(realpathSync.native(grant)).toBe(join(f.root, 'outside', 'grant'));
+    for (const root of [join(f.root, 'grant'), realpathSync.native(grant)]) {
+      mkdirSync(join(root, 'bin'));
+      for (const entry of [root, join(root, 'bin')]) {
+        expect(() => assertIsolationSearchPath({ PATH: `${entry}:/usr/bin` }, policy)).toThrow(/^UNSUPPORTED:.*PATH overlaps/);
+      }
+    }
+  });
+  it.skipIf(process.platform !== 'darwin')('PATH resolution rejects macOS case aliases in both containment directions', () => {
+    mkdirSync(join(f.workspace, 'bin'));
+    const alias = f.workspace.toUpperCase();
+    expect(realpathSync.native(alias)).toBe(realpathSync.native(f.workspace));
+    expect(() => validateIsolationSearchPath(`${alias}/BIN:/usr/bin`, [f.workspace])).toThrow(/^UNSUPPORTED:.*PATH/);
+    expect(() => validateIsolationSearchPath(`${f.root}:/usr/bin`, [alias])).toThrow(/^UNSUPPORTED:.*PATH/);
+    // Missing denied suffixes cannot obtain canonical casing from realpath yet.
+    expect(() => validateIsolationSearchPath(`${f.workspace}:/usr/bin`, [`${alias}/FUTURE`])).toThrow(/^UNSUPPORTED:.*PATH/);
   });
   it.each(['workspace', 'other-scope', 'other-bot', 'grant', 'temporary', 'inbox', 'other-inbox', 'symlink', 'normalized'])('PATH hygiene rejects canonical writable and inbox entries: %s', kind => {
     let entry = join(f.workspace, 'bin');
@@ -48,25 +134,28 @@ describe('slice 5 isolation policy', () => {
       f.bot.workingDirectory = f.workspace; f.bot.userOverrides = undefined;
       f.bot.isolation!.writable = [join(f.root, 'grant')]; entry = join(f.root, 'grant', 'bin');
     }
-    if (kind === 'temporary') { f.bot.agent = 'claude-code'; entry = join(f.policy().tmpdir, 'bin'); }
+    if (kind === 'temporary') entry = join(f.policy().tmpdir, 'bin');
     if (kind === 'inbox') entry = join(f.policy().inbox, 'bin');
     if (kind === 'other-inbox') entry = join(f.paths.dataDir, 'inbox', scopeHash(join(f.root, 'bob')), 'bin');
-    if (kind === 'symlink') { symlinkSync(f.workspace, join(f.root, 'alias')); entry = join(f.root, 'alias', 'missing-bin'); }
+    if (kind === 'symlink') { symlinkSync(f.workspace, join(f.root, 'alias')); entry = join(f.root, 'alias', 'bin'); }
     if (kind === 'normalized') entry = `${f.workspace}/../alice/bin`;
+    if (kind !== 'normalized') mkdirSync(entry, { recursive: true });
     expect(() => buildIsolationPolicy({ config: f.config, botName: 'bot', workspace: f.workspace, paths: f.paths,
       binaryPath: '/bin/cat', effectiveEnv: { PATH: `${entry}:/usr/bin:/bin` } })).toThrow(/^UNSUPPORTED:.*PATH/);
   });
   it('fingerprints PATH values and order without retaining other environment values', () => {
     const params = { config: f.config, botName: 'bot', workspace: f.workspace, paths: f.paths, binaryPath: '/bin/cat' };
     const base = buildIsolationPolicy({ ...params, effectiveEnv: { PATH: '/usr/bin:/bin' } });
-    for (const PATH of ['/bin:/usr/bin', '/usr/bin:/bin:/usr/local/bin']) {
+    for (const PATH of ['/bin:/usr/bin', `/usr/bin:/bin:${f.root}/outside`]) {
       expect(buildIsolationPolicy({ ...params, effectiveEnv: { PATH } }).fingerprint).not.toBe(base.fingerprint);
     }
     const env = { PATH: '/usr/bin:/bin', FIXTURE_SECRET: 'never-store-this-value' };
     const same = buildIsolationPolicy({ ...params, effectiveEnv: env });
     expect(same.fingerprint).toBe(base.fingerprint);
     expect(JSON.stringify(same)).not.toContain(env.FIXTURE_SECRET);
-    expect(same.searchPath).toEqual(['/usr/bin', '/bin']);
+    expect(same.searchPath).toEqual(['/usr/bin', '/bin'].map(p => realpathSync.native(p)));
+    symlinkSync('/usr/bin', join(f.root, 'trusted-alias'));
+    expect(buildIsolationPolicy({ ...params, effectiveEnv: { PATH: `${f.root}/missing:${f.root}/trusted-alias:/bin` } }).fingerprint).toBe(base.fingerprint);
   });
   it('normalizes effective sets, private inbox and Codex temporary directory', () => {
     const p = f.policy();

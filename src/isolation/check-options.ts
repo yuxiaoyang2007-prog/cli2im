@@ -8,7 +8,7 @@ import { assertIsolationSearchPath } from './policy.js';
 const checks = new WeakMap<SpawnOpts, { url: string; env: Record<string, string>; placeholder: string }>();
 export function createCheckOptions(agent: string, production: SpawnOpts, env: Record<string, string>, url: string, placeholder = 'cli2im-check-placeholder') {
   if (!production.isolation) throw new Error('Isolation check requires a production policy');
-  assertIsolationSearchPath(env, production.isolation);
+  const PATH = assertIsolationSearchPath(env, production.isolation);
   assertNoProviderCredentials(env);
   const endpoint = new URL(url);
   if (endpoint.protocol !== 'http:' || endpoint.hostname !== '127.0.0.1' || !endpoint.port || endpoint.username || endpoint.password) {
@@ -18,7 +18,7 @@ export function createCheckOptions(agent: string, production: SpawnOpts, env: Re
   const access: Record<string, string> = agent === 'claude-code'
     ? { ANTHROPIC_BASE_URL: url, ANTHROPIC_API_KEY: placeholder }
     : {};
-  const checkEnv = { ...isolationEnvironment(env, production.isolation), ...access, NO_PROXY: noProxy(env.NO_PROXY), no_proxy: noProxy(env.no_proxy) } as Record<string, string>;
+  const checkEnv = { ...isolationEnvironment(env, production.isolation), PATH, ...access, NO_PROXY: noProxy(env.NO_PROXY), no_proxy: noProxy(env.no_proxy) } as Record<string, string>;
   const opts: SpawnOpts = { ...production, model: production.model ?? (agent === 'claude-code' ? 'claude-sonnet-4-6' : 'gpt-5.4') };
   checks.set(opts, { url, env: checkEnv, placeholder });
   return { opts, checkOverrides: {
@@ -29,8 +29,7 @@ export function createCheckOptions(agent: string, production: SpawnOpts, env: Re
 }
 export function agentChildEnv(agent: ChildProvider, opts: SpawnOpts): Record<string, string> {
   const env = checks.get(opts)?.env ?? buildChildEnv(agent, opts.env);
-  if (opts.isolation) assertIsolationSearchPath(env, opts.isolation);
-  return opts.isolation ? isolationEnvironment(env, opts.isolation) : env;
+  return opts.isolation ? isolationEnvironment({ ...env, PATH: assertIsolationSearchPath(env, opts.isolation) }, opts.isolation) : env;
 }
 export function claudeCheckOptions(opts: SpawnOpts): { persistSession?: false } {
   return checks.has(opts) ? { persistSession: false } : {};

@@ -43,6 +43,7 @@ describe('slice 9 automatic check runtime integration', () => {
   }
   it.each(['claude-code', 'codex'] as const)('rejects unsafe effective PATH in preparation, admission and forced checks for %s', async agent => {
     f.bot.agent = agent; f.config.agents[agent] = { binary };
+    mkdirSync(join(f.workspace, 'bin')); // Missing entries are now dropped; test an existing writable directory.
     const { runtime, runCheck, invalidate } = setup();
     for (const PATH of ['', 'bin:/usr/bin', '.', ':/usr/bin', '/usr/bin:', '/usr/bin::/bin', `${f.workspace}/bin:/usr/bin`]) {
       const options = opts(); options.env!.PATH = PATH;
