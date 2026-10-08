@@ -303,6 +303,52 @@ newMessageBehavior: queue        # queue | interrupt
 
 详见 [完整配置示例](config.example.yaml)。机器人使用飞书工具时，为不同账号配置各自的 `larkCliConfigDir`，不要把多个用户的个人授权混在同一目录。
 
+## 长期记忆
+
+每个 Bot 可显式开启 `memory: true`，必须同时设置 `isolation.enabled: true`。CLI2IM 只保存通过命令提供的条目，不自动收录聊天或启用 agent 自动记忆；每个进程的首条消息和记忆变化后的下一条消息会带上结构化快照。记忆与隔离配置缺省时，保持原有行为。
+
+```yaml
+memory:
+  dir: ~/.cli2im/memory
+  people:
+    alice: ["feishu:ccbot:ou_alice", "telegram:codexbot:123456789"]
+```
+
+`memory.people` 按 `<平台>:<Bot 名>:<用户 ID>` 填写，须引用已配置且平台匹配的 Bot。私聊默认按平台应用与用户分别保存，只有显式映射到同一个人时才跨 Bot／平台共享；同一身份不能映射给两个人。群记忆按群保存，群内话题共用，不使用发言人的私聊记忆。
+
+| 命令 | 行为 |
+|---|---|
+| `/remember <文本>` | 新增条目，最多 2,000 字符；每个身份／群最多 200 条 |
+| `/memory [页]` | 查看当前身份／群的条目 |
+| `/memory edit <id> <文本>` | 修改并保留最多 20 个旧版本；下一条消息注入新快照 |
+| `/memory history <id>` | 查看旧版本 |
+| `/forget <id>` | 删除条目及全部版本，结束该身份／群跨 Bot、跨话题的运行中会话，并取消相关排队任务 |
+
+`/memory edit` 后旧文本仍可能留在当前对话上下文中，需彻底清除可用 `/new`。`/forget` 后下一条消息开启新会话：旧会话记录保留，但不再使用，也不允许该身份续接。群记忆仅创建者（含映射到同一人的身份）或该 Bot 的 `adminUsers` 可修改／删除。备份目录中的历史副本不受程序管理，也不会随 `/forget` 删除。
+
+## 共享 Bot 隔离
+
+隔离目前要求 macOS，仅支持 `claude-code` 与 `codex`，agy 等其他 agent 不支持。设置 `isolation.enabled: true`，用绝对路径填写 `isolation.readable`（只读）和 `isolation.writable`（读写），并为 `allowFrom ∪ adminUsers` 中每人配置 `userOverrides` 工作区。不同执行范围的工作区不得重叠。禁止 `allowPublic: true`、`allowFrom: ['*']` 和 `mcpServers`。注释示例见 [config.example.yaml](config.example.yaml)。
+
+私聊使用个人 override 工作区；同一 Bot 的所有群聊共用 Bot 级 `workingDirectory`：**这些群的对话可互相看到工作区文件**，群记忆则各自独立。工作区和可写授予需避开记忆、CLI2IM 数据／安装目录及插件目录。`larkCliConfigDir` 不会自动获得访问授权，须显式列入 `isolation.writable`，这等于授予该 lark-cli 账户能力。隔离子进程的 `PATH` 会在拒绝空项、相对路径及 `.`／`..` 段后，按原生路径解析重写为真实目录并丢弃不存在或非目录项；结果为空或与可写目录、收件目录相等或互为包含（macOS 上忽略大小写）时判为不支持隔离，重写后的 PATH 统一用于启动、续接、后续轮次、检查与策略指纹。
+
+`plugins` 与可选的 `skills` 白名单仅用于 Claude。插件目录须由本人维护、位于可写区域之外，且只含 skills，不得含 hooks、MCP、agents、commands 或 LSP 定义。桥接层不为隔离 Bot 读取工作区默认 `AGENTS.md`；显式 `agentsFile` 必须是所有 Bot 可写区域之外的绝对路径。子进程环境中存在模型供应商凭据变量时会拒绝启动，应使用 CLI 自身登录存储。
+
+守护进程启动及 agent 可执行文件变化时自动检查，使用本地脚本化模型，不调用付费模型。可在本机运行 `cli2im doctor isolation [--config <path>]`（无需守护进程），或由管理员在 IM 中运行 `/doctor`，重新检查并查看结果。结果默认保存在 `~/.cli2im/isolation/verification.json`。执行范围没有当前有效的 `VERIFIED` 记录时，禁止启动／续接，回复“隔离检查未通过，已暂停执行，请管理员查看 /doctor”。检查失败还会结束该 Bot 正在运行的隔离 agent；控制、诊断和记忆命令仍可使用。
+
+每个隔离 Codex Bot 使用独立的 `CODEX_HOME`：`<dataDir>/codex-home/<Bot 名 sha256 十六进制前 16 位>`。`dataDir` 默认为 `~/.cli2im`，可由 `CLI2IM_DATA_DIR` 指定。部署时需本人为每个 Bot 用个人 Codex 账户登录一次：
+
+```bash
+bot_name='codexbot' # 与配置中的 Bot 名完全一致，哈希输入不带换行
+bot_hash=$(printf %s "$bot_name" | shasum -a 256 | cut -c1-16)
+data_dir="${CLI2IM_DATA_DIR:-$HOME/.cli2im}"
+CODEX_HOME="$data_dir/codex-home/$bot_hash" codex login
+```
+
+已知限制：共享 Claude Bot 无内置文件工具，文件操作只经沙箱内 Bash；Claude 沙箱内置保护 `.git/config`、`.git/hooks`，因此不能 `git init`／`git clone`。不支持 MCP。隔离 Codex Bot 关闭子代理与目标管理，不自动回传共享生成图片目录中的图片。隔离 Bot 的 `/sessions` 仅列出当前隔离域内符合续接条件的会话，不扫描个人桌面历史，也不支持 handoff。
+
+回滚时可停用受影响 Bot 或恢复已验证版本。**关闭 isolation 会恢复无限制执行，只应在去除非本人用户后进行。**
+
 ## 代理、语音与恢复
 
 macOS 可使用 `network.mode: system` 跟随系统 HTTP/HTTPS 代理；Linux/Windows 使用 `environment` 模式读取代理环境变量。`required: true` 下，代理失效时停止联网任务，不自动改成直连；直连例外只允许本机地址。应用设置不会替代系统 TUN、防火墙或 DNS 防漏规则，忽略代理的工具和系统 DNS 仍需单独验证。

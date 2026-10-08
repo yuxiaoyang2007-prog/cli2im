@@ -17,6 +17,15 @@ network:
   required: true
   noProxy: [127.0.0.1, localhost, "::1"]  # required mode permits local exceptions only
 
+# Explicit long-term memory; omitted by default. Enable per bot with memory: true.
+# memory:
+#   dir: ~/.cli2im/memory           # private bridge storage; never grant to agents
+#   people:                        # optional explicit private-memory sharing
+#     alice: ["feishu:ccbot:ou_xxxxxxxxxxxx", "feishu:codexbot:ou_xxxxxxxxxxxx"]
+#     # Format: <platform>:<botName>:<userId>; bot must exist on that platform.
+#     # Telegram example (requires a configured Telegram bot): telegram:mytg:123456789
+#     # Group memory remains per group, including its topics.
+
 # ----------------------------------------------------------
 # Bots — each bot binds one agent to one IM platform.
 # You can define as many bots as you need.
@@ -68,6 +77,36 @@ bots:
     # userOverrides:                # per-user overrides
     #   ou_xxxxxxxxxxxx:
     #     workingDirectory: ~/user-a-projects
+    # --- Shared bot isolation (macOS; claude-code or codex only) ---
+    # Merge these fields into this bot, replacing workingDirectory/projects above
+    # and the userOverrides example. Use separate, non-overlapping paths per bot/user.
+    # workingDirectory: /Users/YourName/bot-work/ccbot/groups
+    # projects: { default: /Users/YourName/bot-work/ccbot/groups }
+    # userOverrides:                # EVERY allowFrom or adminUsers user needs a workspace
+    #   ou_xxxxxxxxxxxx:
+    #     workingDirectory: /Users/YourName/bot-work/ccbot/alice
+    # memory: true                  # optional; requires isolation.enabled: true
+    # isolation:
+    #   enabled: true               # omitted = existing behavior; no isolation
+    #   readable: [/Users/YourName/bot-reference]  # absolute, read-only grants
+    #   writable: []                # absolute read/write grants; keep outside protected data
+    # plugins: [/Users/YourName/bot-plugins/skills-only]  # Claude only, operator-maintained/read-only
+    # skills: [example-skill]        # optional Claude skill allowlist
+    # agentsFile: false             # no bridge default AGENTS.md lookup in isolation;
+    #                               # explicit path must be absolute, outside all bot-writable areas
+    # All groups use the bot-level workspace: these groups can see each other's files.
+    # Keep allowPublic false; '*' and mcpServers are forbidden, including empty mcpServers.
+    # Plugins must contain only skills, without hooks/MCP/agents/commands/LSP definitions.
+    # larkCliConfigDir must also be explicitly listed in isolation.writable;
+    # this grants that lark-cli account's capabilities. It is never auto-granted.
+    # Isolated PATH: absolute entries only, no empty entries or '.'/'..' segments,
+    # and no entries inside agent-writable directories. Use CLI login, not provider keys in env.
+    # Use an agent binary outside personal CLI state directories (see agents below).
+    # Checks run at startup and executable changes; cli2im doctor isolation / IM /doctor
+    # reruns them without paid models. No current VERIFIED record means execution is paused.
+    # Codex: owner logs in once with CODEX_HOME=<dataDir>/codex-home/<sha256(botName)[:16]>.
+    # See README for the hash/login command and tool limits. Disabling isolation restores
+    # unrestricted execution; first remove all users other than yourself.
     # relay:                         # bot-to-bot relay (group chats only)
     #   enabled: false               # opt-in: both sender and receiver must enable
     #   allowFromBots: [codexbot]     # exact permitted source bots; never authorizes control commands
@@ -137,12 +176,15 @@ bots:
 agents:
   claude-code:
     binary: ~/.claude/local/claude       # path to Claude Code binary
+    # Isolation: use a binary outside ~/.claude, e.g. /opt/homebrew/bin/claude,
+    # whose resolved installation directory is also outside protected/writable areas.
     # defaultModel: claude-sonnet-4-6    # optional; omit to use CLI default
     env:
       DISABLE_AUTOUPDATER: "1"           # recommended for daemon use
 
   codex:
     binary: ~/.codex/bin/codex
+    # Isolation: likewise use an installation outside ~/.codex, e.g. /opt/homebrew/bin/codex.
 
   # gemini:
   #   binary: /opt/homebrew/bin/gemini   # or: /usr/local/bin/gemini

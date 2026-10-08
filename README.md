@@ -300,6 +300,52 @@ Ordinary users can resume history already bound to the current chat/topic. `sess
 
 See [config.example.yaml](config.example.yaml). Stopping one bot interrupts its work without restarting other bots; use the local CLI to start a stopped bot because it cannot receive IM commands.
 
+## Long-term memory
+
+Memory is opt-in per bot: `memory: true` requires `isolation.enabled: true`. CLI2IM saves only explicitly supplied entries, not chat history or agent-generated memories. It passes a structured snapshot to the agent on the first message of each process and after changes. Omitting memory and isolation settings preserves existing behavior.
+
+```yaml
+memory:
+  dir: ~/.cli2im/memory
+  people:
+    alice: ["feishu:ccbot:ou_alice", "telegram:codexbot:123456789"]
+```
+
+`memory.people` entries use `<platform>:<botName>:<userId>` and must reference configured bots on those platforms. Private-chat memory is separate by platform application and user unless explicitly mapped to the same person; an identity cannot map to two people. Group memory belongs to the group, including its topics, rather than the speaker's private memory.
+
+| Command | Behavior |
+|---|---|
+| `/remember <text>` | Save an entry, up to 2,000 characters; up to 200 entries per identity/group |
+| `/memory [page]` | List entries for the current identity/group |
+| `/memory edit <id> <text>` | Replace text and retain up to 20 prior versions; the next message receives an updated snapshot |
+| `/memory history <id>` | Show prior versions |
+| `/forget <id>` | Delete the entry and all its versions, end running sessions for this identity/group across bots/topics, and cancel their queued tasks |
+
+After `/memory edit`, old text may remain in the current conversation context; use `/new` to clear that context. After `/forget`, the next message starts a new session: old session records remain stored but are no longer used or resumable for that identity. Group entries may be edited/deleted only by their creator (including identities mapped to the same person) or that bot's `adminUsers`. Historical copies in backup directories are not managed or erased by CLI2IM.
+
+## Shared bot isolation
+
+Isolation currently requires macOS and supports only `claude-code` and `codex`; agy and other agents are unsupported. Enable `isolation.enabled`, use absolute paths in `isolation.readable` (read-only) and `isolation.writable` (read/write), and give every user in `allowFrom ∪ adminUsers` a `userOverrides` workspace. Workspaces for different scopes must not overlap. `allowPublic: true`, `allowFrom: ['*']`, and `mcpServers` are forbidden. See the commented setup in [config.example.yaml](config.example.yaml).
+
+Private chats use the user's override workspace. All groups of the same bot use its bot-level `workingDirectory`: **these groups' conversations can see each other's workspace files**, even though their memories are separate. Keep workspaces and writable grants separate from memory, CLI2IM data/install directories, and plugins. `larkCliConfigDir` is not automatically granted: it must be explicitly listed in `isolation.writable`, which grants the capabilities of that lark-cli account. The isolated subprocess `PATH` is rewritten to native real directories after rejecting empty, relative, or `.`/`..` entries and dropping missing or non-directory entries; an empty result or any overlap with writable or inbox directories (compared case-insensitively on macOS) makes isolation unsupported, and the rewritten PATH is used for starts, resumes, later turns, checks, and the policy fingerprint.
+
+`plugins` and the optional `skills` allowlist are Claude-only. Plugin directories must be outside writable areas, maintained by the operator, and contain only skills (no hooks, MCP, agents, commands, or LSP definitions). The bridge does not load a default workspace `AGENTS.md` for isolated bots; an explicit `agentsFile` must be an absolute path outside all bots' writable areas. Provider credentials in the subprocess environment cause isolation startup to be refused; use CLI login storage.
+
+Checks run automatically at daemon startup and when the agent executable changes, using a local scripted model without calling paid models. Run `cli2im doctor isolation [--config <path>]` locally without a daemon, or administrator `/doctor` in IM to rerun checks and inspect results. Records are stored at `~/.cli2im/isolation/verification.json` by default. A scope without a current `VERIFIED` record cannot start or resume an agent and replies “隔离检查未通过，已暂停执行，请管理员查看 /doctor”. Failed checks also stop running isolated agents for that bot; control, diagnostic, and memory commands remain available.
+
+Each isolated Codex bot uses its own `CODEX_HOME`: `<dataDir>/codex-home/<first 16 hex characters of sha256(bot name)>`. `dataDir` defaults to `~/.cli2im` and can be set with `CLI2IM_DATA_DIR`. During deployment, the owner must log in once per bot with their personal Codex account:
+
+```bash
+bot_name='codexbot' # Exact configured bot name; hash without a trailing newline
+bot_hash=$(printf %s "$bot_name" | shasum -a 256 | cut -c1-16)
+data_dir="${CLI2IM_DATA_DIR:-$HOME/.cli2im}"
+CODEX_HOME="$data_dir/codex-home/$bot_hash" codex login
+```
+
+Known limits: shared Claude bots have no built-in file tools; file operations go through sandboxed Bash. `git init` and `git clone` are unavailable because Claude's sandbox protects `.git/config` and `.git/hooks`. MCP is unsupported. Isolated Codex bots disable subagents and goal management and do not automatically return images from the shared generated-images directory. Isolated `/sessions` lists only eligible sessions in the current isolation domain; desktop history scanning and handoff are disabled.
+
+For rollback, stop the affected bot or restore a verified version. **Disabling isolation restores unrestricted execution; do so only after removing all users other than yourself.**
+
 ## Proxy, speech, and recovery
 
 On macOS, `network.mode: system` follows the system HTTP/HTTPS proxy. Linux/Windows use `environment` mode and proxy environment variables. With `required: true`, unavailable proxies pause network work without selecting direct fallback; only localhost exceptions are allowed. Application proxy settings do not enforce OS isolation or prove DNS privacy. System DNS and tools that ignore proxies still need separate verification.
