@@ -43,9 +43,11 @@ export async function ensureExecutionSession(params: {
   const { bot, message, key, store, reset } = params;
   const scope = resolveExecutionScope(bot, message);
   const session = await store.getOrCreate(key, { agentName: bot.agent, workingDirectory: scope.workingDirectory });
-  if (scope.group && canonicalPath(session.workingDirectory) !== scope.workingDirectory
+  if ((scope.group && canonicalPath(session.workingDirectory) !== scope.workingDirectory
     && Object.values(bot.userOverrides ?? {}).some(override => override.workingDirectory
-      && pathContains(override.workingDirectory, session.workingDirectory))) {
+      && pathContains(override.workingDirectory, session.workingDirectory)))
+    // Sessions created before isolation was enabled may point outside the current execution scope.
+    || (bot.isolation?.enabled && !pathContains(scope.workingDirectory, session.workingDirectory))) {
     reset(key);
     await store.updateWorkingDirectory(session.id, scope.workingDirectory);
     await store.clearAgentSessionId(session.id);

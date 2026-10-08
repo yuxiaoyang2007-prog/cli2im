@@ -113,6 +113,28 @@ describe('slice 2 execution scope and identity', () => {
     await expect(config({ isolation: { enabled: true }, userOverrides: { alice: { workingDirectory: join(directory, 'alias', 'new') }, bob: { workingDirectory: join(directory, 'alice', 'new', 'nested') } } })).rejects.toThrow('overlap');
   });
 
+  it('moves a pre-isolation private session into the sender execution scope', async () => {
+    const store = await SessionStore.create(':memory:');
+    const key = 'feishu:dm:bot';
+    const legacy = join(directory, 'legacy'); await mkdir(legacy);
+    const old = await store.getOrCreate(key, { agentName: 'codex', workingDirectory: legacy });
+    await store.updateAgentSessionId(old.id, 'old-agent');
+    const reset = vi.fn();
+    bot.isolation = { enabled: true };
+    const session = await ensureExecutionSession({ bot, message: message('p2p', 'alice'), key, store, reset });
+    expect(reset).toHaveBeenCalledWith(key);
+    expect(session.workingDirectory).toBe(join(directory, 'alice'));
+    expect(session.agentSessionId).toBeUndefined();
+    expect((await store.getByKey(key))?.workingDirectory).toBe(join(directory, 'alice'));
+    delete bot.isolation;
+    const plainKey = 'feishu:dm2:bot';
+    await store.getOrCreate(plainKey, { agentName: 'codex', workingDirectory: legacy });
+    const plainReset = vi.fn();
+    expect((await ensureExecutionSession({ bot, message: message('p2p', 'alice'), key: plainKey, store, reset: plainReset })).workingDirectory).toBe(legacy);
+    expect(plainReset).not.toHaveBeenCalled();
+    store.close();
+  });
+
   it('integration: migrates a personal group session, downloads into shared inbox, and excludes personal cwd roots', async () => {
     const store = await SessionStore.create(':memory:');
     const key = 'feishu:chat:bot:topic';

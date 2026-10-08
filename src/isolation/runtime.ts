@@ -51,6 +51,7 @@ export class IsolationRuntime {
   }
   async prepare(key: SessionKey, principal: string, scopeKey: string, opts: SpawnOpts, identityMapping: unknown, requireVerified = true, inspectOnly = false): Promise<IsolationPolicy> {
     let prepared = false;
+    let requestScoped = false;
     try {
       const botName = key.split(':')[2];
       const bot = this.deps.config.bots[botName];
@@ -65,7 +66,8 @@ export class IsolationRuntime {
         // Production launch values only: no prompt, session ID, ephemeral probe flags or credential values.
         production: productionParameters(opts, env) };
       const policy = buildIsolationPolicy(input);
-      if (!contains(policy.workspace, canonicalPolicyWorkspace(opts.workingDirectory))) throw new IsolationAdmissionError();
+      // A single request outside its scope is refused without revoking the bot's other scopes.
+      if (!contains(policy.workspace, canonicalPolicyWorkspace(opts.workingDirectory))) { requestScoped = true; throw new IsolationAdmissionError(); }
       const expected = { bot: botName, principal, scope: canonicalPolicyWorkspace(opts.workingDirectory), policyFingerprint: policy.fingerprint,
         memoryGeneration: await this.deps.memory.generation(principal) };
       if (inspectOnly) return policy;
@@ -79,7 +81,7 @@ export class IsolationRuntime {
       return this.bindings.get(key)!.policy;
     } catch (error) {
       if (!inspectOnly) this.deps.invalidate(key);
-      if (!inspectOnly && !prepared) throw this.revokePreparation(key.split(':')[2], error);
+      if (!inspectOnly && !prepared && !requestScoped) throw this.revokePreparation(key.split(':')[2], error);
       throw error instanceof IsolationAdmissionError ? error : new IsolationAdmissionError(undefined,
         error instanceof Error && error.message.startsWith('UNSUPPORTED') ? 'UNSUPPORTED' : 'ERROR');
     }

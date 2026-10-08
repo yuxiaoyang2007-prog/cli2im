@@ -120,6 +120,18 @@ describe('slice 9 automatic check runtime integration', () => {
     await runtime.check(key);
     expect(runCheck).toHaveBeenCalledTimes(2);
   });
+  it('a request outside its execution scope is refused without revoking the bot', async () => {
+    const { runtime, invalidate } = setup();
+    const bob = f.bot.userOverrides!.bob.workingDirectory!;
+    await runtime.prepare(otherKey, 'person:bob', bob, opts(bob), {});
+    await runtime.check(otherKey);
+    invalidate.mockClear();
+    await expect(runtime.prepare(key, 'person:alice', f.workspace, opts(bob), {})).rejects.toThrow();
+    expect(invalidate).not.toHaveBeenCalledWith(otherKey);
+    expect(verification.preparationFailure('bot')).toBeUndefined();
+    expect(verification.get('bot', bob)?.status).toBe('VERIFIED');
+    await expect(runtime.assert(otherKey)).resolves.toBeUndefined();
+  });
   it.each(['project-config', 'unavailable-binary'])('doctor preparation failure revokes every live session and persisted VERIFIED scope: %s', async failure => {
     const { runtime, invalidate } = setup();
     await runtime.prepare(key, 'person:alice', f.workspace, opts(), {});
