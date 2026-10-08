@@ -1589,9 +1589,11 @@ export async function resolveBotSpawnOpts(params: ResolveBotSpawnOptsInput): Pro
   const addDirs = params.addDirs?.length
     ? params.addDirs.map((dir) => expandHome(dir))
     : undefined;
-  if (params.botConfig.isolation?.enabled) assertAgentsFile(params.botConfig, params.allWritable ?? [workingDirectory, ...(params.botConfig.isolation.writable ?? [])]);
+  const validatedAgentsFile = params.botConfig.isolation?.enabled
+    ? assertAgentsFile(params.botConfig, params.allWritable ?? [workingDirectory, ...(params.botConfig.isolation.writable ?? [])])
+    : undefined;
   const appendSystemPrompt = await readAgentsInstructions(
-    params.botConfig.isolation?.enabled ? params.botConfig.agentsFile ?? false : params.botConfig.agentsFile,
+    params.botConfig.isolation?.enabled ? validatedAgentsFile ?? false : params.botConfig.agentsFile,
     workingDirectory,
   );
 

@@ -4,6 +4,7 @@ import { relative, isAbsolute } from 'node:path';
 import { collectBotIdentities, resolvePeople, type BotIdentityMetadata } from '../memory/principal.js';
 import { pathContains } from '../runtime/execution-scope.js';
 import { validateIsolationConfig } from '../isolation/policy.js';
+import { assertSupportedIsolationAgent } from '../isolation/supported.js';
 import { parse as parseYaml } from 'yaml';
 import type { AppConfig, BotConfig, MemoryConfig } from '../types.js';
 
@@ -268,6 +269,8 @@ function validateBotConfig(name: string, bot: BotConfig): void {
     throw new Error(`Config error: bot "${name}" memory requires isolation.enabled`);
   }
   if (bot.isolation?.enabled) {
+    assertSupportedIsolationAgent(bot.agent);
+    if ('mcpServers' in bot) throw new Error('Config error: isolation forbids mcpServers');
     if (bot.allowPublic || bot.allowFrom.includes('*')) throw new Error('Config error: isolation forbids public access');
     for (const user of new Set([...bot.allowFrom, ...(bot.adminUsers ?? [])])) {
       if (typeof bot.userOverrides?.[user]?.workingDirectory !== 'string' || !bot.userOverrides[user].workingDirectory!.trim()) {

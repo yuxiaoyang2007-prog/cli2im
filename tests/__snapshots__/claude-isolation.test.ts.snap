@@ -1,0 +1,220 @@
+// Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
+
+exports[`slice 6 Claude isolation > integration: SDK options snapshot, isolation=false, resume and autoApprove guard 1`] = `
+{
+  "abortController": "<AbortController>",
+  "allowDangerouslySkipPermissions": true,
+  "canUseTool": "<function>",
+  "cwd": "<fixture>/alice",
+  "effort": "high",
+  "env": {
+    "HOME": "<fixture>",
+    "PATH": "/usr/bin:/bin",
+  },
+  "includePartialMessages": true,
+  "model": "model",
+  "pathToClaudeCodeExecutable": "/fixture/claude",
+  "permissionMode": "bypassPermissions",
+  "resume": "session",
+  "stderr": "<function>",
+  "systemPrompt": undefined,
+}
+`;
+
+exports[`slice 6 Claude isolation > integration: SDK options snapshot, isolation=true, resume and autoApprove guard 1`] = `
+{
+  "abortController": "<AbortController>",
+  "allowDangerouslySkipPermissions": false,
+  "canUseTool": "<function>",
+  "cwd": "<fixture>/alice",
+  "effort": "high",
+  "env": {
+    "CLAUDE_CODE_TMPDIR": "/private/tmp/c2i-<scope>",
+    "HOME": "<fixture>",
+    "PATH": "/usr/bin:/bin",
+  },
+  "extraArgs": {
+    "restricted": null,
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "hooks": [
+          "<function>",
+        ],
+        "timeout": 2,
+      },
+    ],
+  },
+  "includePartialMessages": true,
+  "mcpServers": {},
+  "model": "model",
+  "pathToClaudeCodeExecutable": "/fixture/claude",
+  "permissionMode": "default",
+  "plugins": [],
+  "resume": "session",
+  "settingSources": [],
+  "settings": {
+    "autoDreamEnabled": false,
+    "autoMemoryEnabled": false,
+    "sandbox": {
+      "allowUnsandboxedCommands": false,
+      "autoAllowBashIfSandboxed": true,
+      "credentials": {
+        "envVars": [
+          {
+            "mode": "deny",
+            "name": "ANTHROPIC_API_KEY",
+          },
+          {
+            "mode": "deny",
+            "name": "ANTHROPIC_AUTH_TOKEN",
+          },
+          {
+            "mode": "deny",
+            "name": "CLAUDE_CODE_OAUTH_TOKEN",
+          },
+          {
+            "mode": "deny",
+            "name": "OPENAI_API_KEY",
+          },
+          {
+            "mode": "deny",
+            "name": "CODEX_API_KEY",
+          },
+          {
+            "mode": "deny",
+            "name": "CTI_CODEX_API_KEY",
+          },
+          {
+            "mode": "deny",
+            "name": "GEMINI_API_KEY",
+          },
+          {
+            "mode": "deny",
+            "name": "GOOGLE_API_KEY",
+          },
+          {
+            "mode": "deny",
+            "name": "GOOGLE_APPLICATION_CREDENTIALS",
+          },
+          {
+            "mode": "deny",
+            "name": "ZAI_API_KEY",
+          },
+          {
+            "mode": "deny",
+            "name": "ZHIPU_API_KEY",
+          },
+          {
+            "mode": "deny",
+            "name": "ZHIPUAI_API_KEY",
+          },
+          {
+            "mode": "deny",
+            "name": "KIMI_API_KEY",
+          },
+          {
+            "mode": "deny",
+            "name": "KIMI_CODE_API_KEY",
+          },
+          {
+            "mode": "deny",
+            "name": "AWS_ACCESS_KEY_ID",
+          },
+          {
+            "mode": "deny",
+            "name": "AWS_SECRET_ACCESS_KEY",
+          },
+          {
+            "mode": "deny",
+            "name": "AWS_SESSION_TOKEN",
+          },
+          {
+            "mode": "deny",
+            "name": "AWS_BEARER_TOKEN_BEDROCK",
+          },
+          {
+            "mode": "deny",
+            "name": "AZURE_OPENAI_API_KEY",
+          },
+          {
+            "mode": "deny",
+            "name": "AZURE_API_KEY",
+          },
+          {
+            "mode": "deny",
+            "name": "GOOGLE_AUTH_TOKEN",
+          },
+          {
+            "mode": "deny",
+            "name": "GOOGLE_ACCESS_TOKEN",
+          },
+        ],
+      },
+      "enabled": true,
+      "excludedCommands": [],
+      "failIfUnavailable": true,
+      "filesystem": {
+        "allowRead": [
+          "/Library/Apple",
+          "/Library/Developer/CommandLineTools",
+          "/System",
+          "<fixture>/alice",
+          "<fixture>/bridge/inbox/<scope>",
+          "<fixture>/reference",
+          "/bin",
+          "/dev/dtracehelper",
+          "/dev/fd",
+          "/dev/null",
+          "/dev/random",
+          "/dev/urandom",
+          "/dev/zero",
+          "/opt/homebrew/Cellar",
+          "/opt/homebrew/Frameworks",
+          "/opt/homebrew/bin",
+          "/opt/homebrew/etc",
+          "/opt/homebrew/include",
+          "/opt/homebrew/lib",
+          "/opt/homebrew/libexec",
+          "/opt/homebrew/opt",
+          "/opt/homebrew/sbin",
+          "/opt/homebrew/share",
+          "/private/etc",
+          "/private/tmp/c2i-<scope>",
+          "/private/var/db/dyld",
+          "/sbin",
+          "/usr",
+        ],
+        "allowWrite": [
+          "<fixture>/alice",
+          "/private/tmp/c2i-<scope>",
+        ],
+        "denyRead": [
+          "/",
+        ],
+        "denyWrite": [
+          "<fixture>/.claude/debug",
+          "<fixture>/.npm/_logs",
+          "/private/tmp/claude",
+          "/tmp/claude",
+        ],
+      },
+      "network": {
+        "allowedDomains": [
+          "*",
+        ],
+      },
+    },
+  },
+  "stderr": "<function>",
+  "strictMcpConfig": true,
+  "systemPrompt": undefined,
+  "tools": [
+    "Bash",
+    "WebFetch",
+    "WebSearch",
+    "TodoWrite",
+  ],
+}
+`;

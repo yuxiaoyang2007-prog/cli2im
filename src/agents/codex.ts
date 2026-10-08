@@ -1,4 +1,7 @@
+import { createCodexExecThread, codexExecArgs } from './codex-exec.js';
 import { buildChildEnv } from '../security/child-env.js';
+import { canonicalPath } from '../runtime/execution-scope.js';
+import { contains } from '../isolation/policy.js';
 import { randomUUID } from 'node:crypto';
 import { mkdir, readdir, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -32,14 +35,14 @@ type CodexSdk = {
   };
 };
 
-type CodexThread = {
+export type CodexThread = {
   id?: string | null;
   runStreamed(input: CodexInput, options?: { signal?: AbortSignal }): Promise<{ events: AsyncIterable<CodexThreadEvent> }>;
 };
 
-type CodexInput = string | Array<{ type: 'text'; text: string } | { type: 'local_image'; path: string }>;
+export type CodexInput = string | Array<{ type: 'text'; text: string } | { type: 'local_image'; path: string }>;
 
-type CodexThreadEvent = {
+export type CodexThreadEvent = {
   type: string;
   thread_id?: string;
   usage?: CodexUsage;
@@ -294,6 +297,7 @@ export class CodexPlugin implements AgentPlugin {
   }
 
   buildSpawnArgs(opts: SpawnOpts): string[] {
+    if (opts.isolation) return codexExecArgs(opts);
     const args: string[] = [];
     if (opts.model) args.push('--model', opts.model);
     if (opts.sandboxMode) args.push('--sandbox', opts.sandboxMode);
@@ -386,12 +390,12 @@ export class CodexPlugin implements AgentPlugin {
     getSessionId: () => string;
     setSessionId: (id: string) => void;
   }): Promise<void> {
-    const sdk = await loadCodexSdk();
-    const Codex = sdk.Codex;
-    const codex = new Codex(createCodexClientOptions(args.opts, this.binary));
-    let thread = args.resumeSessionId
-      ? codex.resumeThread(args.resumeSessionId, createThreadOptions(args.opts))
-      : codex.startThread(createThreadOptions(args.opts));
+    const codex = args.opts.isolation ? undefined : new (await loadCodexSdk()).Codex(createCodexClientOptions(args.opts, this.binary));
+    let thread = args.opts.isolation
+      ? createCodexExecThread(this.binary, args.opts, args.resumeSessionId)
+      : args.resumeSessionId
+        ? codex!.resumeThread(args.resumeSessionId, createThreadOptions(args.opts))
+        : codex!.startThread(createThreadOptions(args.opts));
     let retriedFreshThread = false;
 
     while (!args.signal.aborted) {
@@ -410,9 +414,9 @@ export class CodexPlugin implements AgentPlugin {
         });
         queued.resolve();
       } catch (err) {
-        if (args.resumeSessionId && !retriedFreshThread && shouldRetryFreshThread(err)) {
+        if (!args.opts.isolation && args.resumeSessionId && !retriedFreshThread && shouldRetryFreshThread(err)) {
           retriedFreshThread = true;
-          thread = codex.startThread(createThreadOptions(args.opts));
+          thread = codex!.startThread(createThreadOptions(args.opts));
           try {
             await this.runSingleTurn({
               thread,
@@ -446,7 +450,7 @@ export class CodexPlugin implements AgentPlugin {
     setSessionId: (id: string) => void;
   }): Promise<void> {
     const tempFiles: string[] = [];
-    const beforeImages = await snapshotGeneratedImages();
+    const beforeImages = args.opts.isolation ? new Set<string>() : await snapshotGeneratedImages();
     const turnController = new AbortController();
     const abortTurn = () => turnController.abort();
     if (args.signal.aborted) {
@@ -458,7 +462,15 @@ export class CodexPlugin implements AgentPlugin {
     const assistantTextBuffer: string[] = [];
 
     try {
-      const input = await messageToCodexInput(args.queued.message, tempFiles);
+      if (args.opts.isolation) {
+        for (const attachment of args.queued.message.attachments ?? []) {
+          if (attachment.type === 'image' && attachment.localPath && !contains(args.opts.isolation.inbox, canonicalPath(attachment.localPath))) {
+            throw new Error('Isolated Codex image is outside the bridge inbox');
+          }
+        }
+        await mkdir(args.opts.isolation.inbox, { recursive: true, mode: 0o700 });
+      }
+      const input = await messageToCodexInput(args.queued.message, tempFiles, args.opts.isolation?.inbox);
       const { events } = await args.thread.runStreamed(input, { signal: turnController.signal });
 
       for await (const event of events) {
@@ -472,7 +484,7 @@ export class CodexPlugin implements AgentPlugin {
         }
 
         if (event.type === 'turn.completed') {
-          const generatedImages = await collectNewGeneratedImages(beforeImages);
+          const generatedImages = args.opts.isolation ? [] : await collectNewGeneratedImages(beforeImages);
           const markedFiles = await resolveMarkedFiles(
             assistantTextBuffer.join('\n'),
             args.opts.workingDirectory,
@@ -533,7 +545,7 @@ function createThreadOptions(opts: SpawnOpts): Record<string, unknown> {
   };
 }
 
-async function messageToCodexInput(msg: UserMessage, tempFiles: string[]): Promise<CodexInput> {
+async function messageToCodexInput(msg: UserMessage, tempFiles: string[], imageDir?: string): Promise<CodexInput> {
   const parts: Array<{ type: 'text'; text: string } | { type: 'local_image'; path: string }> = [];
   if (typeof msg.content === 'string') {
     if (msg.content) parts.push({ type: 'text', text: msg.content });
@@ -542,7 +554,7 @@ async function messageToCodexInput(msg: UserMessage, tempFiles: string[]): Promi
       if (part.type === 'text') {
         if (part.text) parts.push({ type: 'text', text: part.text });
       } else if (part.type === 'image') {
-        const path = await base64ImageToTempFile(part.source.data, part.source.media_type, tempFiles);
+        const path = await base64ImageToTempFile(part.source.data, part.source.media_type, tempFiles, imageDir);
         parts.push({ type: 'local_image', path });
       }
     }
@@ -550,7 +562,7 @@ async function messageToCodexInput(msg: UserMessage, tempFiles: string[]): Promi
 
   for (const attachment of msg.attachments ?? []) {
     if (attachment.type === 'image') {
-      const path = await attachmentToLocalImage(attachment, tempFiles);
+      const path = await attachmentToLocalImage(attachment, tempFiles, imageDir);
       if (path) parts.push({ type: 'local_image', path });
     } else {
       parts.push({ type: 'text', text: formatNonImageAttachment(attachment) });
@@ -564,12 +576,13 @@ async function messageToCodexInput(msg: UserMessage, tempFiles: string[]): Promi
 async function attachmentToLocalImage(
   attachment: NonNullable<UserMessage['attachments']>[number],
   tempFiles: string[],
+  imageDir?: string,
 ): Promise<string | null> {
   if (attachment.localPath) return attachment.localPath;
   const base64Part = extractBase64Image(attachment);
   if (!base64Part) return null;
 
-  return base64ImageToTempFile(base64Part, attachment.mimeType, tempFiles);
+  return base64ImageToTempFile(base64Part, attachment.mimeType, tempFiles, imageDir);
 }
 
 function extractBase64Image(attachment: NonNullable<UserMessage['attachments']>[number]): string | null {
@@ -587,9 +600,9 @@ export function formatNonImageAttachment(attachment: NonNullable<UserMessage['at
   ].filter(Boolean).join('\n');
 }
 
-async function base64ImageToTempFile(base64Data: string, mimeType: string | undefined, tempFiles: string[]): Promise<string> {
+async function base64ImageToTempFile(base64Data: string, mimeType: string | undefined, tempFiles: string[], imageDir?: string): Promise<string> {
   const ext = extensionForMime(mimeType);
-  const path = join(tmpdir(), `cli2im-codex-${randomUUID()}${ext}`);
+  const path = join(imageDir ?? tmpdir(), `cli2im-codex-${randomUUID()}${ext}`);
   await writeFile(path, Buffer.from(base64Data, 'base64'), { mode: 0o600, flag: 'wx' });
   tempFiles.push(path);
   return path;

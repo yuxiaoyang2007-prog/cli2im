@@ -1,11 +1,14 @@
 import { createHash } from 'node:crypto';
-import { lstatSync, readdirSync, readFileSync, statSync } from 'node:fs';
+import { lstatSync, readdirSync, readFileSync, readlinkSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { canonicalPath } from '../runtime/execution-scope.js';
 import { getCli2imDataDir } from '../util/data-dir.js';
 import type { AppConfig, BotConfig, SpawnOpts } from '../types.js';
+import { compileClaudeSettings, validateClaudePlugins } from './claude.js';
+import { codexConfigSources, codexPermissionArgs } from './codex.js';
+import { assertSupportedIsolationAgent } from './supported.js';
 
 export interface IsolationPolicy {
   scopeKey: string;
@@ -24,6 +27,7 @@ export interface IsolationPolicy {
 }
 export interface PolicyPaths {
   home: string; dataDir: string; memoryDir: string; installDir: string; claudeTmpRoot: string;
+  codexSystemConfigs?: string[];
 }
 export function policyPaths(config: Pick<AppConfig, 'memory'>, overrides: Partial<PolicyPaths> = {}): PolicyPaths {
   const home = overrides.home ?? homedir();
@@ -77,6 +81,7 @@ function unsafeWorkspace(path: string, paths: PolicyPaths): boolean {
 /** Decision O is checked against all configured bots, including non-isolated writers. */
 export function validateIsolationConfig(config: Pick<AppConfig, 'bots' | 'memory'>, paths = policyPaths(config)): void {
   if (!Object.values(config.bots).some(b => b.isolation?.enabled)) return;
+  for (const bot of Object.values(config.bots)) if (bot.isolation?.enabled) assertSupportedIsolationAgent(bot.agent);
   const all = scopes(config, paths);
   const protectedReadRoots = normalized([paths.memoryDir, paths.installDir, paths.dataDir, join(paths.home, '.cli2im')]);
   const protectedRoots = normalized([...protectedReadRoots, ...Object.values(config.bots).flatMap(b => b.plugins ?? [])]);
@@ -109,11 +114,29 @@ export function validateIsolationConfig(config: Pick<AppConfig, 'bots' | 'memory
     assertAgentsFile(bot, all.flatMap(s => s.writable));
   }
 }
-export function assertAgentsFile(bot: BotConfig, writable: string[]): void {
+export function assertAgentsFile(bot: BotConfig, writable: string[]): string | undefined {
   if (!bot.isolation?.enabled || bot.agentsFile === undefined || bot.agentsFile === false || bot.agentsFile === '') return;
-  if (!isAbsolute(bot.agentsFile) || writable.some(root => contains(canonicalPath(root), canonicalPath(bot.agentsFile as string)))) {
+  if (!isAbsolute(bot.agentsFile)) {
     throw new Error('Isolation agentsFile must be an absolute path outside every writable scope');
   }
+  const roots = [...writable.map(p => resolve(p)), ...writable.map(canonicalPath)];
+  let links = 0;
+  const follow = (path: string): string => {
+    let current = '/';
+    for (const part of path.split('/').filter(Boolean)) {
+      current = join(current, part);
+      if (roots.some(root => contains(root, current))) throw new Error('Isolation agentsFile resolution crosses a writable scope');
+      try {
+        if (lstatSync(current).isSymbolicLink()) {
+          if (++links > 40) throw new Error('Isolation agentsFile symlink loop');
+          const target = readlinkSync(current);
+          current = follow(isAbsolute(target) ? target : `${dirname(current)}/${target}`);
+        }
+      } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
+    }
+    return current;
+  };
+  return follow(bot.agentsFile);
 }
 // Runtime-only OS/toolchain directories from PLAN 5.2; no HOME, Homebrew var or shared tmp grant.
 // Root and /dev are directory literals in SBPL, never recursive filesystem grants.
@@ -171,9 +194,17 @@ export function buildIsolationPolicy(params: {
     readExceptions: normalized([...own.writable, inbox, ...(bot.isolation?.readable ?? [])]),
     tools: bot.agent === 'claude-code' ? ['Bash', 'WebFetch', 'WebSearch', 'TodoWrite', ...(plugins.length ? ['Skill'] : [])] : [],
     plugins, skills: [...(bot.skills ?? [])].sort() };
+  let launchPolicy: unknown;
+  if (bot.agent === 'claude-code') {
+    validateClaudePlugins(plugins);
+    launchPolicy = { settings: compileClaudeSettings({ ...policy, fingerprint: '' }, paths.home),
+      extraArgs: { restricted: null }, settingSources: [], strictMcpConfig: true, mcpServers: {}, tools: policy.tools };
+  } else if (bot.agent === 'codex') {
+    launchPolicy = { args: codexPermissionArgs({ ...policy, fingerprint: '' }), sources: codexConfigSources(workspace, paths.home, paths.codexSystemConfigs) };
+  }
   const binaryStat = statSync(params.binaryPath);
   const production = params.production;
-  return { ...policy, fingerprint: fingerprint({ agent: bot.agent, policy,
+  return { ...policy, fingerprint: fingerprint({ agent: bot.agent, policy, launchPolicy,
     binary: { realpath: canonicalPath(params.binaryPath), size: binaryStat.size, mtime: binaryStat.mtimeMs },
     // Bump when the SBPL operations or exception semantics change.
     profileVersion: 2, runtimeReadExceptions: normalized(RUNTIME_READ_EXCEPTIONS),

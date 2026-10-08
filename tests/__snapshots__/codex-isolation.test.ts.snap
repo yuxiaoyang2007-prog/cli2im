@@ -1,0 +1,69 @@
+// Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
+
+exports[`slice 7 Codex isolation > builds a unique single inline permissions table, quotes every key, and disables ambient capabilities 1`] = `
+[
+  "exec",
+  "--json",
+  "--ignore-user-config",
+  "--ignore-rules",
+  "-c",
+  "default_permissions="cli2im-<scope>"",
+  "-c",
+  "permissions={"cli2im-<scope>"={"extends"=":workspace","filesystem"={":root"="deny",":minimal"="read",":tmpdir"="write",":slash_tmp"="deny","/private/var/folders"="deny","/Library/Apple"="read","/Library/Developer/CommandLineTools"="read","/System"="read","/bin"="read","/dev/dtracehelper"="read","/dev/fd"="read","/dev/null"="read","/dev/random"="read","/dev/urandom"="read","/dev/zero"="read","/opt/homebrew/Cellar"="read","/opt/homebrew/Frameworks"="read","/opt/homebrew/bin"="read","/opt/homebrew/etc"="read","/opt/homebrew/include"="read","/opt/homebrew/lib"="read","/opt/homebrew/libexec"="read","/opt/homebrew/opt"="read","/opt/homebrew/sbin"="read","/opt/homebrew/share"="read","/private/etc"="read","/private/var/db/dyld"="read","/sbin"="read","/usr"="read","<fixture>/alice"="write","<fixture>/alice/.cli2im-tmp"="write","<fixture>/bridge/inbox/<scope>"="read","<fixture>/reference"="read","<fixture>/dot.name"="read","<fixture>/has space"="read","<fixture>/a\\"quote"="read","<fixture>/雪"="read","<fixture>/back\\\\slash"="read","/Library/Keychains"="deny","/Users/Shared"="deny","<fixture>/.aws"="deny","<fixture>/.bash_login"="deny","<fixture>/.bash_profile"="deny","<fixture>/.bashrc"="deny","<fixture>/.claude"="deny","<fixture>/.claude.json"="deny","<fixture>/.cli2im"="deny","<fixture>/.codex"="deny","<fixture>/.config"="deny","<fixture>/.gemini"="deny","<fixture>/.gnupg"="deny","<fixture>/.profile"="deny","<fixture>/.ssh"="deny","<fixture>/.zlogin"="deny","<fixture>/.zprofile"="deny","<fixture>/.zshenv"="deny","<fixture>/.zshrc"="deny","<fixture>/Library"="deny","<fixture>/bob"="deny","<fixture>/bob/.cli2im-tmp"="deny","<fixture>/bridge"="deny","<fixture>/bridge/memory"="deny","<fixture>/group"="deny","<fixture>/group/.cli2im-tmp"="deny","<fixture>/install"="deny","/Volumes"="deny","/opt/homebrew/var"="deny","/private/tmp"="deny","/private/var/db"="deny"},"network"={"enabled"=true}}}",
+  "--disable",
+  "memories",
+  "--disable",
+  "hooks",
+  "--disable",
+  "plugins",
+  "--disable",
+  "apps",
+  "-c",
+  "mcp_servers={}",
+  "-c",
+  "notify=[]",
+  "-c",
+  "project_root_markers=[]",
+  "--skip-git-repo-check",
+  "-C",
+  "<fixture>/alice",
+  "-c",
+  "approval_policy="never"",
+  "--model",
+  "fixture-model",
+  "-c",
+  "model_reasoning_effort="high"",
+  "--",
+  "-",
+]
+`;
+
+exports[`slice 7 Codex isolation > integration: exec JSONL and SDK produce identical mapped events, baseline options snapshot is unchanged 1`] = `
+{
+  "args": [
+    "--model",
+    "fixture-model",
+    "--sandbox",
+    "danger-full-access",
+    "--model-reasoning-effort",
+    "high",
+  ],
+  "client": {
+    "codexPathOverride": "<fixture>/fake-codex.cjs",
+    "env": {
+      "CAPTURE": "<fixture>/capture.json",
+      "HOME": "<fixture>",
+      "PATH": "/usr/bin:/bin",
+      "TMPDIR": "<fixture>/alice/.cli2im-tmp",
+    },
+  },
+  "thread": {
+    "approvalPolicy": "never",
+    "model": "fixture-model",
+    "modelReasoningEffort": "high",
+    "sandboxMode": "danger-full-access",
+    "skipGitRepoCheck": true,
+    "workingDirectory": "<fixture>/alice",
+  },
+}
+`;

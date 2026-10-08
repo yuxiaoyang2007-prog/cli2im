@@ -15,7 +15,7 @@ export function isolationFixture() {
   const config: AppConfig = { bots: { bot }, agents: { codex: { binary: '/bin/cat' } },
     memory: { dir: join(root, 'bridge', 'memory') }, session: { dbPath: ':memory:' },
     server: { port: 12345, token: 'fixture' }, dangerousPatterns: [] } as unknown as AppConfig;
-  const paths = policyPaths(config, { home: join(root, 'home'), dataDir: join(root, 'bridge'), installDir: join(root, 'install') });
+  const paths = policyPaths(config, { home: root, dataDir: join(root, 'bridge'), installDir: join(root, 'install'), codexSystemConfigs: [] });
   const workspace = join(root, 'alice');
   const policy = () => buildIsolationPolicy({ config, botName: 'bot', workspace, paths, binaryPath: '/bin/cat', sdkVersions: { fixture: '1' } });
   return { root, bot, config, paths, workspace, policy };

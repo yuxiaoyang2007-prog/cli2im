@@ -1,3 +1,5 @@
+import { homedir } from 'node:os';
+import { allowedClaudeTool, claudeIsolationOptions } from '../isolation/claude.js';
 import { buildChildEnv } from '../security/child-env.js';
 import { PassThrough, Writable } from 'node:stream';
 import { EventEmitter } from 'node:events';
@@ -272,6 +274,10 @@ export class ClaudeCodeVirtualProcess implements AgentProcess {
 
   canUseTool: CanUseTool = async (toolName, input, context) => {
     this.resumeAttemptHasSideEffects = this.bufferingResumeInput || this.resumeAttemptHasSideEffects;
+
+    if (this.opts.isolation && !allowedClaudeTool(this.opts.isolation, toolName, input)) {
+      return { behavior: 'deny', message: 'Isolation tool guard denied this request' };
+    }
 
     if (this.opts.autoApprove) {
       return { behavior: 'allow', updatedInput: input };
@@ -576,6 +582,7 @@ export class ClaudeCodeVirtualProcess implements AgentProcess {
       canUseTool: this.canUseTool,
       // Raw CLI diagnostics can contain prompts, paths, or credentials.
       stderr: () => undefined,
+      ...(this.opts.isolation ? claudeIsolationOptions(this.opts.isolation, this.opts.env?.HOME ?? homedir()) : {}),
     };
   }
 
