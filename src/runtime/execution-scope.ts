@@ -5,7 +5,7 @@ import { isGroupChat } from '../security/access-policy.js';
 import type { BotConfig, InboundMessage, Session, SessionKey } from '../types.js';
 import type { SessionStore } from '../session/store.js';
 
-function canonical(path: string): string {
+export function canonicalPath(path: string): string {
   const expanded = resolve(expandHome(path));
   let parent = expanded;
   const suffix: string[] = [];
@@ -20,7 +20,7 @@ function canonical(path: string): string {
 }
 
 export function pathContains(root: string, path: string): boolean {
-  const rel = relative(canonical(root), canonical(path));
+  const rel = relative(canonicalPath(root), canonicalPath(path));
   return rel === '' || (rel !== '..' && !rel.startsWith('../') && !isAbsolute(rel));
 }
 
@@ -31,7 +31,7 @@ export function resolveExecutionScope(bot: BotConfig, msg: Pick<InboundMessage, 
   if (bot.isolation?.enabled && !group && (!override || !['p2p', 'private'].includes(msg.chatType ?? ''))) {
     throw new Error('隔离机器人缺少该私聊身份的工作区');
   }
-  const workingDirectory = canonical(override ?? bot.workingDirectory);
+  const workingDirectory = canonicalPath(override ?? bot.workingDirectory);
   return { workingDirectory, scopeKey: workingDirectory, group };
 }
 
@@ -43,7 +43,7 @@ export async function ensureExecutionSession(params: {
   const { bot, message, key, store, reset } = params;
   const scope = resolveExecutionScope(bot, message);
   const session = await store.getOrCreate(key, { agentName: bot.agent, workingDirectory: scope.workingDirectory });
-  if (scope.group && canonical(session.workingDirectory) !== scope.workingDirectory
+  if (scope.group && canonicalPath(session.workingDirectory) !== scope.workingDirectory
     && Object.values(bot.userOverrides ?? {}).some(override => override.workingDirectory
       && pathContains(override.workingDirectory, session.workingDirectory))) {
     reset(key);

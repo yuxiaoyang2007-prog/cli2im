@@ -55,7 +55,7 @@ describe('validateWorkingDirectory', () => {
   });
 
   it('rejects symlinks under an allowed path when they resolve to system paths', async () => {
-    const dir = await mkdtemp(join(process.cwd(), '.validators-'));
+    const dir = await mkdtemp(join(process.cwd(), 'tests', '.validators-'));
     try {
       const linkPath = join(dir, 'link-to-etc');
       await symlink('/etc', linkPath);

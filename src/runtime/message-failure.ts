@@ -1,3 +1,4 @@
+import { IsolationAdmissionError, ISOLATION_PAUSED } from '../isolation/admission.js';
 import { QueueCancelledError } from '../session/queue.js';
 import type { SessionStore } from '../session/store.js';
 import { buildSessionKey, type InboundMessage, type PlatformAdapter, type SessionKey } from '../types.js';
@@ -18,7 +19,7 @@ export async function reportMessageFailure(
   console.error('[pipeline] message_processing_failed');
   await deps.store.updatePreferences(sessionKey, { taskState: 'failed', taskUpdatedAt: Date.now() }, cancellation.isCurrent).catch(() => {});
   if (!cancellation.isCurrent()) return;
-  await deps.adapter.send(msg.chatId, { text: '任务未完成，请查看 /status；程序没有自动重跑。' }).catch(() => {});
+  await deps.adapter.send(msg.chatId, { text: error instanceof IsolationAdmissionError ? ISOLATION_PAUSED : '任务未完成，请查看 /status；程序没有自动重跑。' }).catch(() => {});
 }
 
 /** Shared execution boundary: a batched message or relay reports failure once. */

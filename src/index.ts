@@ -82,6 +82,11 @@ import { bindReplyRoute, type ReplyRoute } from './runtime/reply-route.js';
 import { RecoveryStore } from './runtime/result-recovery.js';
 import { TaskTracker } from './runtime/task-tracker.js';
 import { reportMessageFailure, withMessageFailureCleanup } from './runtime/message-failure.js';
+import { reconcileIsolatedSession } from './isolation/session.js';
+import { IsolationRuntime } from './isolation/runtime.js';
+import { VerificationStore } from './isolation/verification.js';
+import { policyPaths, isolationWritablePaths, assertAgentsFile, contains } from './isolation/policy.js';
+import { sandboxReadFile } from './isolation/sbx-read.js';
 import { MemoryStore } from './memory/store.js';
 import { MemoryInjector } from './memory/inject.js';
 import { MemorySessions } from './memory/sessions.js';
@@ -101,6 +106,8 @@ interface RuntimeCommandState {
 }
 
 export interface BridgeControls {
+  resumeIsolated?: Parameters<typeof handleCLISessionResume>[0]['resumeIsolated'];
+  isolatedSessions?: () => Promise<import('./isolation/provenance.js').SessionProvenance[]>;
   memory?: MemoryCommandContext;
   defaultModel?: string;
   queue?: ChatQueue;
@@ -200,9 +207,62 @@ async function main(): Promise<void> {
     cardControllers.get(name)?.interruptCard(key);
     clearSessionScopedBuffers(key, { voiceSessions, tgStreamController: telegramStreams.get(name) });
   });
+  const isolation = new IsolationRuntime({ config, store, memory: memoryStore,
+    paths: policyPaths(config), verification: new VerificationStore(join(dataDir, 'isolation', 'verification.json')),
+    replaceProcess: key => agentManager.forgetSession(key),
+    invalidate: key => {
+      preparation.cancel(key); queue.cancelPending(key); busyTasks.cancel(key);
+      batchers.get(key.split(':')[2])?.cancel(key);
+      agentManager.forgetSession(key);
+    },
+  });
+  agentManager.setIsolationGuard((key, opts, id) => isolation.guardStart(key, opts, id));
+
+  async function prepareIsolation(botName: string, message: InboundMessage, key: SessionKey, workingDirectory: string, requireVerified = true, inspectOnly = false): Promise<SpawnOpts> {
+    const bot = config.bots[botName];
+    const telegramIds = new Map<string, string>();
+    for (const [name, adapter] of adapters) if (adapter.appKey) telegramIds.set(name, adapter.appKey);
+    const { identity, people } = resolveRuntimeMemoryIdentity(botName, botIdentities, config.memory?.people, telegramIds, message);
+    if (!inspectOnly) await memorySessions.bind(key, identity.principal);
+    const prefs = await store.getPreferences(key);
+    const opts = await resolveBotSpawnOpts({ botConfig: bot, workingDirectory,
+      allWritable: isolationWritablePaths(config, policyPaths(config)),
+      env: { ...config.agents[bot.agent]?.env, ...buildSenderEnv({ channel: message.platform, userId: message.userId,
+        userName: message.userName, chatId: message.chatId, chatType: message.chatType }),
+        ...(bot.larkCliConfigDir ? { LARKSUITE_CLI_CONFIG_DIR: bot.larkCliConfigDir } : {}) },
+      model: prefs.model ?? config.agents[bot.agent]?.defaultModel, autoApprove: bot.autoApprove,
+      turnTimeoutMs: bot.turnTimeoutMs, idleTimeoutMs: bot.idleTimeoutMs, sandboxMode: bot.sandboxMode,
+      reasoningEffort: runtimeState.fastModeBySession.get(key) ? 'low' : config.agents[bot.agent]?.defaultEffort });
+    const policy = await isolation.prepare(key, identity.principal, resolveExecutionScope(bot, message).scopeKey, opts, [...people.entries()].sort(), requireVerified, inspectOnly);
+    opts.isolation = policy;
+    return opts;
+  }
+
+  async function resumeIsolated(callback: import('./types.js').CallbackQuery, id: string, botName: string): Promise<void> {
+    const key = buildSessionKey(callback.platform, callback.chatId, botName, callback.threadId);
+    const ensureReady = captureReadiness(key);
+    const message = { ...callback, text: '' };
+    const scope = resolveExecutionScope(config.bots[botName], message);
+    const record = store.getProvenance(botName, id);
+    if (!record || !contains(scope.workingDirectory, record.scope)) throw new Error('Isolation session unavailable');
+    const opts = await prepareIsolation(botName, message, key, record.scope);
+    ensureReady();
+    await isolation.assert(key, id);
+    ensureReady();
+    if (agentManager.isSessionInUse(config.bots[botName].agent, id, key)) throw new Error('Session is already in use');
+    agentManager.forgetSession(key);
+    const session = await store.getOrCreate(key, { agentName: config.bots[botName].agent, workingDirectory: record.scope });
+    ensureReady();
+    await agentManager.resumeAgent(key, config.bots[botName].agent, id, opts, createEventHandlers(key));
+    ensureReady();
+    await store.updateWorkingDirectory(session.id, record.scope);
+    await store.updateAgentSessionId(session.id, id);
+    await store.updateState(session.id, 'active');
+  }
+
   function memoryContext(botName: string, message: InboundMessage): MemoryCommandContext | undefined {
     const bot = config.bots[botName];
-    if (bot.memory !== true) return undefined;
+    if (bot.memory !== true && !bot.isolation?.enabled) return undefined;
     const command = parseBridgeCommand(message.text)?.command;
     // Diagnostic and stop controls must remain usable even when a memory file is damaged.
     if (command && !['remember', 'memory', 'forget', 'new', 'cwd', 'projects', 'task', 'resume', 'switch', 'handoff', 'model'].includes(command)) return undefined;
@@ -316,6 +376,7 @@ async function main(): Promise<void> {
   }
 
   const handoffService = new HandoffService({
+    isIsolatedBot: name => config.bots[name]?.isolation?.enabled === true,
     spawnResume: createHandoffSpawnResume(
       agentManager,
       store,
@@ -359,6 +420,15 @@ async function main(): Promise<void> {
 
     return {
       onEvent: createRuntimeEventHandler({
+        ...(config.bots[botName]?.isolation?.enabled ? {
+          onSessionId: isolation.captureRecorder(sessionKey),
+          readOutbound: async (file: import('./types.js').FilePayload, signal: AbortSignal) => {
+            await isolation.assert(sessionKey);
+            const policy = isolation.policy(sessionKey);
+            if (!policy) throw new Error('Isolation outbound policy unavailable');
+            return { ...file, data: await sandboxReadFile(file.path, policy, { signal }) };
+          },
+        } : {}),
         onTerminal: async (state, text, context) => {
           const process = agentManager.getProcess(sessionKey);
           if (process) memoryInjector.terminal(process, state);
@@ -455,7 +525,10 @@ async function main(): Promise<void> {
         const memory = memoryContext(botName, msg);
         if (memory) {
           if (['remember', 'memory', 'forget'].includes(parseBridgeCommand(msg.text)?.command ?? '')) memorySessions.track(key, memory.identity.principal);
-          else await memorySessions.bind(key, memory.identity.principal);
+          else if (await memorySessions.bind(key, memory.identity.principal) && !parseBridgeCommand(msg.text)) {
+            await bindReplyRoute(adapter, msg.threadId ? { threadId: msg.threadId, replyToMessageId: msg.messageId } : {}).send(msg.chatId,
+              { text: '原会话身份或记忆代次已变化，已开始新会话。旧记录仍保留。' });
+          }
         }
         await batcher.enqueue(key, msg, processMessage);
       }
@@ -468,6 +541,7 @@ async function main(): Promise<void> {
 
     const callbackHandler = createCallbackHandler({
       botName, botConfig, adapter, store, agentManager, handoffService, queue, capturePreparation: captureReadiness,
+      resumeIsolated: (callback, id) => resumeIsolated(callback, id, botName),
       cardController: cardControllers.get(botName), tgStreamController: telegramStreams.get(botName),
       handleControl: async (callback, text) => admit({
         platform: callback.platform, chatId: callback.chatId, userId: callback.userId,
@@ -485,7 +559,7 @@ async function main(): Promise<void> {
       const key = buildSessionKey(callback.platform, callback.chatId, botName, callback.threadId);
       senders.set(key, { platform: callback.platform, chatId: callback.chatId, userId: callback.userId, chatType: callback.chatType, messageId: callback.messageId, threadId: callback.threadId, text: '' });
       routes.set(key, callback.threadId ? { threadId: callback.threadId, replyToMessageId: callback.messageId } : {});
-      if (botConfig.memory && parseSessionResumeCallback(callback.data)) {
+      if ((botConfig.memory || botConfig.isolation?.enabled) && parseSessionResumeCallback(callback.data)) {
         const ensureReady = captureReadiness(key);
         void (async () => {
           const memory = memoryContext(botName, senders.get(key)!);
@@ -569,7 +643,9 @@ async function main(): Promise<void> {
       const memory = memoryContext(botName, msg);
       if (memory) {
         if (['remember', 'memory', 'forget'].includes(ctx.bridgeCommand?.command ?? '')) memorySessions.track(ctx.sessionKey, memory.identity.principal);
-        else await memorySessions.bind(ctx.sessionKey, memory.identity.principal);
+        else if (await memorySessions.bind(ctx.sessionKey, memory.identity.principal) && !ctx.bridgeCommand) {
+          await adapter.send(msg.chatId, { text: '原会话身份或记忆代次已变化，已开始新会话。旧记录仍保留。' });
+        }
       }
       if (ctx.bridgeCommand) {
         if (['stop', 'kill'].includes(ctx.bridgeCommand.command)) {
@@ -599,6 +675,15 @@ async function main(): Promise<void> {
           },
           notificationService,
           { defaultModel: config.agents[botConfig.agent]?.defaultModel, queue, lifecycle, memory,
+            resumeIsolated: (callback, id) => resumeIsolated(callback, id, botName),
+            isolatedSessions: async () => {
+              const cwd = (await store.getByKey(ctx.sessionKey))?.workingDirectory ?? resolveExecutionScope(botConfig, msg).workingDirectory;
+              const opts = await prepareIsolation(botName, msg, ctx.sessionKey, cwd, false, true);
+              const ids = new Map<string, string>();
+              for (const [name, connected] of adapters) if (connected.appKey) ids.set(name, connected.appKey);
+              const { identity } = resolveRuntimeMemoryIdentity(botName, botIdentities, config.memory?.people, ids, msg);
+              return isolation.listDomain({ bot: botName, principal: identity.principal, scope: cwd, policyFingerprint: opts.isolation!.fingerprint });
+            },
             runPrompt: prompt => processMessagePrompt(botName, msg, prompt),
             doctor: diagnose, controlBot, readResult: key => recovery.read(key),
             capturePreparation: captureReadiness,
@@ -624,6 +709,11 @@ async function main(): Promise<void> {
         },
       });
 
+      ensureReady();
+      const isolatedOpts = botConfig.isolation?.enabled
+        ? await prepareIsolation(botName, msg, sessionKey, session.workingDirectory) : undefined;
+      if (isolatedOpts) await reconcileIsolatedSession({ runtime: isolation, manager: agentManager, store, session, key: sessionKey,
+        notify: () => adapter.send(msg.chatId, { text: '原会话不符合当前隔离范围或已被撤销，已开始新会话。旧记录仍保留。' }) });
       ensureReady();
       const previousTask = await store.getPreferences(sessionKey);
       if (previousTask.taskState === 'interrupted') {
@@ -660,7 +750,7 @@ async function main(): Promise<void> {
             chatType: msg.chatType,
           };
       const senderHeader = buildSenderHeader(sender);
-      await downloadInboundAttachments(msg, adapter, join(expandHome(session.workingDirectory), 'inbox'));
+      await downloadInboundAttachments(msg, adapter, join(expandHome(session.workingDirectory), 'inbox'), isolatedOpts?.isolation);
 
       ensureReady();
       let pendingVoiceChatId: string | undefined;
@@ -685,6 +775,7 @@ async function main(): Promise<void> {
 
       ensureReady();
       const messageText = senderHeader + msg.text;
+      if (isolatedOpts) isolatedOpts.initialPrompt = messageText;
       const userMessage = await buildUserMessageForAgent(
         botConfig.agent,
         messageText,
@@ -717,7 +808,7 @@ async function main(): Promise<void> {
           : {};
         const spawnEnv = { ...config.agents[botConfig.agent]?.env, ...senderEnv, ...larkCliEnv };
 
-        const spawnOpts = await resolveBotSpawnOpts({
+        const spawnOpts = isolatedOpts ?? await resolveBotSpawnOpts({
           botConfig,
           workingDirectory: session.workingDirectory,
           env: spawnEnv,
@@ -760,7 +851,8 @@ async function main(): Promise<void> {
           getContextSignal: (key) => agentManager.getContextSignal(key),
         });
       }
-      const memoryDocument = memory ? await memoryStore.read(memory.identity.principal) : undefined;
+      if (isolatedOpts) await isolation.assert(sessionKey);
+      const memoryDocument = memory && botConfig.memory === true ? await memoryStore.read(memory.identity.principal) : undefined;
       ensureReady();
       const memoryProcess = agentManager.getProcess(sessionKey);
       const preparedMemory = memoryDocument && memoryProcess
@@ -936,6 +1028,7 @@ export async function handleBridgeCommand(
 ): Promise<void> {
   const actor = { userId: commandSender?.userId ?? '', chatId, chatType: commandSender?.chatType };
   const visibleSessions = async () => {
+    if (botConfig.isolation?.enabled) return [];
     const sessions = await store.listByBot(botName);
     return (await Promise.all(sessions.map(async session =>
       await canAccessSession({ bot: botConfig, actor, sessionKey, session }) ? session : null)))
@@ -945,6 +1038,10 @@ export async function handleBridgeCommand(
     projects: botConfig.projects, shortcuts: botConfig.shortcuts,
     validateDirectory: async (candidate) => {
       const path = await resolveStrictDirectory(candidate);
+      if (botConfig.isolation?.enabled) {
+        if (!contains(resolveExecutionScope(botConfig, actor).workingDirectory, path)) throw new Error('目录不在当前隔离范围');
+        return path;
+      }
       if (isBotAdmin(botConfig, actor.userId)) return path;
       const roots = [resolveExecutionScope(botConfig, actor).workingDirectory,
         ...Object.values(botConfig.projects ?? {})];
@@ -1156,13 +1253,14 @@ export async function handleBridgeCommand(
       await handleCLISessionResume({
         callback: { ...commandSender, chatId, data: '', messageId: commandSender.messageId ?? '' },
         resume: { sessionId, cwd: '' }, botName, botConfig, adapter, store, agentManager, handoffService,
-        cardController, tgStreamController, ensureReady: controls.capturePreparation?.(sessionKey),
+        cardController, tgStreamController, ensureReady: controls.capturePreparation?.(sessionKey), resumeIsolated: controls.resumeIsolated,
       });
       store.save();
       break;
     }
 
     case 'handoff': {
+      if (botConfig.isolation?.enabled) { await adapter.send(chatId, { text: '隔离机器人禁用 handoff' }); break; }
       try {
         const result = await handoffService.releaseHandoff(sessionKey);
         controls.cancelScope?.(sessionKey);
@@ -1233,6 +1331,11 @@ export async function handleBridgeCommand(
     }
 
     case 'sessions': {
+      if (botConfig.isolation?.enabled) {
+        const records = await controls.isolatedSessions?.() ?? [];
+        await adapter.send(chatId, { text: records.length ? records.map(r => `- ${r.agentSessionId}`).join('\n') : '当前隔离范围没有可恢复的会话' });
+        break;
+      }
       const sub = cmd.args[0];
 
       if (sub === 'bot') {
@@ -1315,6 +1418,7 @@ export function createCallbackHandler(params: {
   cardController?: StreamingCardController;
   tgStreamController?: TelegramStreamController;
   handleSessionResume?: typeof handleCLISessionResume;
+  resumeIsolated?: Parameters<typeof handleCLISessionResume>[0]['resumeIsolated'];
   capturePreparation?: (key: SessionKey) => () => void;
   handleControl?: (callback: import('./types.js').CallbackQuery, text: string) => Promise<void>;
 }): (callback: import('./types.js').CallbackQuery) => void {
@@ -1363,6 +1467,7 @@ export function createCallbackHandler(params: {
         handleSessionResume({
           callback,
           resume,
+          resumeIsolated: params.resumeIsolated,
           botName,
           botConfig,
           adapter: bindReplyRoute(adapter, callback.threadId ? { threadId: callback.threadId, replyToMessageId: callback.messageId } : {}),
@@ -1424,6 +1529,7 @@ export async function sendAgentMessageOrNotify(params: {
 }
 
 export interface ResolveBotSpawnOptsInput {
+  allWritable?: string[];
   botConfig: BotConfig;
   workingDirectory: string;
   env?: Record<string, string>;
@@ -1483,8 +1589,9 @@ export async function resolveBotSpawnOpts(params: ResolveBotSpawnOptsInput): Pro
   const addDirs = params.addDirs?.length
     ? params.addDirs.map((dir) => expandHome(dir))
     : undefined;
+  if (params.botConfig.isolation?.enabled) assertAgentsFile(params.botConfig, params.allWritable ?? [workingDirectory, ...(params.botConfig.isolation.writable ?? [])]);
   const appendSystemPrompt = await readAgentsInstructions(
-    params.botConfig.agentsFile,
+    params.botConfig.isolation?.enabled ? params.botConfig.agentsFile ?? false : params.botConfig.agentsFile,
     workingDirectory,
   );
 
@@ -1563,6 +1670,7 @@ export function createHandoffSpawnResume(
     const botConfig = getBotConfig?.(botName);
     assertNetworkReady();
     if (!botConfig) throw new Error('Unknown bot');
+    if (botConfig.isolation?.enabled) throw new Error('隔离机器人禁用 handoff');
     const session = await store.getOrCreate(sessionKey, { agentName, workingDirectory: expandHome(workDir) });
     ensureReady();
     const prefs = 'getPreferences' in store ? await (store as SessionStore).getPreferences(sessionKey) : {};

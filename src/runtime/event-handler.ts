@@ -18,6 +18,8 @@ const TERMINAL_PATTERNS = /^(done|lgtm|confirmed|accepted|acknowledged|agreed|ok
 export type SessionIdStore = Pick<SessionStore, 'getByKey' | 'updateAgentSessionId'>;
 
 export interface RuntimeEventHandlerDeps {
+  readOutbound?: (file: FilePayload, signal: AbortSignal) => Promise<FilePayload>;
+  onSessionId?: (id: string) => void;
   onTerminal?: (state: 'completed' | 'failed', text: string, context: AgentEventContext) => Promise<void>;
   sessionKey: SessionKey;
   store: SessionIdStore;
@@ -79,6 +81,7 @@ export function createRuntimeEventHandler(
     console.log(`[event] bot=${scrubLog(botName)} type=${event.type} voice=${isVoiceSession} hasCard=${!!cardController} hasTgStream=${!!tgStream}`);
 
     if ((event.type === 'result' || event.type === 'status') && event.sessionId) {
+      deps.onSessionId?.(event.sessionId);
       await persistAgentSessionIdIfCurrent(
         store,
         sessionKey,
@@ -173,11 +176,10 @@ export function createRuntimeEventHandler(
 
     if (event.type === 'file' && adapter?.sendFile) {
       if (!ensureActive()) return;
-      await adapter.sendFile(chatId, {
-        path: event.path,
-        name: basename(event.path),
-        mimeType: event.mimeType,
-      }, { signal });
+      let file: FilePayload = { path: event.path, name: basename(event.path), mimeType: event.mimeType };
+      if (deps.readOutbound) file = await deps.readOutbound(file, signal);
+      if (!ensureActive()) return;
+      await adapter.sendFile(chatId, file, { signal });
       if (!ensureActive()) return;
     }
 
@@ -186,12 +188,14 @@ export function createRuntimeEventHandler(
       for (const file of files) {
         if (!ensureActive()) return;
         try {
-          if (!(await isCreatedFileCurrent(file))) {
+          if (!deps.readOutbound && !(await isCreatedFileCurrent(file))) {
             console.warn('[file-send] skipped_changed_or_missing_file');
             continue;
           }
           if (!ensureActive()) return;
-          await adapter.sendFile(chatId, file, { signal });
+          const outgoing = deps.readOutbound ? await deps.readOutbound(file, signal) : file;
+          if (!ensureActive()) return;
+          await adapter.sendFile(chatId, outgoing, { signal });
         } catch (err) {
           if (isAbortError(err) || signal.aborted) return;
           console.warn('[file-send] delivery_failed');

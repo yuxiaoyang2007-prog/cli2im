@@ -1,21 +1,33 @@
 import { randomUUID } from 'node:crypto';
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, writeFile, chmod, lstat } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { basename, extname, join } from 'node:path';
 import type { FileAttachment, InboundMessage, PlatformAdapter, UserMessage } from './types.js';
 import { formatAttachmentMetadataFields } from './security/attachment-metadata.js';
 import { assertWithinAttachmentDownloadLimit } from './security/download-limits.js';
+import { canonicalPath } from './runtime/execution-scope.js';
+import { contains, type IsolationPolicy } from './isolation/policy.js';
 import { getCli2imDataDir } from './util/data-dir.js';
 
 export async function downloadInboundAttachments(
   msg: InboundMessage,
   adapter: Pick<PlatformAdapter, 'downloadFile'>,
   targetDir = join(getCli2imDataDir(), 'media'),
+  isolation?: IsolationPolicy,
 ): Promise<void> {
-  if (!msg.attachments?.length || !adapter.downloadFile) return;
+  if (!msg.attachments?.length) return;
 
+  if (isolation) {
+    targetDir = isolation.inbox;
+    for (const attachment of msg.attachments) {
+      if (attachment.localPath && (!contains(targetDir, canonicalPath(attachment.localPath))
+        || !(await lstat(attachment.localPath)).isFile())) throw new Error('Isolation attachment is outside the bridge inbox');
+    }
+  }
+  if (!adapter.downloadFile) return;
   await mkdir(targetDir, { recursive: true, mode: 0o700 });
-  await ensureTargetDirGitignore(targetDir);
+  if (isolation) await chmod(targetDir, 0o700);
+  else await ensureTargetDirGitignore(targetDir);
   for (const attachment of msg.attachments) {
     if (attachment.localPath || !attachment.fileKey || !attachment.messageId) continue;
     if (typeof attachment.size === 'number') {

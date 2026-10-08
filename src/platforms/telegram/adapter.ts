@@ -245,7 +245,7 @@ export class TelegramAdapter implements PlatformAdapter {
     const method = isImageFile(file.path || file.name) ? 'sendPhoto' : 'sendDocument';
     const field = method === 'sendPhoto' ? 'photo' : 'document';
     const form = new FormData();
-    const blob = fileHasVerificationMetadata(file)
+    const blob = file.data ? new Blob([new Uint8Array(file.data)], { type: file.mimeType ?? inferMimeType(file.name) }) : fileHasVerificationMetadata(file)
       ? await verifiedFileBlob(file)
       : await openAsBlob(file.path, { type: file.mimeType ?? inferMimeType(file.name) });
     throwIfAborted(options.signal);

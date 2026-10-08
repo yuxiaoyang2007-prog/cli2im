@@ -3,7 +3,7 @@ import type { SessionStore } from '../session/store.js';
 import { QueueCancelledError } from '../session/queue.js';
 import type { MemoryStore } from './store.js';
 
-/** Current chat bindings only. Historical agent-session provenance belongs to slice 5. */
+/** Current chat bindings only. Historical agent-session provenance is stored separately. */
 export class MemorySessions {
   private principals = new Map<SessionKey, string>();
   private epochs = new Map<string, number>();
@@ -16,7 +16,7 @@ export class MemorySessions {
     this.principals.set(key, principal);
   }
 
-  async bind(key: SessionKey, principal: string): Promise<void> {
+  async bind(key: SessionKey, principal: string): Promise<boolean> {
     const epoch = this.epochs.get(principal) ?? 0;
     const check = () => {
       if (this.revoking.has(principal) || (this.epochs.get(principal) ?? 0) !== epoch) throw new QueueCancelledError();
@@ -26,8 +26,9 @@ export class MemorySessions {
     const generation = await this.memory.generation(principal);
     const previous = await this.store.getPreferences(key);
     check();
-    if (previous.memoryPrincipal !== undefined
-      && (previous.memoryPrincipal !== principal || previous.memoryGeneration !== generation)) {
+    const reset = previous.memoryPrincipal !== undefined
+      && (previous.memoryPrincipal !== principal || previous.memoryGeneration !== generation);
+    if (reset) {
       await this.clear(key);
     }
     check();
@@ -35,6 +36,7 @@ export class MemorySessions {
       await this.store.updatePreferences(key, { memoryPrincipal: principal, memoryGeneration: generation });
     }
     check();
+    return reset;
   }
 
   async revoke(principal: string): Promise<void> {

@@ -30,8 +30,11 @@ describe('runtime memory mappings with filtered bots', () => {
   afterEach(() => { rmSync(directory, { recursive: true, force: true }); });
 
   function fixture(people: MemoryConfig['people']): string {
+    const scopedBots = Object.fromEntries(Object.entries(bots).map(([name, bot]) => [name, { ...bot,
+      workingDirectory: join(directory, name, 'group'),
+      userOverrides: bot.userOverrides && Object.fromEntries(Object.keys(bot.userOverrides).map(user => [user, { workingDirectory: join(directory, name, user) }])) } ]));
     const path = join(directory, 'config.yaml');
-    writeFileSync(path, stringify({ bots, memory: { people }, agents: {},
+    writeFileSync(path, stringify({ bots: scopedBots, memory: { people }, agents: {},
       server: { port: 3900, token: 'fixture' }, dangerousPatterns: [] }));
     return path;
   }

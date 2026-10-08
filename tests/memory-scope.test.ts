@@ -103,7 +103,7 @@ describe('slice 2 execution scope and identity', () => {
   }
   it('parses optional fields and enforces isolated override and memory gates', async () => {
     expect((await config()).bots.bot.memory).toBeUndefined();
-    expect((await config({ memory: true, isolation: { enabled: true, readable: [directory] } })).bots.bot.memory).toBe(true);
+    expect((await config({ memory: true, isolation: { enabled: true, readable: [join(directory, 'reference')] } })).bots.bot.memory).toBe(true);
     await expect(config({ memory: true })).rejects.toThrow('requires isolation');
     await expect(config({ isolation: { enabled: true }, adminUsers: ['admin'] })).rejects.toThrow('every allowed');
     await expect(config({ isolation: { enabled: true }, allowFrom: ['*'] })).rejects.toThrow('public');

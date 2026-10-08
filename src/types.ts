@@ -12,6 +12,7 @@ export interface AgentCapabilities {
 }
 
 export interface SpawnOpts {
+  isolation?: import('./isolation/policy.js').IsolationPolicy;
   workingDirectory: string;
   model?: string;
   permissionMode: 'bypass' | 'blacklist';
@@ -148,6 +149,8 @@ export interface CardButton {
 }
 
 export interface FilePayload {
+  /** Trusted bridge bytes, already read through the isolation helper. */
+  data?: Buffer;
   path: string;
   name: string;
   mimeType?: string;

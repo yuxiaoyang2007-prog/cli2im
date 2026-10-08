@@ -85,6 +85,17 @@ export class AgentManager {
     this.bindProcessCleanup = bindProcessCleanup;
   }
 
+  private isolationGuard?: (key: SessionKey, opts: SpawnOpts, sessionId?: string) => Promise<void>;
+
+  setIsolationGuard(guard: (key: SessionKey, opts: SpawnOpts, sessionId?: string) => Promise<void>): void {
+    this.isolationGuard = guard;
+  }
+
+  private async admit(key: SessionKey, opts: SpawnOpts, sessionId?: string): Promise<void> {
+    if (opts.isolation && !this.isolationGuard) throw new Error('Isolation admission is unavailable');
+    await this.isolationGuard?.(key, opts, sessionId);
+  }
+
   registerPlugin(plugin: AgentPlugin): void {
     this.plugins.set(plugin.name, plugin);
   }
@@ -137,6 +148,7 @@ export class AgentManager {
       if (!(await validateWorkingDirectory(opts.workingDirectory))) {
         throw new Error(`Invalid working directory: ${opts.workingDirectory}`);
       }
+      if (this.isolationGuard || opts.isolation) await this.admit(sessionKey, opts);
       this.assertCurrentClaim(sessionKey, claim);
 
       const abortController = this.createAbortController(sessionKey);
@@ -172,6 +184,7 @@ export class AgentManager {
       if (!(await validateWorkingDirectory(opts.workingDirectory))) {
         throw new Error(`Invalid working directory: ${opts.workingDirectory}`);
       }
+      if (this.isolationGuard || opts.isolation) await this.admit(sessionKey, opts, sessionId);
       this.assertCurrentClaim(sessionKey, claim);
 
       const abortController = this.createAbortController(sessionKey);

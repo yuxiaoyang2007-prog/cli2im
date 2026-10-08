@@ -19,6 +19,7 @@ import type {
 } from '../types.js';
 
 export async function handleCLISessionResume(params: {
+  resumeIsolated?: (callback: CallbackQuery, sessionId: string) => Promise<void>;
   callback: CallbackQuery;
   resume: { sessionId: string; cwd: string };
   botName: string;
@@ -56,6 +57,18 @@ export async function handleCLISessionResume(params: {
     return;
   }
 
+  if (botConfig.isolation?.enabled) {
+    try {
+      if (!params.resumeIsolated) throw new Error('隔离检查未通过，已暂停执行，请管理员查看 /doctor');
+      ensureReady();
+      await params.resumeIsolated(callback, resume.sessionId);
+      ensureReady();
+      await adapter.send(callback.chatId, { text: '已恢复当前隔离范围内的会话' });
+    } catch {
+      await adapter.send(callback.chatId, { text: '恢复失败：隔离检查未通过，或会话不属于当前范围、已被撤销' });
+    }
+    return;
+  }
   const platform = callback.platform ?? 'feishu';
   const sessionKey = buildSessionKey(platform, callback.chatId, botName, callback.threadId);
   if (!handoffService.tryAcquireLock(sessionKey)) {

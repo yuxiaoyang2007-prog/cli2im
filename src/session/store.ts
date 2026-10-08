@@ -1,3 +1,4 @@
+import { canResumeIsolated } from '../isolation/provenance.js';
 import initSqlJs, { type Database, type SqlJsStatic } from 'sql.js';
 import { randomUUID } from 'node:crypto';
 import { basename, dirname, join } from 'node:path';
@@ -62,6 +63,36 @@ export class SessionStore {
   private db: Database;
   private dbPath: string;
   private privacyPublicationPending = false;
+
+  private ensureProvenanceTable(): void {
+    this.db.run(`CREATE TABLE IF NOT EXISTS isolation_provenance (
+      bot TEXT NOT NULL, agent_session_id TEXT NOT NULL, record TEXT NOT NULL,
+      PRIMARY KEY (bot, agent_session_id))`);
+  }
+
+  putProvenance(record: import('../isolation/provenance.js').SessionProvenance): void {
+    this.ensureProvenanceTable();
+    const previous = this.getProvenance(record.bot, record.agentSessionId);
+    // An ID must never be relabelled into a new principal, policy or generation.
+    if (previous && !canResumeIsolated(previous, record)) throw new Error('Conflicting isolation session provenance');
+    this.db.run('INSERT OR IGNORE INTO isolation_provenance VALUES (?, ?, ?)', [record.bot, record.agentSessionId, JSON.stringify(record)]);
+    this.save();
+  }
+
+  getProvenance(bot: string, sessionId: string): import('../isolation/provenance.js').SessionProvenance | undefined {
+    return this.listProvenance(bot).find(record => record.agentSessionId === sessionId);
+  }
+
+  listProvenance(bot: string): import('../isolation/provenance.js').SessionProvenance[] {
+    this.ensureProvenanceTable();
+    const stmt = this.db.prepare('SELECT record FROM isolation_provenance WHERE bot = ?');
+    try {
+      stmt.bind([bot]);
+      const records: import('../isolation/provenance.js').SessionProvenance[] = [];
+      while (stmt.step()) records.push(JSON.parse(String(stmt.getAsObject().record)));
+      return records;
+    } finally { stmt.free(); }
+  }
 
   private constructor(db: Database, dbPath: string) {
     this.db = db;

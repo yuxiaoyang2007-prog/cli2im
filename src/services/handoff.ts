@@ -9,6 +9,7 @@ import type {
 import { buildSessionKey } from '../types.js';
 
 export interface HandoffDeps {
+  isIsolatedBot?: (botName: string) => boolean;
   spawnResume: (
     sessionKey: SessionKey,
     agentName: string,
@@ -64,6 +65,7 @@ export class HandoffService {
     } catch {
       return { success: false, error: 'Handoff failed' };
     }
+    if (this.deps.isIsolatedBot?.(req.botName)) return { success: false, error: '隔离机器人禁用 handoff' };
     const chatId = req.chatId ?? 'default';
     const configuredPlatform = this.deps.getBotPlatform?.(req.botName);
     if (req.platform && configuredPlatform && req.platform !== configuredPlatform) {
@@ -116,6 +118,7 @@ export class HandoffService {
 
   async releaseHandoff(sessionKey: SessionKey): Promise<HandoffRelease> {
     const botName = sessionKey.split(':')[2];
+    if (this.deps.isIsolatedBot?.(botName)) throw new Error('隔离机器人禁用 handoff');
     const currentAgent = this.deps.getBotAgent?.(botName);
     if (currentAgent && this.deps.getAgentCapabilities?.(currentAgent)?.sessionResume === false) {
       throw new Error(UNSUPPORTED_HANDOFF);

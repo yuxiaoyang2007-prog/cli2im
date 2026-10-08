@@ -3,6 +3,7 @@ import { homedir } from 'node:os';
 import { relative, isAbsolute } from 'node:path';
 import { collectBotIdentities, resolvePeople, type BotIdentityMetadata } from '../memory/principal.js';
 import { pathContains } from '../runtime/execution-scope.js';
+import { validateIsolationConfig } from '../isolation/policy.js';
 import { parse as parseYaml } from 'yaml';
 import type { AppConfig, BotConfig, MemoryConfig } from '../types.js';
 
@@ -69,6 +70,8 @@ function validateConfig(config: AppConfig, options: { skipBots?: boolean; botErr
     }
     resolvePeople((config.memory as MemoryConfig).people, collectBotIdentities(config.bots));
   }
+
+  validateIsolationConfig({ ...config, bots: Object.fromEntries(Object.entries(config.bots).filter(([name]) => !options.botErrors?.[name])) });
 
   // Warn if relay-enabled bots span different platforms
   const relayPlatforms = new Set<string>();

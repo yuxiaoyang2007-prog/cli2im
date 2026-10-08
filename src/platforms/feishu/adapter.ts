@@ -1,7 +1,7 @@
+import type { Readable } from 'node:stream';
 import { spawn } from 'node:child_process';
 import * as lark from '@larksuiteoapi/node-sdk';
 import { extname } from 'node:path';
-import type { Readable } from 'node:stream';
 import type {
   PlatformAdapter,
   InboundMessage,
@@ -180,10 +180,10 @@ export class FeishuAdapter implements PlatformAdapter {
 
   async sendFile(chatId: string, file: FilePayload, options: AbortableOptions = {}): Promise<void> {
     throwIfAborted(options.signal);
-    const handle = await openVerifiedOutboundFile(file);
-    const stream = handle.createReadStream();
-    stream.once('close', () => {
-      void handle.close().catch(() => undefined);
+    const handle = file.data ? undefined : await openVerifiedOutboundFile(file);
+    const stream = handle?.createReadStream();
+    stream?.once('close', () => {
+      void handle?.close().catch(() => undefined);
     });
 
     if (isImageFile(file.name || file.path)) {
@@ -192,7 +192,7 @@ export class FeishuAdapter implements PlatformAdapter {
         atFeishuSdkBoundary(() => this.client.im.image.create(withSignal({
           data: {
             image_type: 'message' as const,
-            image: stream,
+            image: file.data ?? stream!,
           },
         }, options.signal)), options.signal),
         'image upload',
@@ -215,7 +215,7 @@ export class FeishuAdapter implements PlatformAdapter {
         data: {
           file_type: 'stream' as const,
           file_name: file.name,
-          file: stream,
+          file: file.data ?? stream!,
         },
       }, options.signal)), options.signal),
       'file upload',
