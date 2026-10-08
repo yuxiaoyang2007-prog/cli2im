@@ -255,9 +255,12 @@ export async function createProbePlan(params: {
     createCanary('bridge', join(paths.dataDir, 'isolation', 'fixtures'));
     createCanary('memory', paths.memoryDir, `.canary-${id}`);
     createCanary('shared-tmp', shared);
+    const seenWorkspaces = new Set<string>();
     for (const [botName, bot] of Object.entries(params.config.bots)) {
       const workspaces = [...new Set([bot.workingDirectory, ...Object.values(bot.userOverrides ?? {}).flatMap(v => v.workingDirectory ? [v.workingDirectory] : [])].map(canonicalPath))];
       for (const workspace of workspaces) if (workspace !== policy.workspace) {
+        if (seenWorkspaces.has(workspace)) continue;
+        seenWorkspaces.add(workspace);
         const label = `${botName}.${scopeHash(workspace).slice(0, 8)}`;
         if (forbiddenCreation(workspace)) {
           cases.push({ name: `sensitive.workspace.${label}.read`, operation: 'read', sensitive: true, path: workspace },

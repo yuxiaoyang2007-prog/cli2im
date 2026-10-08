@@ -31,6 +31,7 @@ exports[`slice 6 Claude isolation > integration: SDK options snapshot, isolation
   "env": {
     "CLAUDE_CODE_TMPDIR": "/private/tmp/c2i-<scope>",
     "DEVELOPER_DIR": "/Library/Developer/CommandLineTools",
+    "GIT_CONFIG_GLOBAL": "/dev/null",
     "HOME": "<fixture>",
     "PATH": "/usr/bin:/bin",
   },

@@ -187,6 +187,20 @@ describe('slice 5 isolation policy', () => {
     if (kind === 'tmp-collision') f.bot.userOverrides!.bob.workingDirectory = join(f.workspace, '.cli2im-tmp');
     expect(() => validateIsolationConfig(f.config, f.paths)).toThrow(/Isolation/);
   });
+  it('allows a non-isolated workspace inside dataDir alongside an isolated bot', () => {
+    f.config.bots.other = { ...f.bot, isolation: undefined,
+      workingDirectory: join(f.paths.dataDir, 'kimi-work', 'workspace'), userOverrides: undefined };
+    expect(() => validateIsolationConfig(f.config, f.paths)).not.toThrow();
+  });
+  it.each(['equal', 'ancestor'])('rejects a non-isolated workspace that is %s to dataDir', kind => {
+    f.config.bots.other = { ...f.bot, isolation: undefined,
+      workingDirectory: kind === 'equal' ? f.paths.dataDir : f.root, userOverrides: undefined };
+    expect(() => validateIsolationConfig(f.config, f.paths)).toThrow('Isolation configuration contains a writer overlapping protected data');
+  });
+  it('rejects an isolated workspace inside dataDir', () => {
+    f.bot.workingDirectory = join(f.paths.dataDir, 'kimi-work', 'workspace');
+    expect(() => validateIsolationConfig(f.config, f.paths)).toThrow('Isolation configuration contains a writer overlapping protected data');
+  });
   it('checks cross-bot writers and canonical symlink aliases, including missing descendants', () => {
     f.config.bots.other = { ...f.bot, isolation: undefined, workingDirectory: join(f.workspace, 'child'), userOverrides: undefined };
     expect(() => validateIsolationConfig(f.config, f.paths)).toThrow(/overlap/);

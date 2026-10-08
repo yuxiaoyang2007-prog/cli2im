@@ -20,6 +20,33 @@ describe('slice 9 structured isolation probe', () => {
     readExceptions: [f.workspace], tools: [], plugins: [], skills: [], binaryPath: '/bin/cat', searchPath: ['/usr/bin', '/bin'], searchPathDenied: [], fingerprint: 'fixture' });
   const prepare = () => createProbePlan({ policy: policy(), paths: f.paths, agent: 'codex', config: f.config, fixtureRoot: join(f.root, 'outside'), keychainExists: () => true });
 
+  it.each([false, true])('deduplicates shared workspaces across bots and cleans all fixtures (isolated=%s)', async isolated => {
+    const workspace = join(f.root, 'group');
+    const alias = join(f.root, 'shared-alias'); fs.symlinkSync(workspace, alias);
+    const bot = { ...f.bot, isolation: isolated ? f.bot.isolation : undefined, userOverrides: undefined };
+    f.config.bots = { first: bot, second: { ...bot }, alias: { ...bot, workingDirectory: alias } };
+    const before = fs.readdirSync(f.root, { recursive: true }).sort();
+    plan = await prepare();
+    const label = `first.${scopeHash(workspace).slice(0, 8)}`;
+    for (const kind of ['workspace', 'inbox', 'tmp']) {
+      expect(plan.canaries.filter(c => c.name.startsWith(`${kind}.`)).map(c => c.name))
+        .toEqual(kind === 'tmp' && !isolated ? [] : [`${kind}.${label}`]);
+    }
+    expect(fs.readdirSync(workspace).filter(name => name.startsWith('.cli2im-canary-'))).toHaveLength(1);
+    let cases: Array<{ name: string }> = [];
+    const source = plan.command.slice("node -e '".length, -1).replaceAll("'\\''", "'");
+    runInNewContext(source.replace(`(${PROBE_SOURCE})`, 'capture'), { capture: (value: typeof cases) => { cases = value; } });
+    expect(cases.map(c => c.name)).toEqual(plan.expectedNames);
+    expect(new Set(plan.expectedNames).size).toBe(plan.expectedNames.length);
+    expect(plan.expectedNames.some(name => /\.(second|alias)\./.test(name))).toBe(false);
+    for (const canary of plan.canaries) {
+      expect(plan.expectedNames.filter(name => name.startsWith(`negative.${canary.name}.`)))
+        .toEqual(['read', 'write', 'directory'].map(operation => `negative.${canary.name}.${operation}`));
+    }
+    plan.cleanup(); plan = undefined;
+    expect(fs.readdirSync(f.root, { recursive: true }).sort()).toEqual(before);
+  });
+
   it.each(['.codex', '.claude/projects', '.gemini', 'Library', '.npm/_logs'])('non-isolated workspace in %s uses static+readonly and never creates or deletes there', async name => {
     const protectedRoot = join(f.paths.home, name); fs.mkdirSync(protectedRoot, { recursive: true });
     const alias = join(f.root, 'personal-alias'); fs.symlinkSync(protectedRoot, alias);

@@ -17,7 +17,7 @@ export function prepareCodexHome(path: string): void {
 }
 export function isolationEnvironment(env: Record<string, string>, policy?: IsolationPolicy): Record<string, string> {
   const developerDir = policy ? policy.developerDir : existsSync('/Library/Developer/CommandLineTools') ? '/Library/Developer/CommandLineTools' : undefined;
-  return { ...env, ...(developerDir ? { DEVELOPER_DIR: developerDir } : {}), ...(policy?.codexHome ? { CODEX_HOME: policy.codexHome } : {}) };
+  return { ...env, GIT_CONFIG_GLOBAL: '/dev/null', ...(developerDir ? { DEVELOPER_DIR: developerDir } : {}), ...(policy?.codexHome ? { CODEX_HOME: policy.codexHome } : {}) };
 }
 
 export const CODEX_SYSTEM_CONFIGS = ['/etc/codex/config.toml', '/etc/codex/managed_config.toml', '/etc/codex/requirements.toml'];

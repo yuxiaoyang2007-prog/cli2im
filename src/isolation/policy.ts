@@ -146,7 +146,8 @@ export function validateIsolationConfig(config: Pick<AppConfig, 'bots' | 'memory
   const all = scopes(config, paths);
   const protectedReadRoots = normalized([paths.memoryDir, paths.installDir, paths.dataDir, join(paths.home, '.cli2im')]);
   const protectedRoots = normalized([...protectedReadRoots, ...Object.values(config.bots).flatMap(b => b.plugins ?? [])]);
-  if (all.some(scope => scope.writable.some(w => protectedRoots.some(root => overlap(w, root))))) {
+  if (all.some(scope => scope.writable.some(w => protectedRoots.some(root =>
+    config.bots[scope.bot].isolation?.enabled ? overlap(w, root) : contains(w, root))))) {
     throw new Error('Isolation configuration contains a writer overlapping protected data');
   }
   for (const [name, bot] of Object.entries(config.bots)) {

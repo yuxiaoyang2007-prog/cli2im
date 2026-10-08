@@ -3,6 +3,7 @@ import { rmSync } from 'node:fs';
 import { isolationFixture } from './helpers/isolation.js';
 import { createCheckOptions, agentChildEnv, claudeCheckOptions, codexCheckArgs } from '../src/isolation/check-options.js';
 import { isolationEnvironment } from '../src/isolation/codex.js';
+import { buildIsolationPolicy } from '../src/isolation/policy.js';
 import { codexExecArgs } from '../src/agents/codex-exec.js';
 import { ClaudeCodePlugin } from '../src/agents/claude-code.js';
 import { assertNoProviderCredentials } from '../src/isolation/admission.js';
@@ -22,6 +23,24 @@ describe('slice 9 production/check parameter contract', () => {
     permissionMode: 'blacklist', model: 'fixture-model', reasoningEffort: 'high', autoApprove: false,
     env: isolationEnvironment({ HOME: f.paths.home, PATH: '/usr/bin:/bin', TMPDIR: f.policy().tmpdir, NO_PROXY: 'example.invalid', no_proxy: 'internal.invalid' }, f.policy()) });
 
+  it.each(['claude-code', 'codex'] as const)('disables global Git config only for isolated %s production and checks', agent => {
+    f.bot.agent = agent;
+    expect(isolationEnvironment({}).GIT_CONFIG_GLOBAL).toBe('/dev/null');
+    expect(isolationEnvironment({ GIT_CONFIG_GLOBAL: '/fixture/inherited.gitconfig' }).GIT_CONFIG_GLOBAL).toBe('/dev/null');
+    const original = production();
+    delete original.env!.GIT_CONFIG_GLOBAL;
+    expect(agentChildEnv(agent, { ...original, isolation: undefined })).not.toHaveProperty('GIT_CONFIG_GLOBAL');
+    original.env!.GIT_CONFIG_GLOBAL = '/fixture/inherited.gitconfig';
+    expect(agentChildEnv(agent, { ...original, isolation: undefined }).GIT_CONFIG_GLOBAL).toBe('/fixture/inherited.gitconfig');
+    const env = agentChildEnv(agent, original);
+    expect(env.GIT_CONFIG_GLOBAL).toBe('/dev/null');
+    const check = createCheckOptions(agent, original, original.env!, 'http://127.0.0.1:12345');
+    expect(agentChildEnv(agent, check.opts).GIT_CONFIG_GLOBAL).toBe('/dev/null');
+    const policy = (envKeys: string[]) => buildIsolationPolicy({ config: f.config, botName: 'bot', workspace: f.workspace,
+      paths: f.paths, binaryPath: '/bin/cat', effectiveEnv: env, production: { permissionMode: original.permissionMode, envKeys } });
+    const keys = Object.keys(env);
+    expect(policy(keys).fingerprint).not.toBe(policy(keys.filter(key => key !== 'GIT_CONFIG_GLOBAL')).fingerprint);
+  });
   it.each(['claude-code', 'codex'])('only local model access changes environment for %s; checkOverrides stays outside policy', agent => {
     if (agent === 'claude-code') f.bot.agent = agent;
     const original = production();
