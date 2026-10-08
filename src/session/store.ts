@@ -50,6 +50,8 @@ export interface SessionAccessBinding {
 }
 
 export interface RuntimePreferences {
+  memoryPrincipal?: string;
+  memoryGeneration?: number;
   model?: string;
   recentDirectories?: string[];
   taskState?: 'running' | 'completed' | 'failed' | 'interrupted';
@@ -294,6 +296,19 @@ export class SessionStore {
     }
     stmt.free();
     return rows;
+  }
+
+  async memorySessionKeys(principal: string): Promise<SessionKey[]> {
+    const stmt = this.db.prepare('SELECT scope_key, value_json FROM runtime_preferences');
+    const keys: SessionKey[] = [];
+    while (stmt.step()) {
+      const row = stmt.getAsObject();
+      try {
+        if (JSON.parse(String(row.value_json)).memoryPrincipal === principal) keys.push(String(row.scope_key) as SessionKey);
+      } catch { /* Ignore malformed optional metadata. */ }
+    }
+    stmt.free();
+    return keys;
   }
 
   async getPreferences(key: SessionKey): Promise<RuntimePreferences> {

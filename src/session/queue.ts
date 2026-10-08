@@ -111,6 +111,7 @@ interface MessageBatch {
 }
 
 export interface MessageBatcherOptions {
+  forgetIsControl?: boolean;
   delayMs?: number;
   maxMessages?: number;
   maxChars?: number;
@@ -132,9 +133,11 @@ export class MessageBatcher {
 
   enqueue(sessionKey: string, message: InboundMessage, handler: (message: InboundMessage) => Promise<void>): Promise<void> {
     const command = message.text.trim().match(/^\/(\w+)(?:\s|$)/)?.[1];
-    if (command === 'stop' || command === 'kill') {
-      this.cancel(sessionKey);
-      this.queue.cancelPending(sessionKey);
+    if (command === 'stop' || command === 'kill' || (command === 'forget' && this.options.forgetIsControl)) {
+      if (command !== 'forget') {
+        this.cancel(sessionKey);
+        this.queue.cancelPending(sessionKey);
+      }
       return this.queue.control(sessionKey, () => this.run(sessionKey, message, handler));
     }
     if (command || !this.delayMs || message.isRelay) {

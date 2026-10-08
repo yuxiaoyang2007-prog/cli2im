@@ -109,6 +109,9 @@ export class TelegramAdapter implements PlatformAdapter {
   private messageHandler?: (msg: InboundMessage) => void;
   private callbackHandler?: (cb: CallbackQuery) => void;
   private botUsername?: string;
+  private botId?: string;
+
+  get appKey(): string | undefined { return this.botId; }
   private offset = 0;
   private polling = false;
   private pollTimer?: ReturnType<typeof setTimeout>;
@@ -128,6 +131,7 @@ export class TelegramAdapter implements PlatformAdapter {
     const generation = ++this.pollGeneration;
     this.polling = true;
     this.botUsername = undefined;
+    this.botId = undefined;
     this.identityRetryMs = 1000;
     await this.lookupIdentity(generation);
     if (!this.isCurrentPoll(generation)) return;
@@ -140,9 +144,10 @@ export class TelegramAdapter implements PlatformAdapter {
     const controller = new AbortController();
     this.identityController = controller;
     try {
-      const identity = await this.botApi<{ username?: string }>('getMe', {}, { signal: controller.signal });
+      const identity = await this.botApi<{ id?: number; username?: string }>('getMe', {}, { signal: controller.signal });
       if (!this.isCurrentPoll(generation) || controller.signal.aborted) return;
       this.botUsername = identity?.username?.toLowerCase();
+      this.botId = Number.isSafeInteger(identity?.id) && identity.id! > 0 ? String(identity.id) : undefined;
     } catch {
       if (!this.isCurrentPoll(generation) || controller.signal.aborted) return;
       console.warn('Telegram identity lookup failed; continuing polling.');

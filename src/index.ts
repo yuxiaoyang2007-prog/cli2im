@@ -82,6 +82,12 @@ import { bindReplyRoute, type ReplyRoute } from './runtime/reply-route.js';
 import { RecoveryStore } from './runtime/result-recovery.js';
 import { TaskTracker } from './runtime/task-tracker.js';
 import { reportMessageFailure, withMessageFailureCleanup } from './runtime/message-failure.js';
+import { MemoryStore } from './memory/store.js';
+import { MemoryInjector } from './memory/inject.js';
+import { MemorySessions } from './memory/sessions.js';
+import { resolvePeople, resolveRuntimeMemoryIdentity } from './memory/principal.js';
+import { handleMemoryCommand, type MemoryCommandContext } from './memory/commands.js';
+import { resolveExecutionScope, ensureExecutionSession } from './runtime/execution-scope.js';
 import { textPage } from './runtime/text-page.js';
 import { PreparationGuard } from './runtime/preparation-guard.js';
 import { saveBotEnabled } from './config/runtime-update.js';
@@ -95,6 +101,7 @@ interface RuntimeCommandState {
 }
 
 export interface BridgeControls {
+  memory?: MemoryCommandContext;
   defaultModel?: string;
   queue?: ChatQueue;
   lifecycle?: BotLifecycle;
@@ -137,7 +144,7 @@ export function logInboundMessageSummary(
 async function main(): Promise<void> {
   console.log('[cli2im] Starting...');
 
-  const { config, botErrors } = loadRuntimeConfig(CONFIG_PATH);
+  const { config, botErrors, botIdentities } = loadRuntimeConfig(CONFIG_PATH);
   for (const name of Object.keys(botErrors)) console.warn(`[config] bot=${scrubLog(name)} status=invalid_disabled`);
   await configureNetworkPolicy(config.network);
   console.log(`[cli2im] Loaded config with ${Object.keys(config.bots).length} bot(s)`);
@@ -180,6 +187,32 @@ async function main(): Promise<void> {
       tgStreamController: telegramStreams.get(botName),
     });
   });
+
+  const memoryStore = new MemoryStore(expandHome(config.memory?.dir ?? join(dataDir, 'memory')));
+  const memoryInjector = new MemoryInjector();
+  const memorySessions = new MemorySessions(store, memoryStore, key => {
+    preparation.cancel(key);
+    busyTasks.cancel(key);
+    queue.cancelPending(key);
+    const name = key.split(':')[2];
+    batchers.get(name)?.cancel(key);
+    agentManager.forgetSession(key);
+    cardControllers.get(name)?.interruptCard(key);
+    clearSessionScopedBuffers(key, { voiceSessions, tgStreamController: telegramStreams.get(name) });
+  });
+  function memoryContext(botName: string, message: InboundMessage): MemoryCommandContext | undefined {
+    const bot = config.bots[botName];
+    if (bot.memory !== true) return undefined;
+    const command = parseBridgeCommand(message.text)?.command;
+    // Diagnostic and stop controls must remain usable even when a memory file is damaged.
+    if (command && !['remember', 'memory', 'forget', 'new', 'cwd', 'projects', 'task', 'resume', 'switch', 'handoff', 'model'].includes(command)) return undefined;
+    const telegramIds = new Map<string, string>();
+    for (const [name, adapter] of adapters) if (adapter.appKey) telegramIds.set(name, adapter.appKey);
+    const { identity, people } = resolveRuntimeMemoryIdentity(botName, botIdentities, config.memory?.people, telegramIds, message);
+    return { store: memoryStore, people, identity,
+      revoke: principal => memorySessions.revoke(principal),
+    };
+  }
 
   function captureReadiness(key: SessionKey): () => void {
     const check = preparation.capture(key);
@@ -327,6 +360,8 @@ async function main(): Promise<void> {
     return {
       onEvent: createRuntimeEventHandler({
         onTerminal: async (state, text, context) => {
+          const process = agentManager.getProcess(sessionKey);
+          if (process) memoryInjector.terminal(process, state);
           const completion = busyTasks.finish(sessionKey, context.signal);
           // Claim completion before any disk wait. A later turn keeps its running state.
           const saved = recovery.save(sessionKey, { status: state === 'completed' ? 'completed' : 'error', text })
@@ -403,7 +438,7 @@ async function main(): Promise<void> {
     });
     const processMessage = withMessageFailureCleanup(botName, createMessageProcessor(botName, botConfig, adapter), reportFailure);
     messageProcessors.set(botName, processMessage);
-    const batcher = new MessageBatcher(queue, { delayMs: botConfig.debounceMs ?? 800 });
+    const batcher = new MessageBatcher(queue, { delayMs: botConfig.debounceMs ?? 800, forgetIsControl: botConfig.memory === true });
     batchers.set(botName, batcher);
     const admit = async (msg: InboundMessage, isCallback = false) => {
       if (!lifecycle.status(botName).acceptsMessages) return;
@@ -416,6 +451,11 @@ async function main(): Promise<void> {
         if (['stop', 'kill'].includes(parseBridgeCommand(msg.text)?.command ?? '')) {
           preparation.cancel(key);
           busyTasks.cancel(key);
+        }
+        const memory = memoryContext(botName, msg);
+        if (memory) {
+          if (['remember', 'memory', 'forget'].includes(parseBridgeCommand(msg.text)?.command ?? '')) memorySessions.track(key, memory.identity.principal);
+          else await memorySessions.bind(key, memory.identity.principal);
         }
         await batcher.enqueue(key, msg, processMessage);
       }
@@ -445,10 +485,24 @@ async function main(): Promise<void> {
       const key = buildSessionKey(callback.platform, callback.chatId, botName, callback.threadId);
       senders.set(key, { platform: callback.platform, chatId: callback.chatId, userId: callback.userId, chatType: callback.chatType, messageId: callback.messageId, threadId: callback.threadId, text: '' });
       routes.set(key, callback.threadId ? { threadId: callback.threadId, replyToMessageId: callback.messageId } : {});
-      callbackHandler(callback);
+      if (botConfig.memory && parseSessionResumeCallback(callback.data)) {
+        const ensureReady = captureReadiness(key);
+        void (async () => {
+          const memory = memoryContext(botName, senders.get(key)!);
+          if (memory) await memorySessions.bind(key, memory.identity.principal);
+          ensureReady();
+          callbackHandler(callback);
+        })().catch(() => console.error('[pipeline] memory_resume_preparation_failed'));
+      } else callbackHandler(callback);
     });
     lifecycle.register(botName, {
-      start: async () => { assertNetworkReady(); await adapter.connect(); },
+      start: async () => {
+        assertNetworkReady();
+        await adapter.connect();
+        const telegramIds = new Map<string, string>();
+        for (const [name, connected] of adapters) if (connected.appKey) telegramIds.set(name, connected.appKey);
+        resolvePeople(config.memory?.people, botIdentities, telegramIds);
+      },
       stop: async () => {
         preparation.cancelBot(botName);
         for (const key of queue.keys()) if (key.split(':')[2] === botName) queue.cancelPending(key);
@@ -512,6 +566,11 @@ async function main(): Promise<void> {
         return;
       }
 
+      const memory = memoryContext(botName, msg);
+      if (memory) {
+        if (['remember', 'memory', 'forget'].includes(ctx.bridgeCommand?.command ?? '')) memorySessions.track(ctx.sessionKey, memory.identity.principal);
+        else await memorySessions.bind(ctx.sessionKey, memory.identity.principal);
+      }
       if (ctx.bridgeCommand) {
         if (['stop', 'kill'].includes(ctx.bridgeCommand.command)) {
           preparation.cancel(scopedKey);
@@ -539,7 +598,7 @@ async function main(): Promise<void> {
             messageId: msg.messageId,
           },
           notificationService,
-          { defaultModel: config.agents[botConfig.agent]?.defaultModel, queue, lifecycle,
+          { defaultModel: config.agents[botConfig.agent]?.defaultModel, queue, lifecycle, memory,
             runPrompt: prompt => processMessagePrompt(botName, msg, prompt),
             doctor: diagnose, controlBot, readResult: key => recovery.read(key),
             capturePreparation: captureReadiness,
@@ -557,13 +616,12 @@ async function main(): Promise<void> {
         if (!lifecycle.status(botName).acceptsMessages) throw new QueueCancelledError();
         assertNetworkReady();
       };
-      const workingDirectory = (
-        botConfig.userOverrides?.[msg.userId]?.workingDirectory
-        ?? botConfig.workingDirectory
-      ).replace('~', homedir());
-      const session = await store.getOrCreate(sessionKey, {
-        agentName: botConfig.agent,
-        workingDirectory,
+      const session = await ensureExecutionSession({
+        bot: botConfig, message: msg, key: sessionKey, store,
+        reset: key => {
+          agentManager.forgetSession(key);
+          clearSessionScopedBuffers(key, { voiceSessions, tgStreamController: telegramStreams.get(botName) });
+        },
       });
 
       ensureReady();
@@ -702,18 +760,29 @@ async function main(): Promise<void> {
           getContextSignal: (key) => agentManager.getContextSignal(key),
         });
       }
-      const delivered = await sendAgentMessageOrNotify({
-        agentManager,
-        adapter,
-        chatId: msg.chatId,
-        sessionKey,
-        agentName: botConfig.agent,
-        message: userMessage,
-        onDelivered: () => {
-          const signal = agentManager.getContextSignal(sessionKey);
-          if (signal) task.dispatch(signal);
-        },
-      });
+      const memoryDocument = memory ? await memoryStore.read(memory.identity.principal) : undefined;
+      ensureReady();
+      const memoryProcess = agentManager.getProcess(sessionKey);
+      const preparedMemory = memoryDocument && memoryProcess
+        ? memoryInjector.prepare(memoryProcess, memoryDocument, userMessage, agentManager.getContextSignal(sessionKey))
+        : undefined;
+      let delivered = false;
+      try {
+        delivered = await sendAgentMessageOrNotify({
+          agentManager,
+          adapter,
+          chatId: msg.chatId,
+          sessionKey,
+          agentName: botConfig.agent,
+          message: preparedMemory?.message ?? userMessage,
+          onDelivered: () => {
+            const signal = agentManager.getContextSignal(sessionKey);
+            if (signal) task.dispatch(signal);
+          },
+        });
+      } finally {
+        if (!delivered) preparedMemory?.cancel();
+      }
       if (!delivered) {
         busyTasks.cancel(sessionKey);
         await store.updatePreferences(sessionKey, { taskState: 'failed', taskUpdatedAt: Date.now() });
@@ -877,7 +946,7 @@ export async function handleBridgeCommand(
     validateDirectory: async (candidate) => {
       const path = await resolveStrictDirectory(candidate);
       if (isBotAdmin(botConfig, actor.userId)) return path;
-      const roots = [botConfig.userOverrides?.[actor.userId]?.workingDirectory ?? botConfig.workingDirectory,
+      const roots = [resolveExecutionScope(botConfig, actor).workingDirectory,
         ...Object.values(botConfig.projects ?? {})];
       const canonicalRoots = await Promise.all(roots.map(root => resolveStrictDirectory(root).catch(() => '')));
       if (!isPathWithinAnyRoot(path, canonicalRoots.filter(Boolean))) throw new Error('这个目录不在当前机器人的项目范围内');
@@ -887,6 +956,13 @@ export async function handleBridgeCommand(
     saveRecent: async (key, recentDirectories) => store.updatePreferences(key as SessionKey, { recentDirectories }),
   });
   switch (cmd.command) {
+    case 'remember':
+    case 'memory':
+    case 'forget': {
+      if (getBotAccessRejection(actor, botConfig)) return;
+      await adapter.send(chatId, { text: await handleMemoryCommand(cmd, botConfig, actor.userId, controls.memory), plainText: true });
+      break;
+    }
     case 'notify-me': {
       if (
         !notificationService

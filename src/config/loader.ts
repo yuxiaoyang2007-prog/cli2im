@@ -1,8 +1,10 @@
 import { readFileSync, realpathSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { relative } from 'node:path';
+import { relative, isAbsolute } from 'node:path';
+import { collectBotIdentities, resolvePeople, type BotIdentityMetadata } from '../memory/principal.js';
+import { pathContains } from '../runtime/execution-scope.js';
 import { parse as parseYaml } from 'yaml';
-import type { AppConfig, BotConfig } from '../types.js';
+import type { AppConfig, BotConfig, MemoryConfig } from '../types.js';
 
 export function substituteEnvVars(
   content: string,
@@ -24,9 +26,10 @@ export function loadConfig(
 export function loadRuntimeConfig(
   configPath: string,
   env: Record<string, string | undefined> = process.env,
-): { config: AppConfig; botErrors: Record<string, string> } {
+): { config: AppConfig; botErrors: Record<string, string>; botIdentities: Record<string, BotIdentityMetadata> } {
   const config = readConfig(configPath, env);
   if (!isRecord(config) || !isRecord(config.bots)) throw new Error('Config error: "bots" section is required');
+  const botIdentities = collectBotIdentities(config.bots);
   const botErrors: Record<string, string> = Object.create(null);
   for (const [name, bot] of Object.entries(config.bots)) {
     try {
@@ -38,7 +41,7 @@ export function loadRuntimeConfig(
   }
   validateConfig(config, { skipBots: true, botErrors });
   config.bots = Object.fromEntries(Object.entries(config.bots).filter(([name]) => !botErrors[name]));
-  return { config, botErrors };
+  return { config, botErrors, botIdentities };
 }
 
 function readConfig(configPath: string, env: Record<string, string | undefined>): AppConfig {
@@ -56,6 +59,15 @@ function validateConfig(config: AppConfig, options: { skipBots?: boolean; botErr
   }
   if (!options.skipBots) {
     for (const [name, bot] of Object.entries(config.bots)) validateBotConfig(name, bot);
+  }
+
+  if (config.memory != null) {
+    if (!isRecord(config.memory)
+      || (config.memory.dir != null && (typeof config.memory.dir !== 'string' || !config.memory.dir.trim()))
+      || (config.memory.people != null && !isRecord(config.memory.people))) {
+      throw new Error('Config error: invalid memory configuration');
+    }
+    resolvePeople((config.memory as MemoryConfig).people, collectBotIdentities(config.bots));
   }
 
   // Warn if relay-enabled bots span different platforms
@@ -149,7 +161,7 @@ function validateBotConfig(name: string, bot: BotConfig): void {
   if (!bot || typeof bot !== 'object' || Array.isArray(bot)) {
     throw new Error(`Config error: bot "${name}" must be an object`);
   }
-  for (const field of ['enabled', 'allowPublic'] as const) {
+  for (const field of ['enabled', 'allowPublic', 'memory'] as const) {
     if (bot[field] != null && typeof bot[field] !== 'boolean') {
       throw new Error(`Config error: bot "${name}" ${field} must be a boolean`);
     }
@@ -227,8 +239,46 @@ function validateBotConfig(name: string, bot: BotConfig): void {
   if (bot.groupAllowFrom != null && !Array.isArray(bot.groupAllowFrom)) {
     throw new Error(`Config error: bot "${name}" groupAllowFrom must be an array`);
   }
-  if (bot.userOverrides != null && typeof bot.userOverrides !== 'object') {
+  if (bot.userOverrides != null && !isRecord(bot.userOverrides)) {
     throw new Error(`Config error: bot "${name}" userOverrides must be an object`);
+  }
+  if (bot.isolation != null) {
+    if (!isRecord(bot.isolation) || typeof bot.isolation.enabled !== 'boolean') {
+      throw new Error(`Config error: bot "${name}" isolation.enabled must be a boolean`);
+    }
+    for (const field of ['readable', 'writable'] as const) {
+      const paths = bot.isolation[field];
+      if (paths != null && (!Array.isArray(paths) || paths.some(path => typeof path !== 'string' || !isAbsolute(path)))) {
+        throw new Error(`Config error: bot "${name}" isolation.${field} must contain absolute paths`);
+      }
+    }
+  }
+  for (const field of ['plugins', 'skills'] as const) {
+    const values = bot[field];
+    if (values != null && (!Array.isArray(values) || values.some(value => typeof value !== 'string' || !value.trim()
+      || (field === 'plugins' && !isAbsolute(value))))) {
+      throw new Error(`Config error: bot "${name}" invalid ${field}`);
+    }
+    if (values != null && bot.agent !== 'claude-code') throw new Error(`Config error: ${field} requires claude-code`);
+  }
+  if (bot.memory === true && bot.isolation?.enabled !== true) {
+    throw new Error(`Config error: bot "${name}" memory requires isolation.enabled`);
+  }
+  if (bot.isolation?.enabled) {
+    if (bot.allowPublic || bot.allowFrom.includes('*')) throw new Error('Config error: isolation forbids public access');
+    for (const user of new Set([...bot.allowFrom, ...(bot.adminUsers ?? [])])) {
+      if (typeof bot.userOverrides?.[user]?.workingDirectory !== 'string' || !bot.userOverrides[user].workingDirectory!.trim()) {
+        throw new Error('Config error: isolation requires a userOverrides workspace for every allowed user and admin');
+      }
+    }
+    const directories = Object.values(bot.userOverrides ?? {}).map(override => override?.workingDirectory).filter((path): path is string => !!path);
+    for (let i = 0; i < directories.length; i++) {
+      for (let j = 0; j < i; j++) {
+        if (pathContains(directories[i], directories[j]) || pathContains(directories[j], directories[i])) {
+          throw new Error('Config error: isolated user workspaces overlap');
+        }
+      }
+    }
   }
   if (bot.sandbox == null) {
     bot.sandbox = 'workdir';

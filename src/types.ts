@@ -159,6 +159,7 @@ export interface FilePayload {
 
 export interface PlatformAdapter {
   name: string;
+  readonly appKey?: string;
   connect(): Promise<void>;
   disconnect(): Promise<void>;
   onMessage(handler: (msg: InboundMessage) => void): void;
@@ -262,7 +263,16 @@ export interface HandoffRelease {
 
 // === Config ===
 
+export interface MemoryConfig {
+  dir?: string;
+  people?: Record<string, string[]>;
+}
+
 export interface BotConfig {
+  memory?: boolean;
+  isolation?: { enabled: boolean; readable?: string[]; writable?: string[] };
+  plugins?: string[];
+  skills?: string[];
   enabled?: boolean;
   agent: string;
   platform: 'feishu' | 'telegram';
@@ -324,6 +334,7 @@ export interface CodexNotificationConfig {
 }
 
 export interface AppConfig {
+  memory?: MemoryConfig;
   network?: { mode: 'system' | 'environment'; required: boolean; noProxy?: string[] };
   bots: Record<string, BotConfig>;
   agents: Record<string, AgentConfig>;

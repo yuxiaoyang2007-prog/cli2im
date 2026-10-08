@@ -60,6 +60,9 @@ const BRIDGE_COMMANDS = new Set([
   'doctor',
   'bots',
   'result',
+  'remember',
+  'memory',
+  'forget',
 ]);
 
 export interface BridgeCommand {
@@ -78,6 +81,9 @@ export function parseBridgeCommand(text: string): BridgeCommand | null {
   const parts = text.slice(1).trim().split(/\s+/);
   const command = parts[0] === 'clear' ? 'new' : parts[0] === 'cd' ? 'cwd' : parts[0];
   if (!BRIDGE_COMMANDS.has(command)) return null;
+  if (command === 'remember') return { command, args: [text.replace(/^\/remember\s*/, '')] };
+  const edit = command === 'memory' ? /^\/memory\s+edit\s+(\S+)(?:\s+([\s\S]*))?$/.exec(text) : null;
+  if (edit) return { command, args: ['edit', edit[1], edit[2] ?? ''] };
   return { command, args: parts.slice(1) };
 }
 
