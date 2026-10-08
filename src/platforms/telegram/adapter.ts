@@ -42,6 +42,7 @@ interface TelegramUpdate {
 interface TelegramMessage {
   message_id?: number;
   message_thread_id?: number;
+  is_topic_message?: boolean;
   chat?: {
     id?: number | string;
     type?: string;
@@ -54,9 +55,18 @@ interface TelegramMessage {
   };
   text?: string;
   caption?: string;
+  entities?: TelegramEntity[];
+  caption_entities?: TelegramEntity[];
   photo?: TelegramPhotoSize[];
   document?: TelegramDocument;
   voice?: TelegramVoice;
+}
+
+interface TelegramEntity {
+  type: string;
+  offset: number;
+  length: number;
+  user?: { username?: string };
 }
 
 interface TelegramPhotoSize {
@@ -98,11 +108,15 @@ export class TelegramAdapter implements PlatformAdapter {
   private readonly allowedUsers?: Set<string>;
   private messageHandler?: (msg: InboundMessage) => void;
   private callbackHandler?: (cb: CallbackQuery) => void;
+  private botUsername?: string;
   private offset = 0;
   private polling = false;
   private pollTimer?: ReturnType<typeof setTimeout>;
   private pollGeneration = 0;
   private pollController?: AbortController;
+  private identityController?: AbortController;
+  private identityTimer?: ReturnType<typeof setTimeout>;
+  private identityRetryMs = 1000;
 
   constructor(config: TelegramAdapterConfig) {
     this.config = config;
@@ -111,10 +125,37 @@ export class TelegramAdapter implements PlatformAdapter {
 
   async connect(): Promise<void> {
     if (this.polling) return;
-    this.pollGeneration += 1;
-    this.offset = this.readOffset();
+    const generation = ++this.pollGeneration;
     this.polling = true;
-    this.schedulePoll(0, this.pollGeneration);
+    this.botUsername = undefined;
+    this.identityRetryMs = 1000;
+    await this.lookupIdentity(generation);
+    if (!this.isCurrentPoll(generation)) return;
+    this.offset = this.readOffset();
+    this.schedulePoll(0, generation);
+  }
+
+  private async lookupIdentity(generation: number): Promise<void> {
+    if (!this.isCurrentPoll(generation)) return;
+    const controller = new AbortController();
+    this.identityController = controller;
+    try {
+      const identity = await this.botApi<{ username?: string }>('getMe', {}, { signal: controller.signal });
+      if (!this.isCurrentPoll(generation) || controller.signal.aborted) return;
+      this.botUsername = identity?.username?.toLowerCase();
+    } catch {
+      if (!this.isCurrentPoll(generation) || controller.signal.aborted) return;
+      console.warn('Telegram identity lookup failed; continuing polling.');
+    } finally {
+      if (this.identityController === controller) this.identityController = undefined;
+      if (this.isCurrentPoll(generation) && !controller.signal.aborted && !this.botUsername) {
+        this.identityTimer = setTimeout(() => {
+          this.identityTimer = undefined;
+          void this.lookupIdentity(generation);
+        }, this.identityRetryMs);
+        this.identityRetryMs = Math.min(this.identityRetryMs * 2, 30_000);
+      }
+    }
   }
 
   async disconnect(): Promise<void> {
@@ -122,10 +163,20 @@ export class TelegramAdapter implements PlatformAdapter {
     this.pollGeneration += 1;
     this.pollController?.abort();
     this.pollController = undefined;
+    this.identityController?.abort();
+    this.identityController = undefined;
+    if (this.identityTimer) {
+      clearTimeout(this.identityTimer);
+      this.identityTimer = undefined;
+    }
     if (this.pollTimer) {
       clearTimeout(this.pollTimer);
       this.pollTimer = undefined;
     }
+  }
+
+  getBotOpenId(): string | undefined {
+    return this.botUsername ? `@${this.botUsername}` : undefined;
   }
 
   onMessage(handler: (msg: InboundMessage) => void): void {
@@ -292,7 +343,7 @@ export class TelegramAdapter implements PlatformAdapter {
       return;
     }
 
-    const message = parseTelegramUpdate(update);
+    const message = parseTelegramUpdate(update, this.botUsername);
     if (message && this.isAllowed(message.userId)) {
       this.messageHandler?.(message);
     }
@@ -362,7 +413,7 @@ export class TelegramAdapter implements PlatformAdapter {
   }
 }
 
-export function parseTelegramUpdate(update: unknown): InboundMessage | null {
+export function parseTelegramUpdate(update: unknown, botUsername?: string): InboundMessage | null {
   const typed = update as TelegramUpdate;
   const message = typed.message;
   if (message?.chat?.id === undefined || message.from?.id === undefined) return null;
@@ -402,15 +453,31 @@ export function parseTelegramUpdate(update: unknown): InboundMessage | null {
     });
   }
 
-  const text = message.text ?? message.caption ?? '';
+  let text = message.text ?? message.caption ?? '';
+  const entities = message.text === undefined ? message.caption_entities : message.entities;
+  const mentions = (entities ?? []).flatMap(entity => {
+    const value = text.slice(entity.offset, entity.offset + entity.length);
+    if (entity.type === 'mention') return [value.toLowerCase()];
+    if (entity.type === 'text_mention' && entity.user?.username) return [`@${entity.user.username.toLowerCase()}`];
+    if (entity.type === 'bot_command' && value.includes('@')) return [`@${value.split('@')[1].toLowerCase()}`];
+    return [];
+  });
+  const addressedCommand = text.match(/^\/([\w]+)@([\w]+)(?=\s|$)/);
+  if (addressedCommand && entities?.some(entity => entity.type === 'bot_command'
+    && entity.offset === 0 && entity.length === addressedCommand[0].length)) {
+    // Drop other bots' commands even when requireMention is disabled.
+    if (addressedCommand[2].toLowerCase() !== botUsername?.toLowerCase()) return null;
+    text = `/${addressedCommand[1]}${text.slice(addressedCommand[0].length)}`;
+  }
   if (!text && attachments.length === 0) return null;
 
   return {
     platform: 'telegram',
     chatId: String(message.chat.id),
     messageId,
-    threadId: message.message_thread_id === undefined ? undefined : String(message.message_thread_id),
+    threadId: !message.is_topic_message || message.message_thread_id === undefined ? undefined : String(message.message_thread_id),
     userId: String(message.from.id),
+    mentions,
     userName: message.from.username ?? formatTelegramName(message.from),
     text,
     chatType: message.chat.type,
@@ -437,7 +504,7 @@ export function parseTelegramCallback(update: unknown): CallbackQuery | null {
     chatType: callback.message?.chat?.type,
     data: callback.data,
     messageId: String(messageId),
-    threadId: callback.message?.message_thread_id === undefined ? undefined : String(callback.message.message_thread_id),
+    threadId: !callback.message?.is_topic_message || callback.message.message_thread_id === undefined ? undefined : String(callback.message.message_thread_id),
   };
 }
 

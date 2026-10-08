@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
 import { createRuntimeEventHandler } from '../src/runtime/event-handler.js';
 import { createRuntimeProcessExitHandler } from '../src/runtime/process-exit-handler.js';
+import { TaskTracker } from '../src/runtime/task-tracker.js';
 import type { AgentEventContext } from '../src/agents/manager.js';
 import type { RelayDeps } from '../src/relay/deliver.js';
 import type { PlatformAdapter, SessionKey } from '../src/types.js';
@@ -22,10 +23,10 @@ describe('createRuntimeEventHandler stale continuation guard', () => {
     await handler(sessionKey, { type: 'text', content: 'first' }, context(() => true));
     expect(terminal).not.toHaveBeenCalled();
     await handler(sessionKey, { type: 'result', sessionId: 'sid' }, context(() => true));
-    expect(terminal).toHaveBeenLastCalledWith('completed', 'first');
+    expect(terminal).toHaveBeenLastCalledWith('completed', 'first', expect.any(Object));
     await handler(sessionKey, { type: 'text', content: 'second' }, context(() => true));
     await handler(sessionKey, { type: 'result', sessionId: 'sid' }, context(() => true));
-    expect(terminal).toHaveBeenLastCalledWith('completed', 'second');
+    expect(terminal).toHaveBeenLastCalledWith('completed', 'second', expect.any(Object));
   });
 
   it('bails before text side effects when the context signal is already aborted', async () => {
@@ -303,6 +304,79 @@ describe('createRuntimeEventHandler stale continuation guard', () => {
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+describe('F05 relay termination without model calls', () => {
+  it.each(['DONE', 'LGTM', '完成', '收到'])('F05 terminal reply %s does not relay again', async (text) => {
+    const relay = vi.fn();
+    const { handler } = createHandler({ adapter: adapterStub(), relayToOtherBotsFn: relay });
+    const active = context(() => true, new AbortController().signal);
+    await handler(sessionKey, { type: 'text', content: text }, active);
+    await handler(sessionKey, { type: 'result', sessionId: 'relay-test' }, active);
+    expect(relay).not.toHaveBeenCalled();
+  });
+});
+
+describe('F01 aborted process bookkeeping', () => {
+  it.each(['attachment', 'card'])('TASK-OWNERSHIP keeps the new turn running when the old process exits during %s preparation', async () => {
+    const tasks = new TaskTracker();
+    let taskState = 'running';
+    const oldController = new AbortController();
+    tasks.begin(sessionKey).dispatch(oldController.signal);
+    const oldContext = context(() => true, oldController.signal);
+    const onExit = vi.fn(async (exiting: AgentEventContext) => {
+      if (tasks.cancel(sessionKey, exiting.signal).remaining) return false;
+      taskState = 'interrupted';
+    });
+    const stopTyping = vi.fn();
+    const handler = createRuntimeProcessExitHandler({
+      sessionKey, store: sessionIdStore(), stopTyping, voiceSessions: new Map(),
+      voiceResponseBuffer: { value: '' }, sendVoiceReply: vi.fn(), onExit,
+      // No replacement process exists yet: the manager still exposes the old context.
+      getCurrentContext: () => oldContext,
+    });
+    tasks.cancel(sessionKey);
+    oldController.abort();
+    let release!: () => void;
+    const preparation = new Promise<void>(resolve => { release = resolve; });
+    const spawn = vi.fn();
+    const nextTurn = (async () => {
+      const task = tasks.begin(sessionKey);
+      taskState = 'running';
+      await preparation;
+      spawn();
+      task.dispatch(new AbortController().signal);
+    })();
+    await handler(sessionKey, 1, oldContext, undefined);
+    expect(onExit).toHaveBeenCalledOnce();
+    expect(stopTyping).not.toHaveBeenCalled();
+    expect(spawn).not.toHaveBeenCalled();
+    expect(taskState).toBe('running');
+    expect(tasks.size()).toBe(1);
+    release();
+    await nextTurn;
+    expect(spawn).toHaveBeenCalledOnce();
+    expect(taskState).toBe('running');
+    expect(tasks.finish(sessionKey).remaining).toBe(0);
+  });
+
+  it('F01 clears bookkeeping for the current aborted process only', async () => {
+    const controller = new AbortController();
+    controller.abort();
+    const onExit = vi.fn(async () => {});
+    let current = context(() => true, controller.signal);
+    const handler = createRuntimeProcessExitHandler({
+      sessionKey, store: sessionIdStore(), stopTyping: vi.fn(), voiceSessions: new Map(),
+      voiceResponseBuffer: { value: '' }, sendVoiceReply: vi.fn(), onExit,
+      getCurrentContext: () => current,
+    });
+    await handler(sessionKey, 1, current, undefined);
+    expect(onExit).toHaveBeenCalledOnce();
+    const old = current;
+    current = context(() => true, new AbortController().signal);
+    await handler(sessionKey, 1, old, undefined);
+    expect(onExit).toHaveBeenCalledOnce();
   });
 });
 

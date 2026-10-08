@@ -6,6 +6,26 @@ const message = (text: string, extra: Partial<InboundMessage> = {}): InboundMess
 afterEach(() => vi.useRealTimers());
 
 describe('message batching', () => {
+  it('F01 reports cancellation from a started handler for bookkeeping cleanup', async () => {
+    const error = new QueueCancelledError();
+    const onError = vi.fn();
+    const batcher = new MessageBatcher(new ChatQueue(), { delayMs: 0, onError });
+    const msg = message('task');
+    await batcher.enqueue('feishu:chat:bot', msg, async () => { throw error; });
+    expect(onError).toHaveBeenCalledExactlyOnceWith(error, 'feishu:chat:bot', msg);
+  });
+
+  it('F12 reports one failed execution for three merged messages', async () => {
+    vi.useFakeTimers();
+    const report = vi.fn();
+    const batcher = new MessageBatcher(new ChatQueue(), { delayMs: 10, onError: report });
+    const process = async () => { throw new Error('network unavailable'); };
+    const pending = ['a', 'b', 'c'].map(text => batcher.enqueue('feishu:chat:bot', message(text), process).catch(() => {}));
+    await vi.advanceTimersByTimeAsync(10);
+    await Promise.all(pending);
+    expect(report).toHaveBeenCalledOnce();
+  });
+
   it('preserves message and attachment order without mutating source messages', async () => {
     vi.useFakeTimers();
     const batching = new MessageBatcher(new ChatQueue(), { delayMs: 500 });

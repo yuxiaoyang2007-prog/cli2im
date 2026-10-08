@@ -2,11 +2,11 @@ import { EventEmitter } from 'node:events';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const mocks = vi.hoisted(() => ({
-  scutil: vi.fn(), connect: vi.fn(), reset: vi.fn(), reachable: true,
+  scutil: vi.fn(), connect: vi.fn(), reset: vi.fn(), reachable: true, supported: true,
 }));
 vi.mock('node:child_process', () => ({ execFileSync: mocks.scutil }));
 vi.mock('node:net', () => ({ connect: mocks.connect }));
-vi.mock('node:http', () => ({ setGlobalProxyFromEnv: mocks.reset }));
+vi.mock('node:http', () => ({ get setGlobalProxyFromEnv() { return mocks.supported ? mocks.reset : undefined; } }));
 
 const PROXY_KEYS = ['HTTP_PROXY', 'http_proxy', 'HTTPS_PROXY', 'https_proxy', 'ALL_PROXY', 'all_proxy', 'NO_PROXY', 'no_proxy', 'NODE_USE_ENV_PROXY', 'CLI2IM_NETWORK_REQUIRED'];
 const systemProxy = (port = 7890) => `<dictionary> {
@@ -27,6 +27,7 @@ describe('network policy', () => {
     mocks.scutil.mockReset().mockReturnValue(systemProxy());
     mocks.reset.mockReset();
     mocks.reachable = true;
+    mocks.supported = true;
     mocks.connect.mockReset().mockImplementation(() => {
       const socket = Object.assign(new EventEmitter(), { setTimeout: vi.fn(), destroy: vi.fn() });
       queueMicrotask(() => socket.emit(mocks.reachable ? 'connect' : 'error', new Error('connection refused')));
@@ -34,6 +35,35 @@ describe('network policy', () => {
     });
   });
   afterEach(() => vi.unstubAllEnvs());
+
+  it('F02 only requires the newer Node proxy API in mandatory mode', async () => {
+    mocks.supported = false;
+    const { createWebSocketProxyAgent } = await import('../src/security/network-policy.js');
+    expect(createWebSocketProxyAgent({ https_proxy: 'http://localhost:7890' })).toBeUndefined();
+    expect(() => createWebSocketProxyAgent({ CLI2IM_NETWORK_REQUIRED: '1', https_proxy: 'http://localhost:7890' })).toThrow('24.14');
+  });
+
+  it('F02 leaves unmanaged unsupported proxy schemes usable without a WebSocket agent', async () => {
+    const { createWebSocketProxyAgent } = await import('../src/security/network-policy.js');
+    expect(createWebSocketProxyAgent({ https_proxy: 'socks5://localhost:7890' })).toBeUndefined();
+  });
+
+  it('F03 does not stop bots when optional proxy support is unavailable', async () => {
+    mocks.supported = false;
+    const policy = await import('../src/security/network-policy.js');
+    await policy.configureNetworkPolicy({ mode: 'environment', required: false });
+    const stopBots = vi.fn();
+    expect(await policy.refreshNetworkPolicy(stopBots)).toEqual({ changed: false, ready: true });
+    expect(stopBots).not.toHaveBeenCalled();
+  });
+
+  it('F03 keeps optional policy ready when proxy settings cannot be resolved', async () => {
+    const policy = await import('../src/security/network-policy.js');
+    vi.stubEnv('https_proxy', 'socks5://localhost:7890');
+    await policy.configureNetworkPolicy({ mode: 'environment', required: false });
+    expect(await policy.refreshNetworkPolicy()).toEqual({ changed: false, ready: true });
+    expect(() => policy.assertNetworkReady()).not.toThrow();
+  });
 
   it('reads active macOS HTTP and HTTPS endpoints, including IPv6 loopback', async () => {
     const { parseMacSystemProxy } = await import('../src/security/network-policy.js');

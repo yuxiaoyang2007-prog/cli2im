@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { getEventListeners } from 'node:events';
 import { TaskTracker } from '../src/runtime/task-tracker.js';
 
 function deferred() {
@@ -8,6 +9,106 @@ function deferred() {
 }
 
 describe('task tracker', () => {
+  it('CODE-S1-F01-REPLACED-OWNER-LEAK abort settles only its owner tickets and invalidates earlier completions', () => {
+    const tracker = new TaskTracker();
+    const key = 'telegram:chat:bot';
+    const old = new AbortController();
+    const replacement = new AbortController();
+    tracker.begin(key).dispatch(old.signal);
+    tracker.begin(key).dispatch(old.signal);
+    const preparing = tracker.begin(key);
+    tracker.begin(key).dispatch(replacement.signal);
+    const completion = tracker.finish(key, replacement.signal);
+    expect(completion.remaining).toBe(3);
+    tracker.begin(key).dispatch(replacement.signal);
+    const beforeAbort = tracker.cancel(key, new AbortController().signal);
+    expect(beforeAbort.isCurrent()).toBe(true);
+    old.abort();
+    expect(beforeAbort.isCurrent()).toBe(false);
+    expect(getEventListeners(old.signal, 'abort')).toHaveLength(0);
+    expect(tracker.finish(key, replacement.signal).remaining).toBe(1);
+    preparing.dispatch(replacement.signal);
+    expect(tracker.finish(key, replacement.signal).remaining).toBe(0);
+    expect(tracker.size()).toBe(0);
+  });
+
+  it('CODE-S1-F01-REPLACED-OWNER-LEAK immediately settles a ticket dispatched to an already aborted owner', () => {
+    const tracker = new TaskTracker();
+    const key = 'telegram:chat:bot';
+    const owner = new AbortController();
+    const task = tracker.begin(key);
+    owner.abort();
+    task.dispatch(owner.signal);
+    expect(tracker.size()).toBe(0);
+    expect(getEventListeners(owner.signal, 'abort')).toHaveLength(0);
+    const replacement = new AbortController();
+    task.dispatch(replacement.signal);
+    expect(getEventListeners(replacement.signal, 'abort')).toHaveLength(0);
+    expect(tracker.size()).toBe(0);
+  });
+
+  it.each(['finish', 'cancel-owner', 'cancel-all'] as const)('CODE-S1-F01-REPLACED-OWNER-LEAK removes abort listeners on %s without invalidating later completions', path => {
+    const tracker = new TaskTracker();
+    const key = 'telegram:chat:bot';
+    const owner = new AbortController();
+    const task = tracker.begin(key);
+    task.dispatch(owner.signal);
+    task.dispatch(owner.signal);
+    expect(getEventListeners(owner.signal, 'abort')).toHaveLength(1);
+    const completion = path === 'finish'
+      ? tracker.finish(key, owner.signal)
+      : tracker.cancel(key, path === 'cancel-owner' ? owner.signal : undefined);
+    expect(completion.remaining).toBe(0);
+    expect(getEventListeners(owner.signal, 'abort')).toHaveLength(0);
+    owner.abort();
+    expect(completion.isCurrent()).toBe(true);
+  });
+
+  it('TASK-OWNERSHIP retains process ownership across queued turns and isolates replacement preparation', () => {
+    const tracker = new TaskTracker();
+    const key = 'telegram:chat:bot';
+    const owner = new AbortController().signal;
+    tracker.begin(key).dispatch(owner);
+    tracker.begin(key).dispatch(owner);
+    expect(tracker.finish(key, owner).remaining).toBe(1);
+    const cancellation = tracker.cancel(key);
+    expect(cancellation.isCurrent()).toBe(true);
+    const next = tracker.begin(key);
+    expect(cancellation.isCurrent()).toBe(false);
+    expect(tracker.cancel(key, owner).remaining).toBe(1);
+    expect(tracker.size()).toBe(1);
+    const replacement = new AbortController().signal;
+    next.dispatch(replacement);
+    expect(tracker.finish(key, owner).remaining).toBe(1);
+    expect(tracker.finish(key, replacement).remaining).toBe(0);
+  });
+
+  it('TASK-OWNERSHIP keeps exit cleanup attached when a persistent process is reused after preparation fails', () => {
+    const tracker = new TaskTracker();
+    const key = 'telegram:chat:bot';
+    const owner = new AbortController().signal;
+    const failed = tracker.begin(key);
+    tracker.cancel(key);
+    failed.dispatch(owner);
+    expect(tracker.size()).toBe(0);
+    tracker.begin(key).dispatch(owner);
+    expect(tracker.cancel(key, owner).remaining).toBe(0);
+    expect(tracker.size()).toBe(0);
+  });
+
+  it('QUEUE-PREPARATION completion and exit cannot consume a task that is still preparing', () => {
+    const tracker = new TaskTracker();
+    const key = 'telegram:chat:bot';
+    const owner = new AbortController().signal;
+    tracker.begin(key).dispatch(owner);
+    const preparing = tracker.begin(key);
+    expect(tracker.finish(key, owner).remaining).toBe(1);
+    expect(tracker.finish(key, owner).remaining).toBe(1);
+    expect(tracker.cancel(key, owner).remaining).toBe(1);
+    preparing.dispatch(owner);
+    expect(tracker.finish(key, owner).remaining).toBe(0);
+  });
+
   it('prevents an old completion from overwriting a new task while result saving is delayed', async () => {
     const tracker = new TaskTracker();
     const save = deferred();

@@ -1,6 +1,6 @@
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-import { CLISessionScanner, type CLISession } from '../session/cli-scanner.js';
+import { CLISessionScanner, type CLISession, type CLISessionScanOptions } from '../session/cli-scanner.js';
 import { CodexSessionScanner } from '../session/codex-scanner.js';
 import { GeminiSessionScanner } from '../session/gemini-scanner.js';
 import { AntigravitySessionScanner } from '../session/antigravity-scanner.js';
@@ -29,7 +29,7 @@ export async function handleCLISessionResume(params: {
     & { getSessionAccess?: (agentName: string, agentSessionId: string) => Promise<Array<{
       key: SessionKey; agentName: string; agentSessionId: string; workingDirectory: string;
     }>> };
-  scanSessions?: (agentName: string) => Promise<CLISession[]>;
+  scanSessions?: (agentName: string, options?: CLISessionScanOptions) => Promise<CLISession[]>;
   /** Captured by the caller before queueing; invalidated by stop/reset/shutdown. */
   ensureReady?: () => void;
   agentManager: Pick<AgentManager, 'cancelAgent'>;
@@ -85,7 +85,7 @@ export async function handleCLISessionResume(params: {
         }
       }
     }
-    const scanned = stored ? undefined : (await (params.scanSessions ?? scanAgentSessions)(botConfig.agent))
+    const scanned = stored ? undefined : (await (params.scanSessions ?? scanAgentSessions)(botConfig.agent, { sessionId: resume.sessionId, limit: 1 }))
       .find((session) => session.sessionId === resume.sessionId);
     ensureReady();
     const record = stored ?? (scanned && { ...scanned, agentName: botConfig.agent });
@@ -162,11 +162,20 @@ export async function handleCLISessionResume(params: {
 }
 
 /** Scan the matching CLI only. Filtering/authorization must happen before display. */
-export async function scanAgentSessions(agentName: string): Promise<CLISession[]> {
-  const options = { limit: Number.MAX_SAFE_INTEGER };
-  if (agentName === 'agy') return new AntigravitySessionScanner(join(homedir(), '.gemini', 'antigravity-cli')).scan(options);
-  if (agentName === 'gemini') return new GeminiSessionScanner(join(homedir(), '.gemini')).scan(options);
-  if (agentName === 'codex') return new CodexSessionScanner(join(homedir(), '.codex')).scan(options);
-  if (agentName === 'claude-code') return new CLISessionScanner(join(homedir(), '.claude')).scan(options);
-  return [];
+export async function scanAgentSessions(agentName: string, options: CLISessionScanOptions = {}): Promise<CLISession[]> {
+  const limit = options.limit ?? 20;
+  if (agentName === 'claude-code') return new CLISessionScanner(join(homedir(), '.claude')).scan({ ...options, limit });
+  // These scanners read bounded index windows or already collect before sorting.
+  const scanOptions = { limit: Number.MAX_SAFE_INTEGER };
+  const candidates = agentName === 'agy'
+    ? await new AntigravitySessionScanner(join(homedir(), '.gemini', 'antigravity-cli')).scan(scanOptions)
+    : agentName === 'gemini' ? await new GeminiSessionScanner(join(homedir(), '.gemini')).scan(scanOptions)
+    : agentName === 'codex' ? await new CodexSessionScanner(join(homedir(), '.codex')).scan(scanOptions) : [];
+  const sessions: CLISession[] = [];
+  for (const candidate of candidates) {
+    if (sessions.length >= limit) break;
+    if (options.sessionId && candidate.sessionId !== options.sessionId) continue;
+    if (!options.accept || await options.accept(candidate)) sessions.push(candidate);
+  }
+  return sessions;
 }

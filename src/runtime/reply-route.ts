@@ -10,7 +10,7 @@ export function bindReplyRoute<T extends PlatformAdapter>(adapter: T, route: Rep
     get(target, property) {
       const value = Reflect.get(target, property);
       if (typeof value !== 'function') return value;
-      if (['send', 'sendCard', 'sendFile', 'sendVoice'].includes(String(property))) {
+      if (['send', 'sendCard', 'sendFile', 'sendVoice', 'sendAudio'].includes(String(property))) {
         return async (...args: unknown[]) => {
           args[2] = { ...route, ...(args[2] as object ?? {}) };
           const result = await value.apply(target, args);

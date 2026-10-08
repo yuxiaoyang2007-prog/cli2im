@@ -16,6 +16,13 @@ export interface CLISession {
   pid?: number;
 }
 
+export interface CLISessionScanOptions {
+  limit?: number;
+  cwdFilter?: string;
+  sessionId?: string;
+  accept?: (session: CLISession) => Promise<boolean>;
+}
+
 interface ActiveSessionJson {
   sessionId?: unknown;
   session_id?: unknown;
@@ -40,7 +47,7 @@ const TAIL_BYTES = 32768;
 export class CLISessionScanner {
   constructor(private readonly claudeDir: string) {}
 
-  async scan(opts: { limit?: number; cwdFilter?: string } = {}): Promise<CLISession[]> {
+  async scan(opts: CLISessionScanOptions = {}): Promise<CLISession[]> {
     const limit = opts.limit ?? DEFAULT_LIMIT;
     const cwdFilterRealpath = opts.cwdFilter
       ? await resolveComparablePath(opts.cwdFilter)
@@ -48,7 +55,7 @@ export class CLISessionScanner {
     if (opts.cwdFilter && !cwdFilterRealpath) return [];
 
     const [allJnl, activeMap] = await Promise.all([
-      this.indexJsonlFiles(),
+      this.indexJsonlFiles(opts.sessionId),
       this.scanActiveSessions(),
     ]);
 
@@ -92,7 +99,7 @@ export class CLISessionScanner {
         status = alive ? asStatus(active.status) : 'stale';
       }
 
-      sessions.push({
+      const session: CLISession = {
         sessionId: jnl.sessionId,
         cwd,
         title,
@@ -101,13 +108,14 @@ export class CLISessionScanner {
         fileSize: jnl.size,
         gitBranch: branch,
         pid: active?.pid,
-      });
+      };
+      if (!opts.accept || await opts.accept(session)) sessions.push(session);
     }
 
     return sessions;
   }
 
-  private async indexJsonlFiles(): Promise<JnlFile[]> {
+  private async indexJsonlFiles(sessionId?: string): Promise<JnlFile[]> {
     const projectsDir = join(this.claudeDir, 'projects');
     const results: JnlFile[] = [];
 
@@ -124,7 +132,7 @@ export class CLISessionScanner {
       const fullDir = join(projectsDir, dir);
       let files: string[];
       try {
-        files = (await readdir(fullDir)).filter((f) => f.endsWith('.jsonl'));
+        files = (await readdir(fullDir)).filter((f) => f.endsWith('.jsonl') && (!sessionId || basename(f, '.jsonl') === sessionId));
       } catch {
         return;
       }

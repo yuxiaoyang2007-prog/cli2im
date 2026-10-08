@@ -3,6 +3,13 @@ import { persistAgentSessionIdIfCurrent } from '../src/runtime/agent-session-id.
 import type { Session, SessionKey } from '../src/types.js';
 
 describe('persistAgentSessionIdIfCurrent', () => {
+  it('F13 does not persist an unchanged agent session id twice', async () => {
+    const current = { ...session('telegram:chat_1:ccbot'), agentSessionId: 'same-id' };
+    const store = { getByKey: vi.fn().mockResolvedValue(current), updateAgentSessionId: vi.fn() };
+    await persistAgentSessionIdIfCurrent(store, current.key, 'same-id', () => true);
+    expect(store.updateAgentSessionId).not.toHaveBeenCalled();
+  });
+
   it('skips the store update when the process context becomes stale while awaiting the session lookup', async () => {
     const lookupGate = deferred<Session | null>();
     const store = {

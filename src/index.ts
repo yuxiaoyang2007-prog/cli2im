@@ -81,6 +81,7 @@ import { ProjectRegistry, buildProjectPanel, parseProjectAction } from './runtim
 import { bindReplyRoute, type ReplyRoute } from './runtime/reply-route.js';
 import { RecoveryStore } from './runtime/result-recovery.js';
 import { TaskTracker } from './runtime/task-tracker.js';
+import { reportMessageFailure, withMessageFailureCleanup } from './runtime/message-failure.js';
 import { textPage } from './runtime/text-page.js';
 import { PreparationGuard } from './runtime/preparation-guard.js';
 import { saveBotEnabled } from './config/runtime-update.js';
@@ -325,8 +326,8 @@ async function main(): Promise<void> {
 
     return {
       onEvent: createRuntimeEventHandler({
-        onTerminal: async (state, text) => {
-          const completion = busyTasks.finish(sessionKey);
+        onTerminal: async (state, text, context) => {
+          const completion = busyTasks.finish(sessionKey, context.signal);
           // Claim completion before any disk wait. A later turn keeps its running state.
           const saved = recovery.save(sessionKey, { status: state === 'completed' ? 'completed' : 'error', text })
             .catch(() => console.error('[recovery] result_save_failed'));
@@ -374,10 +375,12 @@ async function main(): Promise<void> {
         }
       },
       onProcessExit: createRuntimeProcessExitHandler({
-        onExit: async () => {
-          busyTasks.cancel(sessionKey);
+        onExit: async context => {
+          const cancellation = busyTasks.cancel(sessionKey, context.signal);
+          if (cancellation.remaining) return false;
           if ((await store.getPreferences(sessionKey)).taskState === 'running')
-            await store.updatePreferences(sessionKey, { taskState: 'interrupted', taskUpdatedAt: Date.now() });
+            await store.updatePreferences(sessionKey, { taskState: 'interrupted', taskUpdatedAt: Date.now() }, cancellation.isCurrent);
+          return cancellation.isCurrent();
         },
         sessionKey,
         store,
@@ -395,9 +398,11 @@ async function main(): Promise<void> {
 
   for (const [botName, adapter] of adapters) {
     const botConfig = config.bots[botName];
-    const processMessage = createMessageProcessor(botName, botConfig, adapter);
+    const reportFailure = (error: unknown, key: string, msg: InboundMessage) => reportMessageFailure(error, key as SessionKey, msg, {
+      busyTasks, store, adapter: bindReplyRoute(adapter, routes.get(key as SessionKey) ?? {}),
+    });
+    const processMessage = withMessageFailureCleanup(botName, createMessageProcessor(botName, botConfig, adapter), reportFailure);
     messageProcessors.set(botName, processMessage);
-
     const batcher = new MessageBatcher(queue, { delayMs: botConfig.debounceMs ?? 800 });
     batchers.set(botName, batcher);
     const admit = async (msg: InboundMessage, isCallback = false) => {
@@ -416,10 +421,7 @@ async function main(): Promise<void> {
       }
       catch (error) {
         if (error instanceof QueueCancelledError) return;
-        console.error('[pipeline] message_processing_failed');
-        busyTasks.cancel(key);
-        await store.updatePreferences(key, { taskState: 'failed', taskUpdatedAt: Date.now() }).catch(() => {});
-        await bindReplyRoute(adapter, routes.get(key) ?? {}).send(msg.chatId, { text: '任务未完成，请查看 /status；程序没有自动重跑。' }).catch(() => {});
+        await reportFailure(error, key, msg);
       }
     };
     adapter.onMessage(msg => { void admit(msg); });
@@ -578,7 +580,7 @@ async function main(): Promise<void> {
         cardControllers.get(botName)?.interruptCard(sessionKey);
         telegramStreams.get(botName)?.interrupt(sessionKey);
       }
-      busyTasks.begin(sessionKey);
+      const task = busyTasks.begin(sessionKey);
       await store.updatePreferences(sessionKey, { taskState: 'running', taskUpdatedAt: Date.now() });
       await store.touch(session.id);
       ensureReady();
@@ -646,7 +648,8 @@ async function main(): Promise<void> {
       );
 
       ensureReady();
-      if (isNewProcess) {
+      // Card setup may outlive the old process, just like attachment preparation.
+      if (shouldStartNewProcess || !agentManager.hasProcess(sessionKey)) {
         console.log(`[pipeline] ${scrubLog(botName)}: agent=${scrubLog(botConfig.agent)} action=spawn`);
         const handlers = createEventHandlers(sessionKey);
 
@@ -706,6 +709,10 @@ async function main(): Promise<void> {
         sessionKey,
         agentName: botConfig.agent,
         message: userMessage,
+        onDelivered: () => {
+          const signal = agentManager.getContextSignal(sessionKey);
+          if (signal) task.dispatch(signal);
+        },
       });
       if (!delivered) {
         busyTasks.cancel(sessionKey);
@@ -1023,7 +1030,8 @@ export async function handleBridgeCommand(
       agentManager.cancelAgent(sessionKey);
       cardController?.interruptCard(sessionKey);
       clearSessionScopedBuffers(sessionKey, { voiceSessions, tgStreamController });
-      await store.updatePreferences(sessionKey, { taskState: 'interrupted', taskUpdatedAt: Date.now() });
+      if ((await store.getPreferences(sessionKey)).taskState === 'running')
+        await store.updatePreferences(sessionKey, { taskState: 'interrupted', taskUpdatedAt: Date.now() });
       await adapter.send(chatId, { text: '已发送中断信号' });
       break;
     }
@@ -1032,7 +1040,8 @@ export async function handleBridgeCommand(
       agentManager.killAgent(sessionKey);
       cardController?.interruptCard(sessionKey);
       clearSessionScopedBuffers(sessionKey, { voiceSessions, tgStreamController });
-      await store.updatePreferences(sessionKey, { taskState: 'interrupted', taskUpdatedAt: Date.now() });
+      if ((await store.getPreferences(sessionKey)).taskState === 'running')
+        await store.updatePreferences(sessionKey, { taskState: 'interrupted', taskUpdatedAt: Date.now() });
       await adapter.send(chatId, { text: '已强制终止进程' });
       break;
     }
@@ -1056,7 +1065,7 @@ export async function handleBridgeCommand(
       const session = await store.getOrCreate(sessionKey, { agentName: botConfig.agent, workingDirectory: resolvedNewDir });
       await store.updateWorkingDirectory(session.id, resolvedNewDir);
       await store.clearAgentSessionId(session.id);
-      await store.updatePreferences(sessionKey, { taskState: 'interrupted' });
+      await store.updatePreferences(sessionKey, { taskState: undefined, taskUpdatedAt: undefined });
       store.save();
       await adapter.send(chatId, { text: `工作目录已切换到 ${resolvedNewDir}，下一条消息会新建该项目的对话` });
       break;
@@ -1081,7 +1090,8 @@ export async function handleBridgeCommand(
       try {
         const result = await handoffService.releaseHandoff(sessionKey);
         controls.cancelScope?.(sessionKey);
-        await store.updatePreferences(sessionKey, { taskState: 'interrupted', taskUpdatedAt: Date.now() });
+        if ((await store.getPreferences(sessionKey)).taskState === 'running')
+          await store.updatePreferences(sessionKey, { taskState: 'interrupted', taskUpdatedAt: Date.now() });
         agentManager.cancelAgent(sessionKey);
         clearSessionScopedBuffers(sessionKey, { voiceSessions, tgStreamController });
         await adapter.send(chatId, {
@@ -1176,12 +1186,11 @@ export async function handleBridgeCommand(
       if (requestedAgent !== botConfig.agent) { await adapter.send(chatId, { text: '请在对应 AI 的机器人中查看历史对话' }); break; }
       const agentLabel = agentManager.getPlugin(botConfig.agent)?.displayName ?? botConfig.agent;
       const bindings = await store.listSessionAccess(sessionKey);
-      const scanned = await scanAgentSessions(botConfig.agent);
-      const sessions = (await Promise.all(scanned.map(async candidate => {
+      const sessions = await scanAgentSessions(botConfig.agent, { accept: async candidate => {
         const binding = bindings.find(item => item.agentName === botConfig.agent && item.agentSessionId === candidate.sessionId);
-        return await canAccessSession({ bot: botConfig, actor, sessionKey,
-          session: binding ?? { ...candidate, agentName: botConfig.agent } }) ? candidate : null;
-      }))).filter((session): session is NonNullable<typeof session> => session !== null).slice(0, 20);
+        return canAccessSession({ bot: botConfig, actor, sessionKey,
+          session: binding ?? { ...candidate, agentName: botConfig.agent } });
+      } });
 
       if (sessions.length === 0) {
         await adapter.send(chatId, { text: `没有找到 ${agentLabel} CLI 会话` });
@@ -1322,10 +1331,14 @@ export async function sendAgentMessageOrNotify(params: {
   sessionKey: SessionKey;
   agentName: string;
   message: UserMessage;
+  onDelivered?: () => void;
 }): Promise<boolean> {
   const { agentManager, adapter, chatId, sessionKey, agentName, message } = params;
   const delivered = agentManager.sendMessage(sessionKey, agentName, message);
-  if (delivered) return true;
+  if (delivered) {
+    params.onDelivered?.();
+    return true;
+  }
 
   console.warn(
     `[pipeline] message_delivery=failed reason=session_transition agent=${scrubLog(agentName)}`,

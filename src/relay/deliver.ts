@@ -79,10 +79,15 @@ export async function relayToOtherBots(
     const processor = messageProcessors.get(targetBotName);
     if (processor) {
       if (signal?.aborted) return;
-      await queue.enqueue(buildSessionKey(targetBotConfig.platform, chatId, targetBotName), async () => {
+      try {
+        await queue.enqueue(buildSessionKey(targetBotConfig.platform, chatId, targetBotName), async () => {
+          if (signal?.aborted) return;
+          await processor(syntheticMsg);
+        });
+      } catch {
         if (signal?.aborted) return;
-        await processor(syntheticMsg);
-      });
+        console.error('[relay] target_delivery_failed');
+      }
     }
   }
 }

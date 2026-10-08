@@ -14,7 +14,7 @@ export async function persistAgentSessionIdIfCurrent(
   if (!isActive()) return;
 
   const session = await store.getByKey(sessionKey);
-  if (!session || !isActive()) return;
+  if (!session || !isActive() || session.agentSessionId === agentSessionId) return;
 
   await store.updateAgentSessionId(session.id, agentSessionId);
 }

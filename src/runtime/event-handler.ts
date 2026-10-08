@@ -18,7 +18,7 @@ const TERMINAL_PATTERNS = /^(done|lgtm|confirmed|accepted|acknowledged|agreed|ok
 export type SessionIdStore = Pick<SessionStore, 'getByKey' | 'updateAgentSessionId'>;
 
 export interface RuntimeEventHandlerDeps {
-  onTerminal?: (state: 'completed' | 'failed', text: string) => Promise<void>;
+  onTerminal?: (state: 'completed' | 'failed', text: string, context: AgentEventContext) => Promise<void>;
   sessionKey: SessionKey;
   store: SessionIdStore;
   voiceSessions: Map<SessionKey, string>;
@@ -71,7 +71,7 @@ export function createRuntimeEventHandler(
     if (event.type === 'result' || event.type === 'error') {
       const finalText = recoveryText + (event.type === 'error' ? '\n任务执行失败。' : '');
       recoveryText = '';
-      await deps.onTerminal?.(event.type === 'result' ? 'completed' : 'failed', finalText);
+      await deps.onTerminal?.(event.type === 'result' ? 'completed' : 'failed', finalText, eventContext);
       if (!ensureActive()) return;
     }
 

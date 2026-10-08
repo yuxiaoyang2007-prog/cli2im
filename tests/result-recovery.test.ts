@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -59,6 +60,18 @@ describe('private result recovery', () => {
 });
 
 describe('incoming metadata deduplication', () => {
+  it('F14 accepts new messages and rejects duplicates with a full 10000-entry ledger', async () => {
+    const now = Date.now();
+    const entries = Array.from({ length: 10000 }, (_, i) => [createHash('sha256').update(String(i)).digest('hex'), now]);
+    await writeFile(join(directory, 'incoming.json'), JSON.stringify({ version: 1, entries }));
+    const store = new RecoveryStore(directory);
+    const started = performance.now();
+    const results = await Promise.all(Array.from({ length: 20 }, (_, i) => store.acceptIncoming('p', `bot-${i % 2}`, `new-${i}`)));
+    expect(results).toEqual(Array(20).fill(true));
+    expect(await store.acceptIncoming('p', 'bot-0', 'new-0')).toBe(false);
+    console.log(`[F14 fixture] 20 admissions, 10000 retained entries: ${Math.round(performance.now() - started)} ms`);
+  });
+
   it('rejects duplicates across restart but isolates platforms and bots', async () => {
     const first = new RecoveryStore(directory);
     expect(await first.acceptIncoming('feishu', 'bot1', 'message-1')).toBe(true);

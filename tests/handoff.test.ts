@@ -34,6 +34,13 @@ describe('HandoffService', () => {
     });
   });
 
+  it.each(['zcode', 'invalid-id'])('F09 does not release state when resume command is invalid: %s', async (scenario) => {
+    if (scenario === 'zcode') mockGetBotAgent.mockReturnValue('zcode');
+    else mockGetSession.mockResolvedValue({ id: 'uuid-1', agentName: 'claude-code', agentSessionId: 'bad;id' } as never);
+    await expect(service.releaseHandoff('feishu:oc_xxx:ccbot')).rejects.toThrow();
+    expect(mockUpdateState).not.toHaveBeenCalled();
+  });
+
   it('isHandoffInProgress returns false initially', () => {
     expect(service.isHandoffInProgress('feishu:oc_xxx:ccbot')).toBe(false);
   });

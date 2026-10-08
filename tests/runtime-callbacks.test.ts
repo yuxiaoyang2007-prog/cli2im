@@ -162,18 +162,23 @@ describe('createCallbackHandler', () => {
 describe('sendAgentMessageOrNotify', () => {
   it('does not notify when the agent message is delivered', async () => {
     const adapter = adapterStub();
+    const onDelivered = vi.fn();
     const agentManager = {
       sendMessage: vi.fn().mockReturnValue(true),
     };
 
-    await sendAgentMessageOrNotify({
+    const delivery = sendAgentMessageOrNotify({
       agentManager,
       adapter,
       chatId: 'chat_1',
       sessionKey: 'feishu:chat_1:ccbot',
       agentName: 'claude-code',
       message: { role: 'user', content: 'hello' },
+      onDelivered,
     });
+    // Ownership must be committed before the caller yields to an exit/result.
+    expect(onDelivered).toHaveBeenCalledOnce();
+    await delivery;
 
     expect(agentManager.sendMessage).toHaveBeenCalledWith(
       'feishu:chat_1:ccbot',
@@ -185,6 +190,7 @@ describe('sendAgentMessageOrNotify', () => {
 
   it('warns and asks the user to resend when delivery fails', async () => {
     const adapter = adapterStub();
+    const onDelivered = vi.fn();
     const agentManager = {
       sendMessage: vi.fn().mockReturnValue(false),
     };
@@ -198,7 +204,9 @@ describe('sendAgentMessageOrNotify', () => {
         sessionKey: 'feishu:chat_1:ccbot',
         agentName: 'claude-code',
         message: { role: 'user', content: 'hello' },
+        onDelivered,
       });
+      expect(onDelivered).not.toHaveBeenCalled();
 
       expect(warn).toHaveBeenCalledWith(
         '[pipeline] message_delivery=failed reason=session_transition agent=claude-code',

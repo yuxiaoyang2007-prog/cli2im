@@ -29,6 +29,25 @@ describe('CLISessionScanner', () => {
     await writeFile(path, lines.map((l) => JSON.stringify(l)).join('\n') + '\n', 'utf8');
   }
 
+  it('F15 selects a requested old session without returning unrelated recent sessions', async () => {
+    const root = await makeClaudeDir();
+    const project = join(root, 'projects', 'test-project');
+    await writeJsonl(join(project, 'old.jsonl'), [{ cwd: '/old', type: 'user', message: { content: 'old' } }]);
+    await utimes(join(project, 'old.jsonl'), 1, 1);
+    await writeJsonl(join(project, 'recent.jsonl'), [{ cwd: '/recent', type: 'user', message: { content: 'recent' } }]);
+    expect((await new CLISessionScanner(root).scan({ limit: 1, sessionId: 'old' })).map(s => s.sessionId)).toEqual(['old']);
+  });
+
+  it('F15 applies authorization before the display limit', async () => {
+    const root = await makeClaudeDir();
+    const project = join(root, 'projects', 'test-project');
+    await writeJsonl(join(project, 'allowed.jsonl'), [{ cwd: '/allowed' }]);
+    await utimes(join(project, 'allowed.jsonl'), 1, 1);
+    await writeJsonl(join(project, 'denied.jsonl'), [{ cwd: '/denied' }]);
+    const sessions = await new CLISessionScanner(root).scan({ limit: 1, accept: async (session) => session.cwd === '/allowed' });
+    expect(sessions.map(s => s.sessionId)).toEqual(['allowed']);
+  });
+
   it('scans JSONL files, merges with active sessions, filters desktop, sorts by mtime', async () => {
     const claudeDir = await makeClaudeDir();
     const livePid = process.pid;

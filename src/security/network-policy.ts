@@ -66,13 +66,20 @@ export function applyProxyEnvironment(settings: ProxySettings, env = process.env
 
 /** WebSocket upgrades do not use Node's global proxy agent; give WSS its own route. */
 export function createWebSocketProxyAgent(env = process.env): HttpsAgent | undefined {
-  const proxy = normalizeProxy(env.https_proxy ?? env.HTTPS_PROXY ?? '');
+  let proxy: string;
+  try {
+    proxy = normalizeProxy(env.https_proxy ?? env.HTTPS_PROXY ?? '');
+  } catch (error) {
+    if (env.CLI2IM_NETWORK_REQUIRED === '1') throw error;
+    return undefined;
+  }
   if (!proxy) {
     if (env.CLI2IM_NETWORK_REQUIRED === '1') throw new Error('飞书长连接所需代理未启用');
     return undefined;
   }
   if (typeof (http as unknown as { setGlobalProxyFromEnv?: unknown }).setGlobalProxyFromEnv !== 'function') {
-    throw new Error('长连接代理保护需要 Node.js 24.14+ 或 25.4+');
+    if (env.CLI2IM_NETWORK_REQUIRED === '1') throw new Error('长连接代理保护需要 Node.js 24.14+ 或 25.4+');
+    return undefined;
   }
   // Use the current normalized HTTPS route even if a broad inherited NO_PROXY exists.
   // This instance is replaced whenever the adapter reconnects after a routing change.
@@ -131,9 +138,9 @@ export async function refreshNetworkPolicy(beforeChange?: () => Promise<void>): 
     const settings = resolveProxySettings(policy);
     const changed = JSON.stringify(settings) !== JSON.stringify(active);
     if (changed) {
-      await beforeChange?.();
       const reset = (http as unknown as { setGlobalProxyFromEnv?: (env: NodeJS.ProcessEnv) => unknown }).setGlobalProxyFromEnv;
       if (!reset) throw new Error('代理保护需要 Node.js 24.14+ 或 25.4+');
+      await beforeChange?.();
       applyProxyEnvironment(settings);
       process.env.CLI2IM_NETWORK_REQUIRED = policy.required ? '1' : '0';
       reset(process.env);
@@ -142,9 +149,9 @@ export async function refreshNetworkPolicy(beforeChange?: () => Promise<void>): 
     ready = !policy.required || (await proxyReachable(settings.httpProxy) && await proxyReachable(settings.httpsProxy));
     return { changed, ready };
   } catch {
-    ready = false;
+    ready = !policy.required;
     // Retain existing proxy environment. Never erase it on system-proxy failure.
-    return { changed: false, ready: false };
+    return { changed: false, ready };
   }
 }
 

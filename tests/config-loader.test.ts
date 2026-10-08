@@ -77,6 +77,10 @@ ${notificationYaml}
     return loadConfig(path);
   }
 
+  it('F04 defaults omitted permissionMode to blacklist', () => {
+    expect(loadAccessFixture({ permissionMode: undefined }).bots.testbot.permissionMode).toBe('blacklist');
+  });
+
   it('loads explicit access grants and operational settings', () => {
     const result = loadAccessFixture({ enabled: true, adminUsers: [123, 'user'], allowPublic: false,
       sessionRoots: [tmpDir], projects: { demo: tmpDir }, shortcuts: { review: { prompt: 'Review current changes', description: 'Review' } },

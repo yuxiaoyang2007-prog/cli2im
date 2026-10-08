@@ -127,11 +127,12 @@ export class HandoffService {
     }
 
     const sessionId = session.agentSessionId ?? session.id;
+    const resumeCommand = buildResumeCommand(currentAgent ?? session.agentName, sessionId);
     await this.deps.updateState(session.id, 'handed_off');
 
     return {
       sessionId,
-      resumeCommand: buildResumeCommand(currentAgent ?? session.agentName, sessionId),
+      resumeCommand,
     };
   }
 }

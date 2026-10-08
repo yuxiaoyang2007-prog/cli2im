@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { scanAgentSessions } from '../src/runtime/session-resume.js';
 import { handleBridgeCommand } from '../src/index.js';
 import type { BotConfig, PlatformAdapter, SessionKey } from '../src/types.js';
 
@@ -10,7 +11,12 @@ const scannerMocks = vi.hoisted(() => ({
 }));
 
 vi.mock('../src/session/cli-scanner.js', () => ({
-  CLISessionScanner: vi.fn(function () { return { scan: scannerMocks.cliScan }; }),
+  CLISessionScanner: vi.fn(function () { return { scan: async (options: { limit: number; accept?: (session: unknown) => Promise<boolean> }) => {
+    const found = await scannerMocks.cliScan(options);
+    const visible = [];
+    for (const item of found) if (!options.accept || await options.accept(item)) visible.push(item);
+    return visible.slice(0, options.limit);
+  } }; }),
 }));
 vi.mock('../src/session/codex-scanner.js', () => ({
   CodexSessionScanner: vi.fn(function () { return { scan: scannerMocks.codexScan }; }),
@@ -36,6 +42,11 @@ describe('/sessions command scanner selection', () => {
     scannerMocks.antigravityScan.mockResolvedValue([session('antigravity-session')]);
   });
 
+  it('F15 bounds default Claude history scanning to the display size', async () => {
+    await scanAgentSessions('claude-code');
+    expect(scannerMocks.cliScan).toHaveBeenCalledWith({ limit: 20 });
+  });
+
   it('scans compatible histories and filters before limiting the displayed list', async () => {
     const sdkDeps = commandDeps({
       botConfig: botConfig({
@@ -44,7 +55,7 @@ describe('/sessions command scanner selection', () => {
       }),
     });
     await runCommand('sessions', [], sdkDeps);
-    expect(scannerMocks.cliScan).toHaveBeenLastCalledWith({ limit: Number.MAX_SAFE_INTEGER });
+    expect(scannerMocks.cliScan).toHaveBeenLastCalledWith({ limit: 20, accept: expect.any(Function) });
 
     const codexDeps = commandDeps({
       botConfig: botConfig({

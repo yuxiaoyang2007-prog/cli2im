@@ -114,6 +114,7 @@ export interface MessageBatcherOptions {
   delayMs?: number;
   maxMessages?: number;
   maxChars?: number;
+  onError?: (error: unknown, sessionKey: string, message: InboundMessage) => Promise<void> | void;
 }
 
 /** Call only after admission checks. No persistence and no cross-sender merging. */
@@ -123,7 +124,7 @@ export class MessageBatcher {
   private maxMessages: number;
   private maxChars: number;
 
-  constructor(private queue: ChatQueue, options: MessageBatcherOptions = {}) {
+  constructor(private queue: ChatQueue, private options: MessageBatcherOptions = {}) {
     this.delayMs = Math.max(0, Math.min(5_000, options.delayMs ?? 800));
     this.maxMessages = Math.max(1, Math.min(20, options.maxMessages ?? 8));
     this.maxChars = Math.max(1, options.maxChars ?? 32_000);
@@ -134,11 +135,11 @@ export class MessageBatcher {
     if (command === 'stop' || command === 'kill') {
       this.cancel(sessionKey);
       this.queue.cancelPending(sessionKey);
-      return this.queue.control(sessionKey, () => handler(message));
+      return this.queue.control(sessionKey, () => this.run(sessionKey, message, handler));
     }
     if (command || !this.delayMs || message.isRelay) {
       this.flush(sessionKey);
-      return this.queue.enqueue(sessionKey, () => handler(message));
+      return this.queue.enqueue(sessionKey, () => this.run(sessionKey, message, handler));
     }
 
     let batch = this.batches.get(sessionKey);
@@ -166,13 +167,23 @@ export class MessageBatcher {
     return new Promise<void>((resolve, reject) => batch!.waiters.push({ resolve, reject }));
   }
 
+  private async run(sessionKey: string, message: InboundMessage, handler: (message: InboundMessage) => Promise<void>): Promise<void> {
+    try {
+      await handler(message);
+    } catch (error) {
+      if (!this.options.onError) throw error;
+      // One execution may have many waiters; report at the execution boundary.
+      await this.options.onError(error, sessionKey, message);
+    }
+  }
+
   /** Enqueues synchronously, preserving order relative to the following command. */
   flush(sessionKey: string): void {
     const batch = this.batches.get(sessionKey);
     if (!batch) return;
     clearTimeout(batch.timer);
     this.batches.delete(sessionKey);
-    void this.queue.enqueue(sessionKey, () => batch.handler(batch.message)).then(
+    void this.queue.enqueue(sessionKey, () => this.run(sessionKey, batch.message, batch.handler)).then(
       () => { for (const waiter of batch.waiters) waiter.resolve(); },
       (error) => { for (const waiter of batch.waiters) waiter.reject(error); },
     );

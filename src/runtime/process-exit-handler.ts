@@ -12,7 +12,8 @@ import { persistAgentSessionIdIfCurrent } from './agent-session-id.js';
 type SessionIdStore = Pick<SessionStore, 'getByKey' | 'updateAgentSessionId'>;
 
 export interface RuntimeProcessExitHandlerDeps {
-  onExit?: () => Promise<void>;
+  /** Return false when another task still owns the shared UI. */
+  onExit?: (context: AgentEventContext) => Promise<boolean | void>;
   sessionKey: SessionKey;
   store: SessionIdStore;
   stopTyping: (chatId: string) => void;
@@ -47,10 +48,10 @@ export function createRuntimeProcessExitHandler(
     const isCurrent = () => exitContext.isCurrent() && getCurrentContext(sk)?.signal === signal && !signal.aborted;
 
     console.log(`[pipeline] process_exited code=${code}`);
+    if (!exitContext.isCurrent() || getCurrentContext(sk)?.signal !== signal) return;
+    if (await deps.onExit?.(exitContext) === false) return;
+    if (!exitContext.isCurrent() || getCurrentContext(sk)?.signal !== signal) return;
     stopTyping(chatId);
-
-    if (!isCurrent()) return;
-    await deps.onExit?.();
     if (!isCurrent()) return;
 
     try {

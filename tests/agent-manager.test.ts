@@ -9,6 +9,13 @@ import { EventEmitter, Readable, Writable } from 'node:stream';
 import { mkdir, mkdtemp, rm, symlink } from 'node:fs/promises';
 import { join } from 'node:path';
 import { validateWorkingDirectory } from '../src/security/validators.js';
+import { TaskTracker } from '../src/runtime/task-tracker.js';
+import { PreparationGuard } from '../src/runtime/preparation-guard.js';
+import { createRuntimeProcessExitHandler } from '../src/runtime/process-exit-handler.js';
+import { createRuntimeEventHandler } from '../src/runtime/event-handler.js';
+import type { StreamingCardController } from '../src/platforms/feishu/cards.js';
+import type { RelayDeps } from '../src/relay/deliver.js';
+import { ChatQueue } from '../src/session/queue.js';
 import {
   bindSessionScopedBufferCleanup,
   commitVoiceSessionWhenContextReady,
@@ -362,7 +369,7 @@ describe('AgentManager', () => {
   it('rejects spawn when a previously valid working directory becomes an invalid symlink', async () => {
     const plugin = createMockPlugin();
     manager.registerPlugin(plugin);
-    const root = await mkdtemp(join(process.cwd(), '.agent-manager-'));
+    const root = await mkdtemp(join(process.cwd(), 'tests', '.agent-manager-'));
 
     try {
       const target = join(root, 'target');
@@ -865,6 +872,191 @@ describe('AgentManager', () => {
 
     expect(manager.getProcess(sessionKey)).toBeUndefined();
     expect(onProcessExit).toHaveBeenCalledWith(sessionKey, 0, expect.any(Object), undefined);
+  });
+
+  it.each(['attachment', 'transcription', 'card'])('CODE-S1-F01-QUEUE-PREPARATION preserves a queued turn across watchdog exit during %s preparation', async () => {
+    vi.useFakeTimers();
+    const key: SessionKey = 'feishu:chat_1:mock-agent';
+    const tasks = new TaskTracker();
+    const preparation = new PreparationGuard();
+    const queue = new ChatQueue();
+    let taskState = 'running';
+    const store = {
+      getByKey: vi.fn(), updateAgentSessionId: vi.fn(),
+      getPreferences: vi.fn(async () => ({ taskState })),
+      updatePreferences: vi.fn(async (_key: string, update: { taskState: string }, isCurrent: () => boolean) => {
+        if (isCurrent()) taskState = update.taskState;
+      }),
+    };
+    const onExit = vi.fn(async (context: import('../src/agents/manager.js').AgentEventContext) => {
+      const cancellation = tasks.cancel(key, context.signal);
+      if (cancellation.remaining) return false;
+      if ((await store.getPreferences()).taskState === 'running')
+        await store.updatePreferences(key, { taskState: 'interrupted' }, cancellation.isCurrent);
+      return cancellation.isCurrent();
+    });
+    const stopTyping = vi.fn();
+    const handlers = {
+      onEvent: vi.fn(), onToolBlocked: vi.fn(), onPermissionTimeout: vi.fn(),
+      onProcessExit: createRuntimeProcessExitHandler({
+        sessionKey: key, store, stopTyping, voiceSessions: new Map(),
+        voiceResponseBuffer: { value: '' }, sendVoiceReply: vi.fn(), onExit,
+        getCurrentContext: sk => manager.getCurrentContext(sk),
+      }),
+    };
+    const plugin = createMockPlugin();
+    manager.registerPlugin(plugin);
+    const spawnOpts = { workingDirectory: '/Users/test/project', permissionMode: 'blacklist' as const, idleTimeoutMs: 100 };
+    try {
+      const old = await manager.spawnAgent(key, plugin.name, spawnOpts, handlers) as MockAgentProcess;
+      const oldSignal = manager.getContextSignal(key)!;
+      tasks.begin(key).dispatch(oldSignal);
+      let release!: () => void;
+      const delayed = new Promise<void>(resolve => { release = resolve; });
+      let registered!: () => void;
+      const ready = new Promise<void>(resolve => { registered = resolve; });
+      const pending = queue.enqueue(key, async () => {
+        expect(manager.hasProcess(key)).toBe(true);
+        const task = tasks.begin(key);
+        const ensureReady = preparation.capture(key);
+        registered();
+        await delayed;
+        ensureReady();
+        if (!manager.hasProcess(key)) await manager.spawnAgent(key, plugin.name, spawnOpts, handlers);
+        expect(manager.sendMessage(key, plugin.name, { role: 'user', content: 'prepared message' })).toBe(true);
+        task.dispatch(manager.getContextSignal(key)!);
+      });
+      await ready;
+      await vi.advanceTimersByTimeAsync(100);
+      expect(old.kill).toHaveBeenCalledWith('SIGTERM');
+      expect(oldSignal.aborted).toBe(true);
+      old.emitExit(1);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(onExit).toHaveBeenCalledOnce();
+      expect(stopTyping).not.toHaveBeenCalled();
+      expect(store.updatePreferences).not.toHaveBeenCalled();
+      expect(taskState).toBe('running');
+      expect(tasks.size()).toBe(1);
+      expect(plugin.spawn).toHaveBeenCalledTimes(1);
+      release();
+      await pending;
+      expect(plugin.spawn).toHaveBeenCalledTimes(2);
+      const replacementSignal = manager.getContextSignal(key)!;
+      expect(replacementSignal).not.toBe(oldSignal);
+      expect(tasks.cancel(key, oldSignal).remaining).toBe(1);
+      expect(taskState).toBe('running');
+      expect(tasks.size()).toBe(1);
+      expect(tasks.finish(key, replacementSignal).remaining).toBe(0);
+      expect(tasks.size()).toBe(0);
+    } finally {
+      manager.killAgent(key);
+      vi.useRealTimers();
+    }
+  });
+
+  it.each(['attachment', 'transcription', 'card'])('CODE-S1-F01-REPLACED-OWNER-LEAK completes a replacement started before old exit after %s preparation', async () => {
+    vi.useFakeTimers();
+    const key: SessionKey = 'feishu:chat_1:mock-agent';
+    const tasks = new TaskTracker();
+    const preparation = new PreparationGuard();
+    const queue = new ChatQueue();
+    let taskState = 'running';
+    const store = {
+      getByKey: vi.fn(), updateAgentSessionId: vi.fn(),
+      getPreferences: vi.fn(async () => ({ taskState })),
+      updatePreferences: vi.fn(async (_key: string, update: { taskState: string }, isCurrent: () => boolean) => {
+        if (isCurrent()) taskState = update.taskState;
+      }),
+    };
+    const onExit = vi.fn(async (context: import('../src/agents/manager.js').AgentEventContext) => {
+      const cancellation = tasks.cancel(key, context.signal);
+      if (cancellation.remaining) return false;
+      if ((await store.getPreferences()).taskState === 'running')
+        await store.updatePreferences(key, { taskState: 'interrupted' }, cancellation.isCurrent);
+      return cancellation.isCurrent();
+    });
+    let remainingAfterResult: number | undefined;
+    const onTerminal = vi.fn(async (state: string, _text: string, context: import('../src/agents/manager.js').AgentEventContext) => {
+      const completion = tasks.finish(key, context.signal);
+      remainingAfterResult = completion.remaining;
+      await store.updatePreferences(key, { taskState: completion.remaining ? 'running' : state }, completion.isCurrent);
+    });
+    const cardController = { handleEvent: vi.fn(), interruptCard: vi.fn() };
+    const stopTyping = vi.fn();
+    const deps = {
+      sessionKey: key, store, stopTyping, voiceSessions: new Map(),
+      voiceResponseBuffer: { value: '' }, sendVoiceReply: vi.fn(),
+      cardController: cardController as unknown as StreamingCardController,
+    };
+    const handlers = {
+      onEvent: createRuntimeEventHandler({
+        ...deps, onTerminal, relayDeps: {} as RelayDeps, relayToOtherBotsFn: vi.fn(),
+      }),
+      onToolBlocked: vi.fn(), onPermissionTimeout: vi.fn(),
+      onProcessExit: createRuntimeProcessExitHandler({
+        ...deps, onExit, getCurrentContext: sk => manager.getCurrentContext(sk),
+      }),
+    };
+    const plugin = createMockPlugin();
+    manager.registerPlugin(plugin);
+    const spawnOpts = { workingDirectory: '/Users/test/project', permissionMode: 'blacklist' as const, idleTimeoutMs: 100 };
+    try {
+      const old = await manager.spawnAgent(key, plugin.name, spawnOpts, handlers) as MockAgentProcess;
+      const oldSignal = manager.getContextSignal(key)!;
+      tasks.begin(key).dispatch(oldSignal);
+      let release!: () => void;
+      const delayed = new Promise<void>(resolve => { release = resolve; });
+      let registered!: () => void;
+      const ready = new Promise<void>(resolve => { registered = resolve; });
+      const pending = queue.enqueue(key, async () => {
+        const task = tasks.begin(key);
+        const ensureReady = preparation.capture(key);
+        registered();
+        await delayed;
+        ensureReady();
+        if (!manager.hasProcess(key)) await manager.spawnAgent(key, plugin.name, spawnOpts, handlers);
+        expect(manager.sendMessage(key, plugin.name, { role: 'user', content: 'prepared message' })).toBe(true);
+        task.dispatch(manager.getContextSignal(key)!);
+      });
+      await ready;
+      await vi.advanceTimersByTimeAsync(100);
+      expect(oldSignal.aborted).toBe(true);
+      expect(old.kill).toHaveBeenCalledWith('SIGTERM');
+      expect(manager.hasProcess(key)).toBe(false);
+      // Start the replacement while the aborted old process has not emitted exit.
+      release();
+      await pending;
+      expect(plugin.spawn).toHaveBeenCalledTimes(2);
+      const replacement = manager.getProcess(key)! as MockAgentProcess;
+      const replacementSignal = manager.getContextSignal(key)!;
+      expect(replacementSignal).not.toBe(oldSignal);
+      old.emitExit(1);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(onExit).not.toHaveBeenCalled();
+      expect(stopTyping).not.toHaveBeenCalled();
+      expect(cardController.interruptCard).not.toHaveBeenCalled();
+      expect(cardController.handleEvent).not.toHaveBeenCalled();
+      expect(store.updatePreferences).not.toHaveBeenCalled();
+      expect(taskState).toBe('running');
+      expect(tasks.size()).toBe(1);
+      expect(manager.getProcess(key)).toBe(replacement);
+      replacement.stdout.push({ type: 'result', sessionId: 'replacement-session' } satisfies AgentEvent);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(onTerminal).toHaveBeenCalledOnce();
+      expect(remainingAfterResult).toBe(0);
+      expect(taskState).toBe('completed');
+      expect(tasks.size()).toBe(0);
+      expect(tasks.keys()).toEqual([]);
+      expect(cardController.handleEvent).toHaveBeenCalledWith(key, expect.objectContaining({ type: 'result' }), { signal: replacementSignal });
+      replacement.emitExit(0);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(onExit).toHaveBeenCalledOnce();
+      expect(taskState).toBe('completed');
+      expect(tasks.size()).toBe(0);
+    } finally {
+      manager.killAgent(key);
+      vi.useRealTimers();
+    }
   });
 
   it('kills a watched process when idle timeout expires and resets timeout on activity', async () => {

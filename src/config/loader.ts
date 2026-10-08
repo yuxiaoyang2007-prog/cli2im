@@ -192,6 +192,7 @@ function validateBotConfig(name: string, bot: BotConfig): void {
   if (typeof bot.workingDirectory !== 'string' || !bot.workingDirectory.trim()) {
     throw new Error(`Config error: bot "${name}" workingDirectory must be a path`);
   }
+  if (bot.permissionMode === undefined) bot.permissionMode = 'blacklist';
   if (bot.permissionMode !== 'bypass' && bot.permissionMode !== 'blacklist') {
     throw new Error(`Config error: bot "${name}" permissionMode must be bypass or blacklist`);
   }

@@ -7,9 +7,29 @@ import {
   parseTelegramCallback,
   parseTelegramUpdate,
 } from '../src/platforms/telegram/adapter.js';
+import { getGroupMessageSkipReason } from '../src/pipeline.js';
+import type { BotConfig } from '../src/types.js';
 import { MAX_ATTACHMENT_DOWNLOAD_BYTES } from '../src/security/download-limits.js';
+import { createCallbackHandler } from '../src/index.js';
+import { ChatQueue } from '../src/session/queue.js';
 
 describe('parseTelegramUpdate', () => {
+  it('F10 accepts an explicit Telegram mention and rejects an unrelated mention', () => {
+    const make = (username: string) => parseTelegramUpdate({ message: {
+      message_id: 1, chat: { id: -1, type: 'supergroup' }, from: { id: 42 },
+      text: `😀 @${username} hi`, entities: [{ type: 'mention', offset: 3, length: username.length + 1 }],
+    } })!;
+    const bot = { requireMention: true } as BotConfig;
+    expect(getGroupMessageSkipReason(make('MyBot'), bot, '@mybot')).toBeUndefined();
+    expect(getGroupMessageSkipReason(make('OtherBot'), bot, '@mybot')).toBe('Bot mention required');
+  });
+
+  it('F11 ignores thread ids on non-topic messages and callbacks', () => {
+    const message = { message_id: 11, message_thread_id: 55, chat: { id: -1001, type: 'supergroup' }, from: { id: 42 }, text: 'reply' };
+    expect(parseTelegramUpdate({ message })?.threadId).toBeUndefined();
+    expect(parseTelegramCallback({ callback_query: { message, from: { id: 42 }, data: 'status' } })?.threadId).toBeUndefined();
+  });
+
   it('parses text messages', () => {
     const msg = parseTelegramUpdate({
       update_id: 1,
@@ -33,7 +53,7 @@ describe('parseTelegramUpdate', () => {
   });
 
   it('carries the same platform topic identity from messages and callbacks', () => {
-    const message = { message_id: 11, message_thread_id: 55, chat: { id: -1001, type: 'supergroup' }, from: { id: 42 }, text: 'hello' };
+    const message = { is_topic_message: true, message_id: 11, message_thread_id: 55, chat: { id: -1001, type: 'supergroup' }, from: { id: 42 }, text: 'hello' };
     expect(parseTelegramUpdate({ message })).toMatchObject({ messageId: '11', threadId: '55' });
     expect(parseTelegramCallback({ callback_query: { message, from: { id: 42 }, data: 'status' } })).toMatchObject({ messageId: '11', threadId: '55' });
   });
@@ -134,9 +154,15 @@ describe('parseTelegramCallback', () => {
 
 describe('TelegramAdapter', () => {
   const originalFetch = globalThis.fetch;
+  const apiPrototype = TelegramAdapter.prototype as unknown as { botApi(method: string, ...args: unknown[]): Promise<unknown> };
+  const originalBotApi = apiPrototype.botApi;
 
   beforeEach(() => {
     vi.useFakeTimers();
+    vi.spyOn(apiPrototype, 'botApi').mockImplementation(function (this: TelegramAdapter, method, ...args) {
+      if (method === 'getMe') return Promise.resolve({ id: 123, username: 'MyBot' });
+      return originalBotApi.call(this, method, ...args);
+    });
     vi.stubGlobal(
       'fetch',
       vi.fn(async (input: RequestInfo | URL) => {
@@ -157,9 +183,156 @@ describe('TelegramAdapter', () => {
 
   afterEach(() => {
     vi.useRealTimers();
+    vi.restoreAllMocks();
     vi.unstubAllGlobals();
     vi.unstubAllEnvs();
     globalThis.fetch = originalFetch;
+  });
+
+  it('F10 resolves the bot username before polling and admits control-panel mentions', async () => {
+    const adapter = new TelegramAdapter({ token: 'TOKEN', botName: 'different-local-name' });
+    vi.spyOn(adapter as unknown as { readOffset(): number }, 'readOffset').mockReturnValue(0);
+    await adapter.connect();
+    expect(adapter.getBotOpenId()).toBe('@mybot');
+    expect(getGroupMessageSkipReason({ platform: 'telegram', chatId: '-1', userId: '42',
+      chatType: 'supergroup', text: '/status', mentions: [adapter.getBotOpenId()!] },
+      { requireMention: true } as BotConfig, adapter.getBotOpenId())).toBeUndefined();
+    await adapter.disconnect();
+  });
+
+  it('ADDRESSED-COMMAND normalizes the current bot command before dispatch and drops other bot commands', async () => {
+    const adapter = new TelegramAdapter({ token: 'TOKEN', botName: 'local-name' });
+    vi.spyOn(adapter as unknown as { readOffset(): number }, 'readOffset').mockReturnValue(0);
+    const received = vi.fn();
+    adapter.onMessage(received);
+    await adapter.connect();
+    const dispatch = adapter as unknown as { dispatchUpdate(update: unknown): void };
+    for (const username of ['MyBot', 'OtherBot']) {
+      const text = `/stop@${username}`;
+      dispatch.dispatchUpdate({ message: { chat: { id: -1, type: 'supergroup' }, from: { id: 42 },
+        text, entities: [{ type: 'bot_command', offset: 0, length: text.length }] } });
+    }
+    expect(received).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ text: '/stop', mentions: ['@mybot'] }));
+    await adapter.disconnect();
+  });
+
+  it('IDENTITY-RECOVERY restores mentions and control-panel admission after the first lookup fails', async () => {
+    vi.mocked(apiPrototype.botApi).mockRejectedValueOnce(
+      new Error('request failed: https://api.telegram.org/botTOKEN/getMe'),
+    );
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    const adapter = new TelegramAdapter({ token: 'TOKEN', botName: 'bot' });
+    const readOffset = vi.spyOn(adapter as unknown as { readOffset(): number }, 'readOffset').mockReturnValue(9);
+    const controls = vi.fn();
+    const botConfig = { requireMention: true, allowFrom: ['42'] } as BotConfig;
+    adapter.onCallback(createCallbackHandler({
+      botName: 'bot', botConfig, adapter, store: {} as never, agentManager: {} as never,
+      handoffService: {} as never, queue: new ChatQueue(),
+      handleControl: async (callback, text) => {
+        const msg = { ...callback, text, mentions: adapter.getBotOpenId() ? [adapter.getBotOpenId()!] : [] };
+        if (!getGroupMessageSkipReason(msg, botConfig, adapter.getBotOpenId())) controls(text);
+      },
+    }));
+    const dispatch = adapter as unknown as { dispatchUpdate(update: unknown): void };
+    const panelUpdate = { callback_query: { from: { id: 42 }, data: 'control:status',
+      message: { message_id: 1, chat: { id: -1, type: 'supergroup' } } } };
+
+    try {
+      await expect(adapter.connect()).resolves.toBeUndefined();
+      expect(adapter.getBotOpenId()).toBeUndefined();
+      dispatch.dispatchUpdate(panelUpdate);
+      expect(controls).not.toHaveBeenCalled();
+      expect(readOffset).toHaveBeenCalledOnce();
+      expect(getGroupMessageSkipReason({ platform: 'telegram', chatId: '-1', userId: '42',
+        chatType: 'supergroup', text: '/status', mentions: ['@mybot'] },
+        { requireMention: true } as BotConfig, adapter.getBotOpenId())).toBe('Bot mention required');
+
+      await vi.advanceTimersByTimeAsync(0);
+      expect(fetch).toHaveBeenCalledOnce();
+      expect(fetch).toHaveBeenCalledWith(
+        'https://api.telegram.org/botTOKEN/getUpdates',
+        expect.objectContaining({ body: JSON.stringify({ offset: 9, timeout: 50, allowed_updates: ['message', 'callback_query'] }) }),
+      );
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(fetch).toHaveBeenCalledTimes(2);
+      expect(adapter.getBotOpenId()).toBe('@mybot');
+      const mentioned = parseTelegramUpdate({ message: { chat: { id: -1, type: 'supergroup' }, from: { id: 42 },
+        text: '@MyBot hello', entities: [{ type: 'mention', offset: 0, length: 6 }] } })!;
+      expect(getGroupMessageSkipReason(mentioned, { requireMention: true } as BotConfig, adapter.getBotOpenId())).toBeUndefined();
+      dispatch.dispatchUpdate(panelUpdate);
+      expect(controls).toHaveBeenCalledExactlyOnceWith('/status');
+      expect(warn.mock.calls).toEqual([['Telegram identity lookup failed; continuing polling.']]);
+    } finally {
+      await adapter.disconnect();
+    }
+  });
+
+  it('IDENTITY-RECOVERY backs off repeated lookups while polling and cancels a scheduled retry on disconnect', async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const lookup = vi.fn(async () => { throw new Error('offline'); });
+    vi.mocked(apiPrototype.botApi).mockImplementation(function (this: TelegramAdapter, method, ...args) {
+      return method === 'getMe' ? lookup() : originalBotApi.call(this, method, ...args);
+    });
+    const adapter = new TelegramAdapter({ token: 'TOKEN', botName: 'bot' });
+    vi.spyOn(adapter as unknown as { readOffset(): number }, 'readOffset').mockReturnValue(0);
+    await adapter.connect();
+    expect(lookup).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(lookup).toHaveBeenCalledTimes(2);
+    await vi.advanceTimersByTimeAsync(1999);
+    expect(lookup).toHaveBeenCalledTimes(2);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(lookup).toHaveBeenCalledTimes(3);
+    expect(fetch).toHaveBeenCalledTimes(4);
+    await adapter.disconnect();
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(lookup).toHaveBeenCalledTimes(3);
+    expect(fetch).toHaveBeenCalledTimes(4);
+  });
+
+  it('IDENTITY-RECOVERY aborts an in-flight retry and ignores its late identity across reconnect', async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    let resolveOld!: (identity: unknown) => void;
+    let retrySignal: AbortSignal | undefined;
+    let lookups = 0;
+    vi.mocked(apiPrototype.botApi).mockImplementation(function (this: TelegramAdapter, method, ...args) {
+      if (method !== 'getMe') return originalBotApi.call(this, method, ...args);
+      if (++lookups === 1) return Promise.reject(new Error('offline'));
+      if (lookups === 2) {
+        retrySignal = (args[1] as { signal: AbortSignal }).signal;
+        return new Promise(resolve => { resolveOld = resolve; });
+      }
+      return Promise.resolve({ username: 'NewBot' });
+    });
+    const adapter = new TelegramAdapter({ token: 'TOKEN', botName: 'bot' });
+    vi.spyOn(adapter as unknown as { readOffset(): number }, 'readOffset').mockReturnValue(0);
+    await adapter.connect();
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(retrySignal?.aborted).toBe(false);
+    expect(fetch).toHaveBeenCalledTimes(2);
+    await adapter.disconnect();
+    expect(retrySignal?.aborted).toBe(true);
+    await adapter.connect();
+    expect(adapter.getBotOpenId()).toBe('@newbot');
+    resolveOld({ username: 'OldBot' });
+    await vi.advanceTimersByTimeAsync(3000);
+    expect(adapter.getBotOpenId()).toBe('@newbot');
+    expect(lookups).toBe(3);
+    await adapter.disconnect();
+  });
+
+  it('F10 does not poll after disconnect during identity lookup', async () => {
+    let resolveIdentity!: (value: unknown) => void;
+    vi.mocked(apiPrototype.botApi).mockImplementationOnce(() => new Promise(resolve => { resolveIdentity = resolve; }));
+    const adapter = new TelegramAdapter({ token: 'TOKEN', botName: 'bot' });
+    const readOffset = vi.spyOn(adapter as unknown as { readOffset(): number }, 'readOffset').mockReturnValue(0);
+    const connecting = adapter.connect();
+    await adapter.disconnect();
+    resolveIdentity({ username: 'OldBot' });
+    await connecting;
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(readOffset).not.toHaveBeenCalled();
+    expect(fetch).not.toHaveBeenCalled();
   });
 
   it('sends, edits, deletes, uploads, and downloads through the Bot API', async () => {
