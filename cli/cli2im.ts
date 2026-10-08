@@ -1,3 +1,6 @@
+import { createRequire } from 'node:module';
+// Standalone ESM bundles include CommonJS dependencies used by the local doctor.
+(globalThis as typeof globalThis & { require: NodeRequire }).require = createRequire(import.meta.url);
 import { parseArgs } from 'node:util';
 
 const DEFAULT_HOST = '127.0.0.1';
@@ -14,6 +17,12 @@ async function main(): Promise<void> {
 
   if (command === 'handoff') {
     await handleHandoff(args.slice(1));
+    return;
+  }
+
+  if (command === 'doctor' && args[1] === 'isolation') {
+    const { doctorIsolation } = await import('./isolation.js');
+    process.exitCode = await doctorIsolation(args.slice(2));
     return;
   }
 
@@ -124,6 +133,7 @@ Commands:
   status    Show CLI2IM daemon status
   bots      List bots, or start/stop/restart one bot
   doctor    Inspect local runtime and configured services
+  doctor isolation [--config <path>]  Run local isolation checks
   help      Show this help
 
 Handoff:

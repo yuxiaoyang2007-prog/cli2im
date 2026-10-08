@@ -4,6 +4,10 @@ import { isAbsolute } from 'node:path';
 import type { IsolationPolicy } from './policy.js';
 import { contains, RUNTIME_READ_EXCEPTIONS } from './policy.js';
 
+export class SandboxReadError extends Error {
+  constructor(readonly category: 'PERMISSION' | 'ENOENT' | 'OTHER') { super('Isolation outbound read denied'); }
+}
+
 export const MAX_OUTBOUND_BYTES = 30 * 1024 * 1024;
 const quote = (value: string) => JSON.stringify(value);
 const subtree = (path: string) => `(subpath ${quote(path)})`;
@@ -42,11 +46,13 @@ export function sandboxReadFile(path: string, policy: IsolationPolicy, options: 
       if (size > (options.maxBytes ?? MAX_OUTBOUND_BYTES)) { failure = new Error('Outbound file exceeds size limit'); child.kill('SIGKILL'); }
       else chunks.push(chunk);
     });
-    child.stderr.resume(); // No agent-controlled paths or file contents in diagnostics.
+    let diagnostics = '';
+    child.stderr.on('data', (chunk: Buffer) => { if (diagnostics.length < 4096) diagnostics += chunk.toString().slice(0, 4096 - diagnostics.length); });
     child.once('error', () => { clearTimeout(timer); reject(new Error('Isolation outbound sandbox unavailable')); });
     child.once('close', code => {
       clearTimeout(timer);
-      if (failure || code !== 0) reject(failure ?? new Error('Isolation outbound read denied'));
+      if (failure || code !== 0) reject(failure ?? new SandboxReadError(/Operation not permitted|Permission denied|EACCES|EPERM/i.test(diagnostics)
+        ? 'PERMISSION' : /No such file|ENOENT/i.test(diagnostics) ? 'ENOENT' : 'OTHER'));
       else resolve(Buffer.concat(chunks));
     });
   });

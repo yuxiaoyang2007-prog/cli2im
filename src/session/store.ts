@@ -1,5 +1,6 @@
 import { canResumeIsolated } from '../isolation/provenance.js';
-import initSqlJs, { type Database, type SqlJsStatic } from 'sql.js';
+import type initSqlJsModule from 'sql.js';
+import type { Database, SqlJsStatic } from 'sql.js';
 import { randomUUID } from 'node:crypto';
 import { basename, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -30,6 +31,8 @@ import type {
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const require = createRequire(import.meta.url);
+// Keep the CommonJS/WASM loader external in both daemon and standalone doctor bundles.
+const initSqlJs: typeof initSqlJsModule = require('sql.js');
 const sqlWasmDir = dirname(require.resolve('sql.js/dist/sql-wasm.wasm'));
 const SQLITE_HEADER = Buffer.from('SQLite format 3\0', 'ascii');
 const EXPECTED_SESSION_COLUMNS = new Set([

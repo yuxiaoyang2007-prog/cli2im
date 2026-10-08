@@ -1,13 +1,13 @@
 import { spawn } from 'node:child_process';
 import { createInterface } from 'node:readline';
-import { buildChildEnv } from '../security/child-env.js';
-import { codexConfigSources, codexPermissionArgs, tomlString } from '../isolation/codex.js';
+import { agentChildEnv, codexCheckArgs } from '../isolation/check-options.js';
+import { codexConfigSources, codexPermissionArgs, prepareCodexHome, tomlString } from '../isolation/codex.js';
 import type { SpawnOpts } from '../types.js';
 import type { CodexInput, CodexThread, CodexThreadEvent } from './codex.js';
 
 export function codexExecArgs(opts: SpawnOpts, sessionId?: string, images: string[] = []): string[] {
   if (!opts.isolation) throw new Error('Codex exec adapter requires isolation');
-  const args = ['exec', '--json', ...codexPermissionArgs(opts.isolation), '--skip-git-repo-check', '-C', opts.workingDirectory,
+  const args = ['exec', '--json', ...codexPermissionArgs(opts.isolation), ...codexCheckArgs(opts), '--skip-git-repo-check', '-C', opts.workingDirectory,
     '-c', `approval_policy=${tomlString(opts.autoApprove || opts.permissionMode === 'bypass' ? 'never' : 'on-request')}`];
   if (opts.model) args.push('--model', opts.model);
   if (opts.reasoningEffort) args.push('-c', `model_reasoning_effort=${tomlString(opts.reasoningEffort)}`);
@@ -20,24 +20,31 @@ export function codexExecArgs(opts: SpawnOpts, sessionId?: string, images: strin
 }
 
 /** Same turn/event contract as the SDK; a fresh exec process for each turn. */
-export function createCodexExecThread(binary: string, opts: SpawnOpts, initialId?: string): CodexThread {
+export function createCodexExecThread(opts: SpawnOpts, initialId?: string): CodexThread {
   let sessionId = initialId;
   return {
     async runStreamed(input: CodexInput, { signal } = {}) {
-      const env = buildChildEnv('codex', opts.env);
-      codexConfigSources(opts.workingDirectory, env.HOME ?? '/');
+      const env = agentChildEnv('codex', opts);
+      if (!opts.isolation?.codexHome || env.CODEX_HOME !== opts.isolation.codexHome) throw new Error('Isolated Codex requires its bridge-owned home');
+      prepareCodexHome(env.CODEX_HOME);
+      codexConfigSources(opts.workingDirectory, env);
       const parts = typeof input === 'string' ? [{ type: 'text' as const, text: input }] : input;
       const images = parts.flatMap(p => p.type === 'local_image' ? [p.path] : []);
       const prompt = parts.flatMap(p => p.type === 'text' ? [p.text] : []).join('\n\n');
       async function* events(): AsyncIterable<CodexThreadEvent> {
         if (signal?.aborted) throw new Error('Codex exec cancelled');
-        const child = spawn(binary, codexExecArgs(opts, sessionId, images), { cwd: opts.workingDirectory, env, stdio: ['pipe', 'pipe', 'pipe'] });
-        const cancel = () => child.kill('SIGTERM');
+        const child = spawn(opts.isolation!.binaryPath, codexExecArgs(opts, sessionId, images), { cwd: opts.workingDirectory, env, stdio: ['pipe', 'pipe', 'pipe'] });
+        let killTimer: ReturnType<typeof setTimeout> | undefined;
+        const cancel = () => {
+          child.kill('SIGTERM');
+          killTimer ??= setTimeout(() => { if (child.exitCode === null) child.kill('SIGKILL'); }, 1000);
+          killTimer.unref();
+        };
         signal?.addEventListener('abort', cancel, { once: true });
         let failure: Error | undefined;
         const closed = new Promise<number | null>(resolve => {
           child.on('error', error => { failure = error; });
-          child.on('close', resolve);
+          child.on('close', code => { clearTimeout(killTimer); resolve(code); });
         });
         child.stdin.on('error', () => { failure ??= new Error('Codex exec input failed'); });
         // Diagnostics may contain prompts or credentials; never forward stderr.
@@ -64,7 +71,7 @@ export function createCodexExecThread(binary: string, opts: SpawnOpts, initialId
         } finally {
           lines.close();
           signal?.removeEventListener('abort', cancel);
-          if (child.exitCode === null) child.kill('SIGTERM');
+          if (child.exitCode === null) cancel();
         }
       }
       return { events: events() };

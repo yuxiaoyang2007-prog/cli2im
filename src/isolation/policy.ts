@@ -1,16 +1,19 @@
 import { createHash } from 'node:crypto';
 import { lstatSync, readdirSync, readFileSync, readlinkSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
+import { basename, delimiter, dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { canonicalPath } from '../runtime/execution-scope.js';
 import { getCli2imDataDir } from '../util/data-dir.js';
 import type { AppConfig, BotConfig, SpawnOpts } from '../types.js';
 import { compileClaudeSettings, validateClaudePlugins } from './claude.js';
-import { codexConfigSources, codexPermissionArgs } from './codex.js';
+import { codexConfigEnvironment, codexConfigSources, codexPermissionArgs, type CodexConfigEnv, isolatedCodexHome, isolationEnvironment } from './codex.js';
 import { assertSupportedIsolationAgent } from './supported.js';
 
 export interface IsolationPolicy {
+  binaryPath: string;
+  searchPath: string[];
+  searchPathDenied: string[];
   scopeKey: string;
   workspace: string;
   tmpdir: string;
@@ -24,6 +27,8 @@ export interface IsolationPolicy {
   plugins: string[];
   skills: string[];
   fingerprint: string;
+  codexHome?: string;
+  developerDir?: string;
 }
 export interface PolicyPaths {
   home: string; dataDir: string; memoryDir: string; installDir: string; claudeTmpRoot: string;
@@ -69,6 +74,33 @@ const sensitiveHome = (home: string) => ['.claude', '.claude.json', '.codex', '.
   '.zshrc', '.zshenv', '.zprofile', '.zlogin', '.bashrc', '.bash_profile', '.profile', '.bash_login'].map(p => join(home, p));
 export function isolationWritablePaths(config: Pick<AppConfig, 'bots'>, paths: PolicyPaths): string[] {
   return normalized(scopes(config, paths).flatMap(s => s.writable));
+}
+export function isolationSearchPathDenied(config: Pick<AppConfig, 'bots'>, paths: PolicyPaths): string[] {
+  return normalized([...isolationWritablePaths(config, paths), join(paths.dataDir, 'inbox')]);
+}
+/** Preserve lookup spelling, but check both literal and canonical containment. */
+export function validateIsolationSearchPath(value: string | undefined, denied: string[]): string[] {
+  const entries = (value ?? '').split(delimiter);
+  if (entries.some(entry => {
+    const segments = entry.split('/');
+    // Reject before canonicalPath can fold segments ahead of symlink resolution.
+    if (!entry || !isAbsolute(entry) || segments.some(segment => segment === '.' || segment === '..')) return true;
+    const literal = '/' + segments.filter(Boolean).join('/');
+    const canonical = canonicalPath(entry);
+    return denied.some(root => {
+      const deniedRoot = canonicalPath(root);
+      return contains(deniedRoot, literal) || contains(deniedRoot, canonical);
+    });
+  })) {
+    throw new Error('UNSUPPORTED: Isolation PATH contains an empty, relative, dot-segment or agent-writable entry');
+  }
+  return entries;
+}
+export function assertIsolationSearchPath(env: NodeJS.ProcessEnv, policy: IsolationPolicy): void {
+  const entries = validateIsolationSearchPath(env.PATH, policy.searchPathDenied);
+  if (stableJSON(entries) !== stableJSON(policy.searchPath)) {
+    throw new Error('UNSUPPORTED: Isolation PATH differs from the verified policy');
+  }
 }
 function unsafeWorkspace(path: string, paths: PolicyPaths): boolean {
   const home = canonicalPath(paths.home);
@@ -140,7 +172,7 @@ export function assertAgentsFile(bot: BotConfig, writable: string[]): string | u
 }
 // Runtime-only OS/toolchain directories from PLAN 5.2; no HOME, Homebrew var or shared tmp grant.
 // Root and /dev are directory literals in SBPL, never recursive filesystem grants.
-export const RUNTIME_READ = ['/', '/bin', '/sbin', '/usr', '/System', '/private/etc', '/private/var/db/dyld', '/Library/Apple',
+export const RUNTIME_READ = ['/', '/bin', '/sbin', '/usr', '/System', '/private/etc', '/private/var/select', '/private/var/db/dyld', '/Library/Apple',
   '/dev', '/dev/null', '/dev/zero', '/dev/urandom', '/dev/random', '/dev/fd', '/dev/dtracehelper',
   '/Library/Developer/CommandLineTools', ...['bin', 'sbin', 'lib', 'libexec', 'opt', 'Cellar', 'share', 'etc', 'include', 'Frameworks'].map(p => `/opt/homebrew/${p}`)];
 // Only this OS runtime subtree may override the /private/var/db hard denial.
@@ -162,11 +194,14 @@ function pluginHash(root: string): string {
 export function buildIsolationPolicy(params: {
   config: Pick<AppConfig, 'bots' | 'memory'>; botName: string; workspace: string;
   paths?: PolicyPaths; binaryPath: string; identityMapping?: unknown; production?: IsolationProductionParameters; sdkVersions?: unknown; uid?: number;
+  effectiveEnv: CodexConfigEnv & { PATH?: string; DEVELOPER_DIR?: string };
 }): IsolationPolicy {
   const { config, botName } = params;
   const paths = params.paths ?? policyPaths(config);
   validateIsolationConfig(config, paths);
   const bot = config.bots[botName];
+  const searchPathDenied = isolationSearchPathDenied(config, paths);
+  const searchPath = validateIsolationSearchPath(params.effectiveEnv.PATH, searchPathDenied);
   const workspace = canonicalPath(params.workspace);
   const all = scopes(config, paths);
   const own = all.find(s => s.bot === botName && s.workspace === workspace);
@@ -183,16 +218,19 @@ export function buildIsolationPolicy(params: {
   if (contains(binaryDirectory, canonicalPath(paths.home)) || all.some(s => contains(binaryDirectory, s.workspace))) {
     throw new Error('Isolation executable directory is too broad or agent-writable');
   }
-  const runtimeRead = normalized([...RUNTIME_READ, binaryDirectory]);
+  const runtimeRead = [...new Set([...RUNTIME_READ, binaryDirectory].map(path =>
+    path.startsWith('/dev/') && RUNTIME_READ.includes(path) ? path : canonicalPath(path)))].sort();
   const hardDeny = normalized(['.claude', '.claude.json', '.codex', '.gemini', '.cli2im', 'Library', '.ssh', '.gnupg', '.aws', '.config',
     '.zshrc', '.zshenv', '.zprofile', '.zlogin', '.bashrc', '.bash_profile', '.profile', '.bash_login'].map(p => join(paths.home, p)).concat([
     ...systemHardDeny,
     paths.dataDir, paths.memoryDir, paths.installDir, ...plugins,
     ...all.filter(s => s !== own).flatMap(s => s.writable),
   ]));
-  const policy = { scopeKey: workspace, workspace, tmpdir, inbox, readable, writable: own.writable, runtimeRead, hardDeny,
+  const codexHome = bot.agent === 'codex' ? isolatedCodexHome(paths.dataDir, botName) : undefined;
+  const developerDir = isolationEnvironment({}).DEVELOPER_DIR;
+  const policy = { binaryPath: canonicalPath(params.binaryPath), searchPath, searchPathDenied, codexHome, developerDir, scopeKey: workspace, workspace, tmpdir, inbox, readable, writable: own.writable, runtimeRead, hardDeny,
     readExceptions: normalized([...own.writable, inbox, ...(bot.isolation?.readable ?? [])]),
-    tools: bot.agent === 'claude-code' ? ['Bash', 'WebFetch', 'WebSearch', 'TodoWrite', ...(plugins.length ? ['Skill'] : [])] : [],
+    tools: bot.agent === 'claude-code' ? ['Bash', 'WebFetch', 'WebSearch', ...(plugins.length ? ['Skill'] : [])] : [],
     plugins, skills: [...(bot.skills ?? [])].sort() };
   let launchPolicy: unknown;
   if (bot.agent === 'claude-code') {
@@ -200,7 +238,9 @@ export function buildIsolationPolicy(params: {
     launchPolicy = { settings: compileClaudeSettings({ ...policy, fingerprint: '' }, paths.home),
       extraArgs: { restricted: null }, settingSources: [], strictMcpConfig: true, mcpServers: {}, tools: policy.tools };
   } else if (bot.agent === 'codex') {
-    launchPolicy = { args: codexPermissionArgs({ ...policy, fingerprint: '' }), sources: codexConfigSources(workspace, paths.home, paths.codexSystemConfigs) };
+    const environment = codexConfigEnvironment({ ...params.effectiveEnv, HOME: params.effectiveEnv?.HOME ?? paths.home, CODEX_HOME: codexHome });
+    launchPolicy = { args: codexPermissionArgs({ ...policy, fingerprint: '' }), environment,
+      sources: codexConfigSources(workspace, environment, paths.codexSystemConfigs) };
   }
   const binaryStat = statSync(params.binaryPath);
   const production = params.production;

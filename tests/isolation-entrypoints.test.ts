@@ -30,7 +30,7 @@ describe('slice 5 all resume entrypoints and controls', () => {
     const expected = { bot: 'bot', principal: 'person:alice', scope: f.workspace, policyFingerprint: p.fingerprint, memoryGeneration: 1 };
     const spawn = vi.fn();
     const resume = vi.fn(async (_callback: unknown, sessionId: string) => {
-      assertIsolationAdmission({ verification, policy: p, binary, expected, env: {}, sessionId,
+      assertIsolationAdmission({ verification, policy: p, binary, expected, env: { PATH: '/usr/bin:/bin' }, sessionId,
         provenance: { ...expected, agentSessionId: sessionId, memoryGeneration: 0 } });
       spawn();
     });

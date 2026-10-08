@@ -392,7 +392,7 @@ export class CodexPlugin implements AgentPlugin {
   }): Promise<void> {
     const codex = args.opts.isolation ? undefined : new (await loadCodexSdk()).Codex(createCodexClientOptions(args.opts, this.binary));
     let thread = args.opts.isolation
-      ? createCodexExecThread(this.binary, args.opts, args.resumeSessionId)
+      ? createCodexExecThread(args.opts, args.resumeSessionId)
       : args.resumeSessionId
         ? codex!.resumeThread(args.resumeSessionId, createThreadOptions(args.opts))
         : codex!.startThread(createThreadOptions(args.opts));

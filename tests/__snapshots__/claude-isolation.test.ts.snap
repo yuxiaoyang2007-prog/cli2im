@@ -30,6 +30,7 @@ exports[`slice 6 Claude isolation > integration: SDK options snapshot, isolation
   "effort": "high",
   "env": {
     "CLAUDE_CODE_TMPDIR": "/private/tmp/c2i-<scope>",
+    "DEVELOPER_DIR": "/Library/Developer/CommandLineTools",
     "HOME": "<fixture>",
     "PATH": "/usr/bin:/bin",
   },
@@ -170,6 +171,7 @@ exports[`slice 6 Claude isolation > integration: SDK options snapshot, isolation
           "/dev/random",
           "/dev/urandom",
           "/dev/zero",
+          "/etc",
           "/opt/homebrew/Cellar",
           "/opt/homebrew/Frameworks",
           "/opt/homebrew/bin",
@@ -183,8 +185,11 @@ exports[`slice 6 Claude isolation > integration: SDK options snapshot, isolation
           "/private/etc",
           "/private/tmp/c2i-<scope>",
           "/private/var/db/dyld",
+          "/private/var/select",
           "/sbin",
+          "/tmp",
           "/usr",
+          "/var",
         ],
         "allowWrite": [
           "<fixture>/alice",
@@ -196,6 +201,8 @@ exports[`slice 6 Claude isolation > integration: SDK options snapshot, isolation
         "denyWrite": [
           "<fixture>/.claude/debug",
           "<fixture>/.npm/_logs",
+          "<fixture>/alice/.claude",
+          "<fixture>/alice/.codex",
           "/private/tmp/claude",
           "/tmp/claude",
         ],
@@ -214,7 +221,6 @@ exports[`slice 6 Claude isolation > integration: SDK options snapshot, isolation
     "Bash",
     "WebFetch",
     "WebSearch",
-    "TodoWrite",
   ],
 }
 `;

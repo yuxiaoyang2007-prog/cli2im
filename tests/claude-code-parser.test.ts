@@ -241,6 +241,41 @@ describe('mapSDKEvent', () => {
 });
 
 describe('ClaudeCodeVirtualProcess permissions', () => {
+  it.each(['allow', 'deny'] as const)('resolves a synchronous %s response from the stdout data handler', async decision => {
+    const plugin = new ClaudeCodePlugin('/usr/local/bin/claude');
+    const proc = plugin.spawn({ ...baseOpts(), autoApprove: false }) as ClaudeCodeVirtualProcess;
+    const controller = new AbortController();
+    const remove = vi.spyOn(controller.signal, 'removeEventListener');
+    const respond = vi.fn((event: AgentEvent) => {
+      if (event.type === 'permission_request') proc.stdin.write(plugin.formatPermissionResponse(event.id, decision));
+    });
+    proc.stdout.on('data', respond);
+    // Ensure the stream is flowing before write(), as in the production pipe chain.
+    await new Promise<void>(resolve => setImmediate(resolve));
+    try {
+      const result = proc.canUseTool('Bash', { command: 'ls' }, { toolUseID: 'sync_permission', signal: controller.signal });
+      expect(respond).toHaveBeenCalledExactlyOnceWith({ type: 'permission_request', id: 'sync_permission', tool: 'Bash', input: { command: 'ls' } });
+      await expect(result).resolves.toEqual(decision === 'allow' ? { behavior: 'allow' } : { behavior: 'deny', message: 'Denied by user' });
+      expect(remove).toHaveBeenCalledOnce();
+    } finally { proc.kill(); remove.mockRestore(); }
+  });
+
+  it.each(['before request', 'in stdout handler', 'after request'] as const)('denies permission when aborted %s', async timing => {
+    const plugin = new ClaudeCodePlugin('/usr/local/bin/claude');
+    const proc = plugin.spawn({ ...baseOpts(), autoApprove: false }) as ClaudeCodeVirtualProcess;
+    const controller = new AbortController();
+    proc.stdout.on('data', (event: AgentEvent) => {
+      if (event.type === 'permission_request' && timing === 'in stdout handler') controller.abort();
+    });
+    await new Promise<void>(resolve => setImmediate(resolve));
+    try {
+      if (timing === 'before request') controller.abort();
+      const result = proc.canUseTool('Bash', { command: 'ls' }, { toolUseID: 'abort_permission', signal: controller.signal });
+      if (timing === 'after request') controller.abort();
+      await expect(result).resolves.toEqual({ behavior: 'deny', message: 'Permission request was cancelled', toolUseID: 'abort_permission' });
+    } finally { proc.kill(); }
+  });
+
   it('emits permission_request and resolves canUseTool from stdin response', async () => {
     const plugin = new ClaudeCodePlugin('/usr/local/bin/claude');
     const proc = plugin.spawn(baseOpts()) as ClaudeCodeVirtualProcess;

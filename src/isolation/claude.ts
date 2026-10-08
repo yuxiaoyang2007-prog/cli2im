@@ -1,9 +1,9 @@
-import { lstatSync, readdirSync, readFileSync } from 'node:fs';
-import { basename, join } from 'node:path';
+import { lstatSync, readdirSync, readFileSync, readlinkSync } from 'node:fs';
+import { basename, join, resolve, dirname } from 'node:path';
 import { parse } from 'yaml';
 import type { HookCallback, Options } from '@anthropic-ai/claude-agent-sdk';
 import { canonicalPath } from '../runtime/execution-scope.js';
-import { contains, RUNTIME_READ_EXCEPTIONS, type IsolationPolicy } from './policy.js';
+import { contains, RUNTIME_READ, RUNTIME_READ_EXCEPTIONS, type IsolationPolicy } from './policy.js';
 import { PROVIDER_CREDENTIAL_NAMES } from './admission.js';
 
 // Statically checked against Claude Code 2.1.293, bundled chunk-ep4t91kn.js:
@@ -15,9 +15,24 @@ export function claudeImplicitWrites(home: string): string[] {
   return [...CLAUDE_WRITE_DEVICES, '/tmp/claude', '/private/tmp/claude', join(home, '.npm/_logs'), join(home, '.claude/debug')];
 }
 const unique = (paths: string[]) => [...new Set(paths)].sort();
-const canonical = (paths: string[]) => unique(paths.map(canonicalPath));
+// Runtime devices name process-local descriptors; resolving them can fail with
+// EBADF or change the grant to the descriptor's current backing file.
+export function canonicalClaudePath(path: string): string {
+  return CLAUDE_WRITE_DEVICES.includes(path) || (path.startsWith('/dev/') && RUNTIME_READ.includes(path)) ? path : canonicalPath(path);
+}
+const canonical = (paths: string[]) => unique(paths.map(canonicalClaudePath));
+
+export const CLAUDE_LINK_READ = ['/etc', '/var', '/tmp'];
+export function validateClaudeLinks(inspect = lstatSync, readlink = readlinkSync): void {
+  for (const path of CLAUDE_LINK_READ) {
+    try {
+      if (!inspect(path).isSymbolicLink() || resolve(dirname(path), String(readlink(path))) !== `/private${path}`) throw new Error();
+    } catch { throw new Error('UNSUPPORTED: Claude runtime link differs from the fixed contract'); }
+  }
+}
 
 export function compileClaudeSettings(policy: IsolationPolicy, home: string) {
+  validateClaudeLinks();
   // These CLI fields accept globs. A literal filesystem path containing glob
   // syntax cannot safely be translated by treating it as an ordinary string.
   if ([home, ...policy.runtimeRead, ...policy.readable, ...policy.writable, ...policy.hardDeny, ...policy.plugins]
@@ -41,6 +56,7 @@ export function compileClaudeSettings(policy: IsolationPolicy, home: string) {
   const denyWrite = unique([
     ...canonical([...hardDeny, ...readonly]).filter(d => actual.some(w => contains(w, d))
       && !allowWrite.some(w => contains(d, w) && d !== w)),
+    join(policy.workspace, '.claude'), join(policy.workspace, '.codex'),
     ...implicit.filter(p => !CLAUDE_WRITE_DEVICES.includes(p) && !allowWrite.some(w => contains(w, canonicalPath(p)))),
   ]);
   if (denyWrite.some(d => allowWrite.some(w => contains(canonicalPath(d), w)))) {
@@ -51,7 +67,7 @@ export function compileClaudeSettings(policy: IsolationPolicy, home: string) {
     sandbox: {
       enabled: true, failIfUnavailable: true, autoAllowBashIfSandboxed: true,
       allowUnsandboxedCommands: false, excludedCommands: [],
-      filesystem: { denyRead: ['/'], allowRead, allowWrite, denyWrite },
+      filesystem: { denyRead: ['/'], allowRead: unique([...allowRead, ...CLAUDE_LINK_READ]), allowWrite, denyWrite },
       network: { allowedDomains: ['*'] },
       credentials: { envVars: PROVIDER_CREDENTIAL_NAMES.map(name => ({ name, mode: 'deny' as const })) },
     },
@@ -81,7 +97,7 @@ export function validateClaudePlugins(roots: string[]): void {
       const info = lstatSync(path);
       if (info.isSymbolicLink() || (!info.isFile() && !info.isDirectory())) throw new Error('UNSUPPORTED: plugin contains a link or special file');
       if (info.isDirectory()) for (const name of readdirSync(path)) visit(join(path, name));
-      else if (basename(path) === 'SKILL.md') validateSkillFrontmatter(path);
+      else if (basename(path).toLowerCase() === 'skill.md') validateSkillFrontmatter(path);
     };
     visit(root);
     if (readdirSync(root).some(n => !['skills', '.claude-plugin', 'README.md', 'LICENSE', 'LICENSE.md'].includes(n))) {

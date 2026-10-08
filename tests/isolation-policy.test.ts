@@ -11,6 +11,63 @@ describe('slice 5 isolation policy', () => {
   let f: ReturnType<typeof isolationFixture>;
   beforeEach(() => { f = isolationFixture(); });
   afterEach(() => { rmSync(f.root, { recursive: true, force: true }); });
+  it.each([undefined, '', 'bin:/usr/bin', '.', '.:/usr/bin', ':/usr/bin', '/usr/bin:', '/usr/bin::/bin',
+    '/usr/./bin', '/usr/bin/.', '/usr/../bin', '/usr/bin/..', '/usr//.//bin', '/usr//..//bin'])('PATH hygiene rejects missing, empty, relative or dot-segment entries: %s', PATH => {
+    expect(() => buildIsolationPolicy({ config: f.config, botName: 'bot', workspace: f.workspace, paths: f.paths,
+      binaryPath: '/bin/cat', effectiveEnv: { PATH } })).toThrow(/^UNSUPPORTED:.*PATH/);
+  });
+  it.each(['workspace', 'grant', 'inbox'])('PATH resolution rejects symlink traversal through %s by literal and canonical containment', kind => {
+    f.bot.workingDirectory = f.workspace; f.bot.userOverrides = undefined;
+    const root = kind === 'workspace' ? f.workspace : kind === 'inbox' ? f.policy().inbox : join(f.root, 'grant');
+    if (kind === 'grant') f.bot.isolation!.writable = [root];
+    mkdirSync(join(root, 'deep/a'), { recursive: true });
+    symlinkSync(join(root, 'deep/a'), join(root, 'up'));
+    symlinkSync(join(f.root, 'outside'), join(root, 'out'));
+    symlinkSync(root, join(f.root, 'alias'));
+    for (const entry of [`${root}/up/../../bin`, `${root}//out//`, `${root}//out//missing-bin/`,
+      join(f.root, 'alias'), join(f.root, 'alias', 'missing-bin')]) {
+      expect(() => buildIsolationPolicy({ config: f.config, botName: 'bot', workspace: f.workspace, paths: f.paths,
+        binaryPath: '/bin/cat', effectiveEnv: { PATH: `${entry}:/usr/bin:/bin` } }), entry).toThrow(/^UNSUPPORTED:.*PATH/);
+    }
+  });
+  it('PATH resolution preserves safe spelling, repeated slashes and trusted external symlinks', () => {
+    symlinkSync(join(f.root, 'outside'), join(f.root, 'trusted-alias'));
+    const entries = [`${f.root}//trusted-alias//missing-bin/`, `${f.root}/outside/.bin`, `${f.root}/outside/...`, '/usr//bin/', '/bin'];
+    const policy = buildIsolationPolicy({ config: f.config, botName: 'bot', workspace: f.workspace, paths: f.paths,
+      binaryPath: '/bin/cat', effectiveEnv: { PATH: entries.join(':') } });
+    expect(policy.searchPath).toEqual(entries);
+  });
+  it.each(['workspace', 'other-scope', 'other-bot', 'grant', 'temporary', 'inbox', 'other-inbox', 'symlink', 'normalized'])('PATH hygiene rejects canonical writable and inbox entries: %s', kind => {
+    let entry = join(f.workspace, 'bin');
+    if (kind === 'other-scope') entry = join(f.root, 'bob', 'bin');
+    if (kind === 'other-bot') {
+      f.config.bots.other = { ...f.bot, isolation: undefined, workingDirectory: join(f.root, 'other'), userOverrides: undefined };
+      entry = join(f.root, 'other', 'bin');
+    }
+    if (kind === 'grant') {
+      f.bot.workingDirectory = f.workspace; f.bot.userOverrides = undefined;
+      f.bot.isolation!.writable = [join(f.root, 'grant')]; entry = join(f.root, 'grant', 'bin');
+    }
+    if (kind === 'temporary') { f.bot.agent = 'claude-code'; entry = join(f.policy().tmpdir, 'bin'); }
+    if (kind === 'inbox') entry = join(f.policy().inbox, 'bin');
+    if (kind === 'other-inbox') entry = join(f.paths.dataDir, 'inbox', scopeHash(join(f.root, 'bob')), 'bin');
+    if (kind === 'symlink') { symlinkSync(f.workspace, join(f.root, 'alias')); entry = join(f.root, 'alias', 'missing-bin'); }
+    if (kind === 'normalized') entry = `${f.workspace}/../alice/bin`;
+    expect(() => buildIsolationPolicy({ config: f.config, botName: 'bot', workspace: f.workspace, paths: f.paths,
+      binaryPath: '/bin/cat', effectiveEnv: { PATH: `${entry}:/usr/bin:/bin` } })).toThrow(/^UNSUPPORTED:.*PATH/);
+  });
+  it('fingerprints PATH values and order without retaining other environment values', () => {
+    const params = { config: f.config, botName: 'bot', workspace: f.workspace, paths: f.paths, binaryPath: '/bin/cat' };
+    const base = buildIsolationPolicy({ ...params, effectiveEnv: { PATH: '/usr/bin:/bin' } });
+    for (const PATH of ['/bin:/usr/bin', '/usr/bin:/bin:/usr/local/bin']) {
+      expect(buildIsolationPolicy({ ...params, effectiveEnv: { PATH } }).fingerprint).not.toBe(base.fingerprint);
+    }
+    const env = { PATH: '/usr/bin:/bin', FIXTURE_SECRET: 'never-store-this-value' };
+    const same = buildIsolationPolicy({ ...params, effectiveEnv: env });
+    expect(same.fingerprint).toBe(base.fingerprint);
+    expect(JSON.stringify(same)).not.toContain(env.FIXTURE_SECRET);
+    expect(same.searchPath).toEqual(['/usr/bin', '/bin']);
+  });
   it('normalizes effective sets, private inbox and Codex temporary directory', () => {
     const p = f.policy();
     expect(p.writable).toEqual([f.workspace, join(f.workspace, '.cli2im-tmp')]);
@@ -62,7 +119,7 @@ describe('slice 5 isolation policy', () => {
     const root = join(f.root, 'plugin'); mkdirSync(root); writeFileSync(join(root, 'SKILL.md'), 'one'); f.bot.plugins = [root];
     const base = f.policy().fingerprint;
     writeFileSync(join(root, 'SKILL.md'), 'two'); expect(f.policy().fingerprint).not.toBe(base);
-    const params = { config: f.config, botName: 'bot', workspace: f.workspace, paths: f.paths, binaryPath: '/bin/cat' };
+    const params = { config: f.config, botName: 'bot', workspace: f.workspace, paths: f.paths, effectiveEnv: { PATH: '/usr/bin:/bin' }, binaryPath: '/bin/cat' };
     expect(buildIsolationPolicy({ ...params, identityMapping: { a: 1 } }).fingerprint)
       .not.toBe(buildIsolationPolicy({ ...params, identityMapping: { a: 2 } }).fingerprint);
     expect(buildIsolationPolicy({ ...params, sdkVersions: '1' }).fingerprint)
@@ -86,15 +143,15 @@ describe('slice 5 isolation policy', () => {
   });
   it('refuses an executable-directory exception that would expose HOME', () => {
     expect(() => buildIsolationPolicy({ config: f.config, botName: 'bot', workspace: f.workspace, paths: f.paths,
-      binaryPath: join(f.paths.home, 'agent') })).toThrow('too broad');
+      effectiveEnv: { PATH: '/usr/bin:/bin' }, binaryPath: join(f.paths.home, 'agent') })).toThrow('too broad');
   });
   it('enforces Claude final tmp path length and stable short root', () => {
     f.bot.agent = 'claude-code';
     const p = f.policy();
     expect(p.tmpdir).toBe(`/private/tmp/c2i-${scopeHash(f.workspace).slice(0, 8)}`);
-    expect(p.tools).toEqual(['Bash', 'WebFetch', 'WebSearch', 'TodoWrite']);
+    expect(p.tools).toEqual(['Bash', 'WebFetch', 'WebSearch']);
     expect(() => buildIsolationPolicy({ config: f.config, botName: 'bot', workspace: f.workspace,
-      paths: { ...f.paths, claudeTmpRoot: join(f.root, 'very-long-root') }, binaryPath: '/bin/cat' })).toThrow('44');
+      paths: { ...f.paths, claudeTmpRoot: join(f.root, 'very-long-root') }, effectiveEnv: { PATH: '/usr/bin:/bin' }, binaryPath: '/bin/cat' })).toThrow('44');
   });
   it('subtracts hard denies per SBPL grant, with only narrow read exceptions and safe quoting', () => {
     f.bot.isolation!.readable = [join(f.paths.home, '.claude', 'private'), join(f.root, 'quote"雪')];

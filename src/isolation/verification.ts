@@ -7,7 +7,8 @@ export type VerificationStatus = 'VERIFIED' | 'LEAK' | 'UNSUPPORTED' | 'ERROR' |
 export interface AgentBinary { realpath: string; size: number; mtime: number }
 export interface VerificationRecord {
   bot: string; scopeKey: string; policyFingerprint: string; agentBinary: AgentBinary;
-  status: VerificationStatus; checks: Array<{ name: string; status: string }>;
+  status: VerificationStatus; checks: Array<{ name: string; status: string; evidenceMode?: 'static+readonly' }>;
+  observedTools?: string[];
   checkedAt: string; checkOverrides?: Record<string, unknown>;
 }
 export function identifyBinary(binary: string, searchPath = process.env.PATH ?? ''): AgentBinary {
@@ -48,9 +49,22 @@ export class VerificationStore {
       throw new Error('Isolation verification records are unreadable');
     }
   }
+  get(bot: string, scopeKey: string): VerificationRecord | undefined {
+    return this.read().find(r => r.bot === bot && r.scopeKey === scopeKey);
+  }
+  preparationFailure(bot: string): VerificationRecord | undefined { return this.get(bot, ''); }
+  clearPreparationFailure(bot: string): void {
+    const records = this.read();
+    if (records.some(record => record.bot === bot && record.scopeKey === '')) {
+      this.write(records.filter(record => record.bot !== bot || record.scopeKey !== ''));
+    }
+  }
   state(bot: string, scopeKey: string, policyFingerprint: string, agentBinary: AgentBinary): VerificationStatus {
     try {
-      const r = this.read().find(r => r.bot === bot && r.scopeKey === scopeKey);
+      const records = this.read();
+      const revoked = records.find(r => r.bot === bot && r.scopeKey === '');
+      if (revoked) return revoked.status;
+      const r = records.find(r => r.bot === bot && r.scopeKey === scopeKey);
       if (!r) return 'UNVERIFIED';
       if (r.policyFingerprint !== policyFingerprint || stableJSON(r.agentBinary) !== stableJSON(agentBinary)) return 'STALE';
       return r.status;
@@ -61,14 +75,27 @@ export class VerificationStore {
     // Revoke live children even if publication of a failed check cannot complete.
     if (record.status !== 'VERIFIED') for (const listener of this.listeners) listener(record);
     const records = this.read().filter(r => r.bot !== record.bot || r.scopeKey !== record.scopeKey);
+    this.write([...records, record]);
+    if (record.status === 'VERIFIED') for (const listener of this.listeners) listener(record);
+  }
+  /** Preparation can fail before a new binary or policy exists. Revoke every old scope atomically. */
+  revokeBot(bot: string, status: 'ERROR' | 'UNSUPPORTED'): void {
+    const failure = { status, checkedAt: new Date().toISOString(), checks: [{ name: 'check.preparation', status }] };
+    const fallback: VerificationRecord = { bot, scopeKey: '', policyFingerprint: '',
+      agentBinary: { realpath: '', size: 0, mtime: 0 }, ...failure };
+    for (const listener of this.listeners) listener(fallback);
+    const records = this.read();
+    this.write([...records.filter(record => record.bot !== bot || record.scopeKey !== '')
+      .map(record => record.bot === bot ? { ...record, ...failure } : record), fallback]);
+  }
+  private write(records: VerificationRecord[]): void {
     mkdirSync(dirname(this.path), { recursive: true, mode: 0o700 });
     const temp = `${this.path}.${randomUUID()}.tmp`;
     const fd = openSync(temp, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL, 0o600);
-    try { fchmodSync(fd, 0o600); writeFileSync(fd, JSON.stringify({ version: 1, records: [...records, record] })); fsyncSync(fd); }
+    try { fchmodSync(fd, 0o600); writeFileSync(fd, JSON.stringify({ version: 1, records })); fsyncSync(fd); }
     finally { closeSync(fd); }
     renameSync(temp, this.path);
     const parent = openSync(dirname(this.path), constants.O_RDONLY);
     try { fsyncSync(parent); } finally { closeSync(parent); }
-    if (record.status === 'VERIFIED') for (const listener of this.listeners) listener(record);
   }
 }

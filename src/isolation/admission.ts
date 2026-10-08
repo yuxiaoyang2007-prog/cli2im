@@ -1,10 +1,10 @@
-import type { IsolationPolicy } from './policy.js';
+import { assertIsolationSearchPath, type IsolationPolicy } from './policy.js';
 import type { AgentBinary, VerificationStore } from './verification.js';
 import { canResumeIsolated, type ProvenanceContext, type SessionProvenance } from './provenance.js';
 
 export const ISOLATION_PAUSED = '隔离检查未通过，已暂停执行，请管理员查看 /doctor';
 export class IsolationAdmissionError extends Error {
-  constructor(message = ISOLATION_PAUSED) { super(message); }
+  constructor(message = ISOLATION_PAUSED, readonly status: 'ERROR' | 'UNSUPPORTED' = 'ERROR') { super(message); }
 }
 export const PROVIDER_CREDENTIAL_NAMES = [
   'ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'CLAUDE_CODE_OAUTH_TOKEN', 'OPENAI_API_KEY',
@@ -25,6 +25,8 @@ export function assertIsolationAdmission(params: {
   sessionId?: string; provenance?: SessionProvenance; env: NodeJS.ProcessEnv;
 }): void {
   assertNoProviderCredentials(params.env);
+  try { assertIsolationSearchPath(params.env, params.policy); }
+  catch { throw new IsolationAdmissionError(ISOLATION_PAUSED, 'UNSUPPORTED'); }
   if (params.verification.state(params.expected.bot, params.policy.scopeKey, params.policy.fingerprint, params.binary) !== 'VERIFIED') {
     throw new IsolationAdmissionError(ISOLATION_PAUSED);
   }

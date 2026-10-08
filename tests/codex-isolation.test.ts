@@ -1,14 +1,17 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { chmodSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, copyFileSync, existsSync, statSync, readdirSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
 import { createServer } from 'node:http';
 import { once } from 'node:events';
 import { isolationFixture } from './helpers/isolation.js';
-import { codexConfigSources, codexPermissionArgs, tomlInline } from '../src/isolation/codex.js';
-import { codexExecArgs } from '../src/agents/codex-exec.js';
+import { codexConfigSources, isolatedCodexHome, prepareCodexHome, codexPermissionArgs, tomlInline } from '../src/isolation/codex.js';
+import { buildIsolationPolicy } from '../src/isolation/policy.js';
+import { codexExecArgs, createCodexExecThread } from '../src/agents/codex-exec.js';
 import { CodexPlugin, type CodexThreadEvent } from '../src/agents/codex.js';
 import type { AgentEvent, SpawnOpts } from '../src/types.js';
+import { identifyBinary } from '../src/isolation/verification.js';
+import { createCheckOptions } from '../src/isolation/check-options.js';
 
 const sdk = vi.hoisted(() => ({ construct: vi.fn(), start: vi.fn(), resume: vi.fn(), records: [] as any[] }));
 vi.mock('node:fs/promises', async importOriginal => {
@@ -42,7 +45,7 @@ describe('slice 7 Codex isolation', () => {
     binary = join(f.root, 'fake-codex.cjs');
     // A local scripted executable: no socket, authentication, or model requests.
     writeFileSync(binary, `#!${process.execPath}\nconst fs = require('node:fs');\nlet prompt = ''; process.stdin.on('data', x => prompt += x); process.stdin.on('end', () => {
-      fs.writeFileSync(process.env.CAPTURE, JSON.stringify({ args: process.argv.slice(2), prompt, tmpdir: process.env.TMPDIR, envKeys: Object.keys(process.env) }));
+      fs.writeFileSync(process.env.CAPTURE, JSON.stringify({ args: process.argv.slice(2), prompt, tmpdir: process.env.TMPDIR, codexHome: process.env.CODEX_HOME, developerDir: process.env.DEVELOPER_DIR, envKeys: Object.keys(process.env) }));
       for (const event of ${JSON.stringify(records)}) process.stdout.write(JSON.stringify(event) + '\\n');
     });\n`);
     chmodSync(binary, 0o700);
@@ -50,7 +53,7 @@ describe('slice 7 Codex isolation', () => {
   afterEach(() => { for (const proc of processes.splice(0)) proc.kill(); vi.restoreAllMocks(); vi.unstubAllEnvs(); rmSync(f.root, { recursive: true, force: true }); });
   const opts = (): SpawnOpts => ({ workingDirectory: f.workspace, permissionMode: 'bypass', autoApprove: true,
     sandboxMode: 'danger-full-access', model: 'fixture-model', reasoningEffort: 'high',
-    isolation: f.policy(), env: { HOME: f.paths.home, TMPDIR: f.policy().tmpdir, CAPTURE: join(f.root, 'capture.json') } });
+    isolation: { ...f.policy(), binaryPath: binary }, env: { HOME: f.paths.home, TMPDIR: f.policy().tmpdir, CAPTURE: join(f.root, 'capture.json') } });
   const normalize = (value: unknown) => JSON.parse(JSON.stringify(value).replaceAll(f.root, '<fixture>').replace(/cli2im-[a-f0-9]{8}/g, 'cli2im-<scope>').replace(/inbox\/[a-f0-9]{32}/g, 'inbox/<scope>'));
 
   it('builds a unique single inline permissions table, quotes every key, and disables ambient capabilities', () => {
@@ -64,7 +67,7 @@ describe('slice 7 Codex isolation', () => {
     expect(args[args.indexOf('project_root_markers=[]') - 1]).toBe('-c');
     const table = args.find(a => a.startsWith('permissions='))!;
     for (const path of paths) expect(table).toContain(`${JSON.stringify(path)}="read"`);
-    for (const feature of ['memories', 'hooks', 'plugins', 'apps']) expect(args.join(' ')).toContain(`--disable ${feature}`);
+    for (const feature of ['memories', 'hooks', 'plugins', 'apps', 'multi_agent', 'goals']) expect(args.join(' ')).toContain(`--disable ${feature}`);
     expect(normalize(args)).toMatchSnapshot();
     expect(codexPermissionArgs({ ...options.isolation!, scopeKey: 'another-scope' })[3]).not.toBe(codexPermissionArgs(options.isolation!)[3]);
   });
@@ -78,7 +81,7 @@ describe('slice 7 Codex isolation', () => {
   it('ignores synthetic HOME user config during admission and before each exec', async () => {
     const before = f.policy().fingerprint;
     mkdirSync(join(f.paths.home, '.codex')); writeFileSync(join(f.paths.home, '.codex/config.toml'), 'fixture user config');
-    expect(codexConfigSources(f.workspace, f.paths.home, [])).toEqual([]);
+    expect(codexConfigSources(f.workspace, { HOME: f.paths.home }, [])).toEqual([]);
     expect(f.policy().fingerprint).toBe(before);
     const options = opts();
     await turn(new CodexPlugin(binary), options);
@@ -87,35 +90,70 @@ describe('slice 7 Codex isolation', () => {
     const workspace = join(f.workspace, 'nested'); mkdirSync(workspace);
     const dir = location === 'workspace' ? workspace : f.workspace;
     mkdirSync(join(dir, '.codex')); writeFileSync(join(dir, '.codex/config.toml'), '');
-    expect(() => codexConfigSources(workspace, f.paths.home, [])).toThrow('UNSUPPORTED');
+    expect(() => codexConfigSources(workspace, { HOME: f.paths.home }, [])).toThrow('UNSUPPORTED');
   });
   it('rejects project configs including dangling links', () => {
-    expect(codexConfigSources(f.workspace, f.paths.home, [])).toEqual([]);
+    expect(codexConfigSources(f.workspace, { HOME: f.paths.home }, [])).toEqual([]);
     const sub = join(f.workspace, 'nested'); mkdirSync(sub);
     mkdirSync(join(f.workspace, '.codex')); symlinkSync(join(f.root, 'absent'), join(f.workspace, '.codex/config.toml'));
-    expect(() => codexConfigSources(sub, f.paths.home, [])).toThrow('UNSUPPORTED');
-    expect(() => codexConfigSources(f.workspace, f.paths.home, [])).toThrow('UNSUPPORTED');
+    expect(() => codexConfigSources(sub, { HOME: f.paths.home }, [])).toThrow('UNSUPPORTED');
+    expect(() => codexConfigSources(f.workspace, { HOME: f.paths.home }, [])).toThrow('UNSUPPORTED');
   });
   it.each(['direct', 'symlink'])('ignores only the canonical explicit CODEX_HOME directory (%s)', spelling => {
     const configDir = join(f.workspace, '.codex'); mkdirSync(configDir);
     writeFileSync(join(configDir, 'config.toml'), '');
     const alias = join(f.root, 'codex-alias'); symlinkSync(configDir, alias);
-    vi.stubEnv('CODEX_HOME', spelling === 'direct' ? configDir : alias);
+    const env = { HOME: f.paths.home, CODEX_HOME: spelling === 'direct' ? configDir : alias };
     const workspace = join(f.workspace, 'nested'); mkdirSync(workspace);
-    expect(codexConfigSources(workspace, f.paths.home, [])).toEqual([]);
+    expect(codexConfigSources(workspace, env, [])).toEqual([]);
     mkdirSync(join(workspace, '.codex')); writeFileSync(join(workspace, '.codex/config.toml'), '');
-    expect(() => codexConfigSources(workspace, f.paths.home, [])).toThrow('UNSUPPORTED');
+    expect(() => codexConfigSources(workspace, env, [])).toThrow('UNSUPPORTED');
   });
   it('normalizes a synthetic HOME alias before excluding its user config', () => {
     mkdirSync(join(f.paths.home, '.codex')); writeFileSync(join(f.paths.home, '.codex/config.toml'), '');
     const alias = join(f.root, 'home-alias'); symlinkSync(f.paths.home, alias);
-    expect(codexConfigSources(f.workspace, alias, [])).toEqual([]);
+    expect(codexConfigSources(f.workspace, { HOME: alias }, [])).toEqual([]);
+  });
+  it('production, resume and subsequent turns force the bridge-owned home and skip both user configurations', async () => {
+    const options = opts();
+    const home = isolatedCodexHome(f.paths.dataDir, 'bot');
+    mkdirSync(join(f.paths.home, '.codex')); writeFileSync(join(f.paths.home, '.codex/config.toml'), 'personal config');
+    prepareCodexHome(home); writeFileSync(join(home, 'config.toml'), 'bot config');
+    options.env!.CODEX_HOME = join(f.root, 'ignored-override');
+    const thread = createCodexExecThread(options, 'existing-thread');
+    for (let i = 0; i < 2; i++) {
+      const { events } = await thread.runStreamed('fixture');
+      for await (const _event of events) { /* exhaust the production exec path */ }
+      const captured = JSON.parse(readFileSync(join(f.root, 'capture.json'), 'utf8'));
+      expect(captured.codexHome).toBe(home);
+      expect(captured.developerDir).toBe(options.isolation!.developerDir);
+      expect(statSync(home).mode & 0o777).toBe(0o700);
+    }
+    expect(readdirSync(home)).toEqual(['config.toml']); // no copied login material
+    mkdirSync(join(f.workspace, '.codex')); writeFileSync(join(f.workspace, '.codex/config.toml'), 'project');
+    await expect(thread.runStreamed('fixture')).rejects.toThrow('UNSUPPORTED');
+  });
+  it.each([false, true])('uses the explicit child HOME rather than the parent HOME (child user source=%s)', childUserSource => {
+    const configDir = join(f.workspace, '.codex'); mkdirSync(configDir); writeFileSync(join(configDir, 'config.toml'), '');
+    vi.stubEnv('HOME', childUserSource ? f.paths.home : f.workspace);
+    const env = { HOME: childUserSource ? f.workspace : f.paths.home };
+    if (childUserSource) expect(codexConfigSources(f.workspace, env, [])).toEqual([]);
+    else expect(() => codexConfigSources(f.workspace, env, [])).toThrow('UNSUPPORTED');
+  });
+  it('binds normalized effective configuration homes into the policy fingerprint', () => {
+    const params = { config: f.config, botName: 'bot', workspace: f.workspace, paths: f.paths, binaryPath: '/bin/cat', effectiveEnv: { PATH: '/usr/bin:/bin' } };
+    const first = buildIsolationPolicy({ ...params, effectiveEnv: { PATH: '/usr/bin:/bin', HOME: f.paths.home, CODEX_HOME: join(f.root, 'state-a') } });
+    const ignored = buildIsolationPolicy({ ...params, effectiveEnv: { PATH: '/usr/bin:/bin', HOME: f.paths.home, CODEX_HOME: join(f.root, 'state-b') } });
+    expect(first.fingerprint).toBe(ignored.fingerprint);
+    const second = buildIsolationPolicy({ ...params, paths: { ...f.paths, dataDir: join(f.root, 'bridge-new') } });
+    expect(first.codexHome).not.toBe(second.codexHome);
+    expect(first.fingerprint).not.toBe(second.fingerprint);
   });
   it('fingerprints system/managed source existence without reading contents', () => {
     const system = join(f.root, 'system-config'); f.paths.codexSystemConfigs = [system];
     const before = f.policy().fingerprint;
     writeFileSync(system, 'fixture');
-    expect(codexConfigSources(f.workspace, f.paths.home, [system])).toEqual([{ path: system, exists: true }]);
+    expect(codexConfigSources(f.workspace, { HOME: f.paths.home }, [system])).toEqual([{ path: system, exists: true }]);
     expect(f.policy().fingerprint).not.toBe(before);
     const exists = f.policy().fingerprint; writeFileSync(system, 'changed contents');
     expect(f.policy().fingerprint).toBe(exists);
@@ -124,9 +162,36 @@ describe('slice 7 Codex isolation', () => {
     const proc = resume ? plugin.resume(resume, options) : plugin.spawn(options); processes.push(proc);
     const events: AgentEvent[] = []; proc.stdout.on('data', event => events.push(event));
     proc.stdin.write(plugin.formatStdinMessage({ role: 'user', content: 'fixture prompt' }));
-    await vi.waitFor(() => expect(events.some(e => e.type === 'result')).toBe(true));
+    await vi.waitFor(() => { expect(events.filter(e => e.type === 'error')).toEqual([]); expect(events.some(e => e.type === 'result')).toBe(true); });
     return { proc, events };
   }
+  it('binds spawn, resume, later turns and checks despite executable and node shadows created after policy verification', async () => {
+    const trustedBin = join(f.paths.installDir, 'bin'); mkdirSync(trustedBin);
+    const trusted = join(trustedBin, 'fixture-codex.cjs');
+    writeFileSync(trusted, readFileSync(binary, 'utf8').replace(/^#!.*\n/, '#!/usr/bin/env node\n'), { mode: 0o700 });
+    symlinkSync(process.execPath, join(trustedBin, 'node'));
+    const options = opts(); options.env!.PATH = `${trustedBin}:/usr/bin:/bin`;
+    const verified = identifyBinary('fixture-codex.cjs', options.env!.PATH);
+    expect(verified.realpath).toBe(trusted);
+    options.isolation = buildIsolationPolicy({ config: f.config, botName: 'bot', workspace: f.workspace, paths: f.paths, binaryPath: verified.realpath, effectiveEnv: options.env! });
+    const shadowBin = join(f.workspace, 'bin'); mkdirSync(shadowBin);
+    const marker = join(f.workspace, 'shadow-ran');
+    const shadow = join(shadowBin, 'fixture-codex.cjs');
+    writeFileSync(shadow, `#!${process.execPath}\nrequire('node:fs').writeFileSync(${JSON.stringify(marker)}, 'unsafe');\n`); chmodSync(shadow, 0o700);
+    copyFileSync(shadow, join(shadowBin, 'node')); chmodSync(join(shadowBin, 'node'), 0o700);
+    const plugin = new CodexPlugin('fixture-codex.cjs');
+    await turn(plugin, options);
+    const resumed = await turn(plugin, options, 'existing-thread');
+    resumed.proc.stdin.write(plugin.formatStdinMessage({ role: 'user', content: 'later turn' }));
+    await vi.waitFor(() => expect(resumed.events.filter(e => e.type === 'result')).toHaveLength(2));
+    expect(JSON.parse(readFileSync(join(f.root, 'capture.json'), 'utf8')).args.slice(-2)).toEqual(['fixture-thread', '-']);
+    const check = createCheckOptions('codex', options, options.env!, 'http://127.0.0.1:12345');
+    await turn(plugin, check.opts);
+    expect(existsSync(marker)).toBe(false);
+    expect(sdk.construct).not.toHaveBeenCalled();
+    await turn(plugin, { ...options, isolation: undefined });
+    expect(sdk.construct.mock.calls[0][0].codexPathOverride).toBe('fixture-codex.cjs');
+  });
   it('integration: exec JSONL and SDK produce identical mapped events, baseline options snapshot is unchanged', async () => {
     const options = opts();
     const isolated = await turn(new CodexPlugin(binary), options);
@@ -172,7 +237,8 @@ describe('slice 7 Codex isolation', () => {
   });
   it('integration: an unavailable binary is an error and cancellation terminates exec', async () => {
     const missing = new CodexPlugin(join(f.root, 'missing'));
-    const failed = missing.spawn(opts()); processes.push(failed);
+    const missingOptions = opts(); missingOptions.isolation!.binaryPath = join(f.root, 'missing');
+    const failed = missing.spawn(missingOptions); processes.push(failed);
     const events: AgentEvent[] = []; failed.stdout.on('data', e => events.push(e));
     failed.stdin.write(missing.formatStdinMessage({ role: 'user', content: 'fixture' }));
     await vi.waitFor(() => expect(events.some(e => e.type === 'error')).toBe(true));

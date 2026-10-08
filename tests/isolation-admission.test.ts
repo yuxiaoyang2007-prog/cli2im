@@ -1,11 +1,13 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { EventEmitter } from 'node:events';
 import { PassThrough, Transform } from 'node:stream';
 import { isolationFixture } from './helpers/isolation.js';
 import { VerificationStore, identifyBinary, type VerificationRecord, type VerificationStatus } from '../src/isolation/verification.js';
 import { assertIsolationAdmission, ISOLATION_PAUSED } from '../src/isolation/admission.js';
+import { agentChildEnv, createCheckOptions } from '../src/isolation/check-options.js';
+import { runIsolationCheck } from '../src/isolation/check.js';
 import { canResumeIsolated } from '../src/isolation/provenance.js';
 import { IsolationRuntime } from '../src/isolation/runtime.js';
 import { MemoryStore } from '../src/memory/store.js';
@@ -32,7 +34,48 @@ describe('slice 5 admission and provenance', () => {
   it.each(['UNVERIFIED', 'STALE', 'LEAK', 'UNSUPPORTED', 'ERROR'] as const)('denies %s and only permits a current VERIFIED record', status => {
     const policy = f.policy();
     verification.put(record(policy.fingerprint, status));
-    expect(() => assertIsolationAdmission({ verification, policy, binary: binary(), expected: context(policy.fingerprint), env: {} })).toThrow(ISOLATION_PAUSED);
+    expect(() => assertIsolationAdmission({ verification, policy, binary: binary(), expected: context(policy.fingerprint), env: { PATH: '/usr/bin:/bin' } })).toThrow(ISOLATION_PAUSED);
+  });
+  it.each(['claude-code', 'codex'] as const)('PATH resolution rejects matching legacy VERIFIED policies before and after node creation for %s', async agent => {
+    f.bot.agent = agent;
+    mkdirSync(join(f.workspace, 'deep/a'), { recursive: true });
+    mkdirSync(join(f.workspace, 'bin'));
+    symlinkSync(join(f.workspace, 'deep/a'), join(f.workspace, 'up'));
+    symlinkSync(join(f.root, 'outside'), join(f.workspace, 'out'));
+    symlinkSync(f.workspace, join(f.root, 'alias'));
+    const entries = [`${f.workspace}/up/../../bin`, `${f.workspace}//out//missing-bin/`, join(f.root, 'alias', 'bin')];
+    expect(realpathSync.native(entries[0])).toBe(join(f.workspace, 'bin'));
+    const node = join(f.workspace, 'bin/node');
+    expect(existsSync(node)).toBe(false);
+    const identity = binary();
+    for (const created of [false, true]) {
+      if (created) writeFileSync(node, '#!/bin/sh\nexit 99\n', { mode: 0o700 });
+      for (const entry of entries) {
+        const PATH = `${entry}:/usr/bin:/bin`;
+        // Simulate a stored policy accepted by the old validator. PATH and
+        // fingerprint match, so rejection cannot rely on either being stale.
+        const policy = { ...f.policy(), searchPath: PATH.split(':') };
+        verification.put(record(policy.fingerprint));
+        const env = { HOME: f.paths.home, PATH };
+        const options: SpawnOpts = { workingDirectory: f.workspace, permissionMode: 'blacklist', isolation: policy, env };
+        expect(verification.state('bot', f.workspace, policy.fingerprint, identity)).toBe('VERIFIED');
+        for (const sessionId of [undefined, 'resume-session']) {
+          expect(() => assertIsolationAdmission({ verification, policy, binary: identity, expected: context(policy.fingerprint), env,
+            sessionId, provenance: sessionId ? { ...context(policy.fingerprint), agentSessionId: sessionId } : undefined }))
+            .toThrow(expect.objectContaining({ status: 'UNSUPPORTED' }));
+        }
+        expect(() => agentChildEnv(agent, options)).toThrow(/^UNSUPPORTED:.*PATH/);
+        expect(() => createCheckOptions(agent, options, env, 'http://127.0.0.1:12345')).toThrow(/^UNSUPPORTED:.*PATH/);
+        const prepareTmp = vi.fn();
+        const checked = await runIsolationCheck({ bot: 'bot', agent, policy, binary: identity, opts: options, env,
+          paths: f.paths, config: f.config }, { prepareTmp });
+        expect(checked.status).toBe('UNSUPPORTED');
+        expect(checked.checks).toContainEqual({ name: 'environment.path', status: 'UNSUPPORTED' });
+        expect(prepareTmp).not.toHaveBeenCalled();
+        expect(agentChildEnv(agent, { ...options, isolation: undefined }).PATH).toBe(PATH);
+      }
+      expect(binary()).toEqual(identity);
+    }
   });
   it('persists 600 records, detects binary/policy staleness and fails closed without overwriting corruption', () => {
     const p = f.policy();
@@ -68,7 +111,7 @@ describe('slice 5 admission and provenance', () => {
   it('keeps VERIFIED admission across /model, reasoning, agentsFile and per-message changes', async () => {
     const invalidate = vi.fn(); const replaceProcess = vi.fn();
     const runtime = new IsolationRuntime({ config: f.config, paths: f.paths, verification, store,
-      memory: new MemoryStore(f.paths.memoryDir), inheritedEnv: { PATH: '/bin' }, sdkVersions: { fixture: '1' }, invalidate, replaceProcess });
+      memory: new MemoryStore(f.paths.memoryDir), inheritedEnv: { PATH: '/bin', HOME: f.paths.home }, sdkVersions: { fixture: '1' }, invalidate, replaceProcess });
     const opts: SpawnOpts = { workingDirectory: f.workspace, permissionMode: 'blacklist', model: 'model-a',
       reasoningEffort: 'low', appendSystemPrompt: 'instructions-a', systemPrompt: 'system-a', initialPrompt: 'message-a',
       env: { CTI_SENDER_ID: 'alice', HTTPS_PROXY: 'http://fixture-a.invalid', LANG: 'en_US.UTF-8' } };
@@ -93,7 +136,7 @@ describe('slice 5 admission and provenance', () => {
     'sandboxOtherProtectedRoots', 'envKeys'] as const)('invalidates admission when isolation parameter %s changes', async field => {
     const invalidate = vi.fn();
     const runtime = new IsolationRuntime({ config: f.config, paths: f.paths, verification, store,
-      memory: new MemoryStore(f.paths.memoryDir), inheritedEnv: { PATH: '/bin' }, sdkVersions: { fixture: '1' }, invalidate });
+      memory: new MemoryStore(f.paths.memoryDir), inheritedEnv: { PATH: '/bin', HOME: f.paths.home }, sdkVersions: { fixture: '1' }, invalidate });
     const opts: SpawnOpts = { workingDirectory: f.workspace, permissionMode: 'blacklist' };
     const initial = await runtime.prepare(key, principal, f.workspace, opts, {}, false);
     verification.put(record(initial.fingerprint));
@@ -104,13 +147,27 @@ describe('slice 5 admission and provenance', () => {
     if (field === 'sandbox') opts.sandbox = 'off';
     if (field === 'sandboxBoxRoots') opts.sandboxBoxRoots = [f.root];
     if (field === 'sandboxOtherProtectedRoots') opts.sandboxOtherProtectedRoots = [f.root];
-    if (field === 'envKeys') opts.env = { ...opts.env, CODEX_HOME: join(f.root, 'agent-home') };
+    if (field === 'envKeys') opts.env = { ...opts.env, XDG_STATE_HOME: join(f.root, 'agent-state') };
     await expect(runtime.assert(key)).rejects.toThrow(ISOLATION_PAUSED);
     const changed = await runtime.prepare(key, principal, f.workspace, opts, {}, false, true);
     expect(changed.fingerprint).not.toBe(initial.fingerprint);
     expect(verification.state('bot', f.workspace, changed.fingerprint, binary())).toBe('STALE');
     expect(invalidate).toHaveBeenCalledWith(key);
   });
+  it('changing the bridge-owned Codex home invalidates verification and old session provenance', async () => {
+    const runtime = new IsolationRuntime({ config: f.config, paths: f.paths, verification, store,
+      memory: new MemoryStore(f.paths.memoryDir), inheritedEnv: { PATH: '/bin', HOME: f.paths.home }, sdkVersions: { fixture: '1' }, invalidate: vi.fn() });
+    const opts: SpawnOpts = { workingDirectory: f.workspace, permissionMode: 'blacklist' };
+    const initial = await runtime.prepare(key, principal, f.workspace, opts, {}, false);
+    verification.put(record(initial.fingerprint));
+    const previous = { ...context(initial.fingerprint), agentSessionId: 'old' };
+    f.paths.dataDir = join(f.root, 'moved-bridge');
+    const next = await runtime.prepare(key, principal, f.workspace, opts, {}, false, true);
+    expect(next.codexHome).not.toBe(initial.codexHome);
+    expect(verification.state('bot', f.workspace, next.fingerprint, binary())).toBe('STALE');
+    expect(canResumeIsolated(previous, context(next.fingerprint))).toBe(false);
+  });
+
   it('integration: manager gates spawn/resume, failure kills live children, forgetting rejects old generations', async () => {
     const memory = new MemoryStore(f.paths.memoryDir);
     const manager = new AgentManager(new ToolGate([]), () => {});
@@ -125,7 +182,7 @@ describe('slice 5 admission and provenance', () => {
     manager.registerPlugin(plugin);
     const invalidated = vi.fn((k: import('../src/types.js').SessionKey) => manager.forgetSession(k));
     const runtime = new IsolationRuntime({ config: f.config, paths: f.paths, verification, store, memory,
-      inheritedEnv: { PATH: '/bin' }, prepareTmp: async policy => { mkdirSync(policy.tmpdir, { recursive: true, mode: 0o700 }); }, sdkVersions: { fixture: '1' }, invalidate: invalidated });
+      inheritedEnv: { PATH: '/bin', HOME: f.paths.home }, prepareTmp: async policy => { mkdirSync(policy.tmpdir, { recursive: true, mode: 0o700 }); }, sdkVersions: { fixture: '1' }, invalidate: invalidated });
     manager.setIsolationGuard((k, opts, id) => runtime.guardStart(k, opts, id));
     const opts: SpawnOpts = { workingDirectory: f.workspace, permissionMode: 'blacklist' };
     const handlers = { onEvent: vi.fn(), onToolBlocked: vi.fn(), onPermissionTimeout: vi.fn(), onProcessExit: vi.fn() };

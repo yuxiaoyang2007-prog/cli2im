@@ -1,4 +1,5 @@
 import { homedir } from 'node:os';
+import { agentChildEnv, claudeCheckOptions } from '../isolation/check-options.js';
 import { allowedClaudeTool, claudeIsolationOptions } from '../isolation/claude.js';
 import { buildChildEnv } from '../security/child-env.js';
 import { PassThrough, Writable } from 'node:stream';
@@ -284,14 +285,7 @@ export class ClaudeCodeVirtualProcess implements AgentProcess {
     }
 
     const toolUseID = context.toolUseID;
-    this.stdout.write({
-      type: 'permission_request',
-      id: toolUseID,
-      tool: toolName,
-      input,
-    } satisfies AgentEvent);
-
-    return new Promise<PermissionResult>((resolve) => {
+    const result = new Promise<PermissionResult>((resolve) => {
       const abort = () => {
         this.settlePermission(toolUseID, {
           behavior: 'deny',
@@ -315,6 +309,15 @@ export class ClaudeCodeVirtualProcess implements AgentProcess {
       });
       context.signal.addEventListener('abort', abort, { once: true });
     });
+
+    // Consumers can reply synchronously from write(); register the request first.
+    this.stdout.write({
+      type: 'permission_request',
+      id: toolUseID,
+      tool: toolName,
+      input,
+    } satisfies AgentEvent);
+    return result;
   };
 
   private handleStdinChunk(chunk: Buffer | string | Uint8Array): void {
@@ -565,6 +568,7 @@ export class ClaudeCodeVirtualProcess implements AgentProcess {
     abortController: AbortController,
   ): ClaudeQueryOptions {
     const permissionMode = mapPermissionMode(this.opts.permissionMode);
+    const env = agentChildEnv('claude-code', this.opts);
     return {
       cwd: this.opts.workingDirectory,
       model: this.opts.model,
@@ -573,16 +577,17 @@ export class ClaudeCodeVirtualProcess implements AgentProcess {
       permissionMode,
       allowDangerouslySkipPermissions: permissionMode === 'bypassPermissions' ? true : undefined,
       includePartialMessages: true,
-      env: buildChildEnv('claude-code', this.opts.env),
+      env,
+      ...claudeCheckOptions(this.opts),
       systemPrompt: this.opts.appendSystemPrompt
         ? { type: 'preset', preset: 'claude_code', append: this.opts.appendSystemPrompt }
         : this.opts.systemPrompt,
       effort: this.opts.reasoningEffort,
-      pathToClaudeCodeExecutable: this.binary,
+      pathToClaudeCodeExecutable: this.opts.isolation ? this.opts.isolation.binaryPath : this.binary,
       canUseTool: this.canUseTool,
       // Raw CLI diagnostics can contain prompts, paths, or credentials.
       stderr: () => undefined,
-      ...(this.opts.isolation ? claudeIsolationOptions(this.opts.isolation, this.opts.env?.HOME ?? homedir()) : {}),
+      ...(this.opts.isolation ? claudeIsolationOptions(this.opts.isolation, env.HOME ?? homedir()) : {}),
     };
   }
 
