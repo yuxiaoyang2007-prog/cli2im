@@ -9,13 +9,15 @@
 # Protect the config/data directory; do not commit expanded credentials.
 # ============================================================
 
-# Follow the current macOS system HTTP/HTTPS proxy. If unavailable, pause network work.
+# Optional; omitted by default. Follow the current macOS system HTTP/HTTPS proxy.
+# With required: true, all bots stop whenever that proxy is off, so leave this out
+# when the proxy runs in TUN mode without a system proxy.
 # Linux/Windows: use mode: environment and configure HTTP_PROXY/HTTPS_PROXY.
 # Requires Node.js 24.14+ (24 LTS) or 25.4+. This is not an OS firewall or DNS leak test.
-network:
-  mode: system
-  required: true
-  noProxy: [127.0.0.1, localhost, "::1"]  # required mode permits local exceptions only
+# network:
+#   mode: system
+#   required: true
+#   noProxy: [127.0.0.1, localhost, "::1"]  # required mode permits local exceptions only
 
 # Explicit long-term memory; omitted by default. Enable per bot with memory: true.
 # memory:
