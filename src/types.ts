@@ -15,7 +15,7 @@ export interface SpawnOpts {
   isolation?: import('./isolation/policy.js').IsolationPolicy;
   workingDirectory: string;
   model?: string;
-  permissionMode: 'bypass' | 'blacklist';
+  permissionMode: 'bypass' | 'blacklist' | 'auto';
   env?: Record<string, string>;
   systemPrompt?: string;
   /**
@@ -59,6 +59,8 @@ export interface AgentPlugin {
   formatStdinMessage(msg: UserMessage): string;
   formatPermissionResponse(requestId: string, decision: 'allow' | 'deny'): string;
   formatCancelMessage?(): string;
+  /** Answers keyed by question text; an empty record means the user did not answer. */
+  formatQuestionResponse?(requestId: string, answers: Record<string, string>): string;
   shutdown?(): Promise<void>;
   capabilities: AgentCapabilities;
 }
@@ -71,10 +73,18 @@ export type AgentEvent =
   | { type: 'tool_use'; id: string; name: string; input: Record<string, unknown> }
   | { type: 'tool_result'; id: string; name: string; output: string; isError?: boolean }
   | { type: 'permission_request'; id: string; tool: string; input: Record<string, unknown> }
+  | { type: 'question_request'; id: string; questions: AgentQuestion[] }
   | { type: 'status'; sessionId?: string; message?: string }
   | { type: 'result'; sessionId: string; usage?: TokenUsage; createdFiles?: Array<string | FilePayload>; noRelay?: boolean }
   | { type: 'error'; message: string }
   | { type: 'file'; path: string; mimeType?: string };
+
+export interface AgentQuestion {
+  question: string;
+  header?: string;
+  multiSelect?: boolean;
+  options: Array<{ label: string; description?: string }>;
+}
 
 export interface TokenUsage {
   inputTokens: number;
@@ -94,6 +104,8 @@ export interface FileAttachment {
   size?: number;
   fileKey?: string;
   messageId?: string;
+  /** From a quoted/forwarded message: skipped instead of failing the turn when unavailable. */
+  optional?: boolean;
 }
 
 export interface SenderInfo {
@@ -106,6 +118,8 @@ export interface SenderInfo {
 }
 
 export interface InboundMessage {
+  /** Content of the message being replied to; prefixed to the agent prompt only. */
+  quotedText?: string;
   platform: string;
   messageId?: string;
   threadId?: string;
@@ -134,7 +148,7 @@ export interface OutboundContent {
 }
 
 export interface CardPayload {
-  type: 'streaming' | 'final' | 'permission' | 'error' | 'session_list';
+  type: 'streaming' | 'final' | 'permission' | 'error' | 'session_list' | 'question';
   content: string;
   title?: string;
   headerTemplate?: 'orange' | 'green';
@@ -298,7 +312,10 @@ export interface BotConfig {
   shortcuts?: Record<string, { description?: string; prompt: string }>;
   debounceMs?: number;
   speech?: { stt?: boolean; tts?: boolean };
-  permissionMode: 'bypass' | 'blacklist';
+  /** auto: Claude Code's classifier-based auto mode (claude-code bots only). */
+  permissionMode: 'bypass' | 'blacklist' | 'auto';
+  /** Extra environment variables for this bot's agent process only. */
+  env?: Record<string, string>;
   /**
    * Path to a per-bot runtime instructions file read on every conversation.
    * Relative paths resolve against `workingDirectory`; `~` is expanded.

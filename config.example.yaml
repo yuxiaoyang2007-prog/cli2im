@@ -64,11 +64,13 @@ bots:
                                         # ordinary users otherwise see only this chat/topic's bound sessions
     permissionMode: blacklist       # bypass = skip all tool approval
                                     # blacklist = block dangerous commands (default)
+                                    # auto = Claude Code auto mode (claude-code only); what it leaves for a human asks via IM card
     # --- Optional fields ---
     # autoApprove: false            # true = auto-approve all tool requests
     # turnTimeoutMs: 600000         # hard cap N ms after process START (not per-turn, never reset — can kill healthy long sessions); unset = no cap
     # idleTimeoutMs: 300000         # stop a stalled process; tasks are not automatically re-executed
     # larkCliConfigDir: ~/.lark-cli/  # path to lark-cli config (for lark-cli skills)
+    # env: { EXAMPLE_API_KEY: "${EXAMPLE_API_KEY}" }  # extra env for this bot's agent only; unset vars are dropped
     # agentsFile: AGENTS.md         # per-bot runtime instructions read every conversation.
                                     #   Relative paths resolve against workingDirectory; ~ is expanded.
                                     #   Defaults to AGENTS.md in workingDirectory when present.

@@ -2,6 +2,7 @@ import type {
   AgentPlugin,
   AgentProcess,
   AgentEvent,
+  AgentQuestion,
   SpawnOpts,
   PendingPermission,
   SessionKey,
@@ -14,6 +15,7 @@ import type { Transform } from 'node:stream';
 import { safeErrorFields } from '../security/logging.js';
 
 const PERMISSION_TIMEOUT_MS = 60_000;
+const QUESTION_TIMEOUT_MS = 30 * 60_000;
 const GRACEFUL_CANCEL_TIMEOUT_MS = 5_000;
 
 type WatchdogHandle = {
@@ -49,6 +51,9 @@ export interface AgentManagerEvents {
   onEvent: (sessionKey: SessionKey, event: AgentEvent, context: AgentEventContext) => void | Promise<void>;
   onToolBlocked: (sessionKey: SessionKey, command: string, requestId: string) => void | Promise<void>;
   onPermissionTimeout: (sessionKey: SessionKey, requestId: string) => void | Promise<void>;
+  /** Without this handler questions are answered as "not answered" immediately. */
+  onQuestion?: (sessionKey: SessionKey, requestId: string, questions: AgentQuestion[]) => void | Promise<void>;
+  onQuestionTimeout?: (sessionKey: SessionKey, requestId: string) => void | Promise<void>;
   onProcessExit: (
     sessionKey: SessionKey,
     code: number | null,
@@ -61,6 +66,12 @@ export type AgentProcessCleanupBinder = (signal: AbortSignal, sessionKey: Sessio
 
 function pendingPermissionKey(sessionKey: SessionKey, requestId: string): string {
   return `${sessionKey}::${requestId}`;
+}
+
+function describeToolRequest(tool: string, input: Record<string, unknown>): string {
+  if (typeof input.command === 'string') return input.command;
+  const detail = JSON.stringify(input);
+  return `${tool} ${detail.length > 300 ? `${detail.slice(0, 300)}…` : detail}`;
 }
 
 function deliverHandler(handler: () => void | Promise<void>): void {
@@ -77,6 +88,7 @@ export class AgentManager {
   private exitingContexts = new Map<SessionKey, ProcessContext>();
   private pendingPermissions = new Map<string, PendingPermission>();
   private pendingPermissionContexts = new Map<string, ProcessContext>();
+  private pendingQuestions = new Map<string, { requestId: string; agentName: string; timer: ReturnType<typeof setTimeout>; ctx: ProcessContext }>();
   private toolGate: ToolGate;
   private bindProcessCleanup: AgentProcessCleanupBinder;
 
@@ -257,6 +269,23 @@ export class AgentManager {
       ctx.proc.stdin.write(plugin.formatPermissionResponse(requestId, 'deny'));
     }
     return true;
+  }
+
+  answerQuestion(sessionKey: SessionKey, requestId: string, answers: Record<string, string>): boolean {
+    const key = pendingPermissionKey(sessionKey, requestId);
+    const pending = this.pendingQuestions.get(key);
+    if (!pending) return false;
+    this.clearPendingQuestion(key);
+    if (!this.isCurrentContext(sessionKey, pending.ctx) || pending.ctx.signal.aborted) return false;
+    const plugin = this.plugins.get(pending.agentName);
+    if (!plugin?.formatQuestionResponse) return false;
+    pending.ctx.proc.stdin.write(plugin.formatQuestionResponse(requestId, answers));
+    return true;
+  }
+
+  hasPendingQuestion(sessionKey: SessionKey, requestId: string): boolean {
+    const pending = this.pendingQuestions.get(pendingPermissionKey(sessionKey, requestId));
+    return !!pending && this.isCurrentContext(sessionKey, pending.ctx) && !pending.ctx.signal.aborted;
   }
 
   getPendingPermissionForSession(sessionKey: SessionKey): PendingPermission | undefined {
@@ -549,14 +578,36 @@ export class AgentManager {
 
       watchdog.markActivity();
 
+      if (event.type === 'question_request') {
+        const onQuestion = handlers.onQuestion;
+        if (!onQuestion || !plugin.formatQuestionResponse) {
+          proc.stdin.write(plugin.formatQuestionResponse?.(event.id, {}) ?? '');
+          return;
+        }
+        const key = pendingPermissionKey(sessionKey, event.id);
+        const timer = setTimeout(() => {
+          if (this.pendingQuestions.get(key)?.ctx !== ctx) return;
+          this.clearPendingQuestion(key);
+          if (this.isCurrentContext(sessionKey, ctx)) proc.stdin.write(plugin.formatQuestionResponse!(event.id, {}));
+          deliverHandler(() => handlers.onQuestionTimeout?.(sessionKey, event.id));
+        }, QUESTION_TIMEOUT_MS);
+        this.pendingQuestions.set(key, { requestId: event.id, agentName: plugin.name, timer, ctx });
+        deliverHandler(() => onQuestion(sessionKey, event.id, event.questions));
+        return;
+      }
+
       if (event.type === 'permission_request') {
-        if (opts.autoApprove) {
+        // Auto mode only forwards what its classifier left for a human, so always ask.
+        const autoMode = opts.permissionMode === 'auto';
+        if (opts.autoApprove && !autoMode) {
           proc.stdin.write(plugin.formatPermissionResponse(event.id, 'allow'));
           deliverHandler(() => handlers.onEvent(sessionKey, event, eventContext));
           return;
         }
 
-        const gateResult = this.toolGate.check(event.tool, event.input);
+        const gateResult = autoMode
+          ? { action: 'block' as const, command: describeToolRequest(event.tool, event.input) }
+          : this.toolGate.check(event.tool, event.input);
 
         if (gateResult.action === 'block') {
           const key = pendingPermissionKey(sessionKey, event.id);
@@ -635,6 +686,15 @@ export class AgentManager {
     for (const key of [...ctx.pendingPermissionKeys]) {
       this.clearPendingPermissionByKey(key, ctx);
     }
+    for (const [key, pending] of this.pendingQuestions) {
+      if (pending.ctx === ctx) this.clearPendingQuestion(key);
+    }
+  }
+
+  private clearPendingQuestion(key: string): void {
+    const pending = this.pendingQuestions.get(key);
+    if (pending) clearTimeout(pending.timer);
+    this.pendingQuestions.delete(key);
   }
 
   private clearPendingPermission(sessionKey: SessionKey, requestId: string, ctx: ProcessContext): void {

@@ -163,6 +163,8 @@ export class MessageBatcher {
       this.batches.set(sessionKey, batch);
     } else {
       batch.message.text = [batch.message.text, message.text].filter(Boolean).join('\n\n');
+      const quotedText = [batch.message.quotedText, message.quotedText].filter(Boolean).join('\n\n');
+      if (quotedText) batch.message.quotedText = quotedText;
       batch.message.attachments = [...(batch.message.attachments ?? []), ...(message.attachments ?? []).map((attachment) => ({ ...attachment }))];
       batch.count++;
       // Fixed maximum wait from the first message avoids starving long bursts.

@@ -59,7 +59,10 @@ interface TelegramMessage {
   caption_entities?: TelegramEntity[];
   photo?: TelegramPhotoSize[];
   document?: TelegramDocument;
+  video?: TelegramDocument;
+  audio?: TelegramDocument;
   voice?: TelegramVoice;
+  reply_to_message?: TelegramMessage;
 }
 
 interface TelegramEntity {
@@ -208,7 +211,7 @@ export class TelegramAdapter implements PlatformAdapter {
         callback_data: button.value,
       }));
       payload.reply_markup = {
-        inline_keyboard: content.card.type === 'session_list'
+        inline_keyboard: content.card.type === 'session_list' || content.card.type === 'question'
           ? mapped.map((b) => [b])
           : [mapped],
       };
@@ -423,29 +426,8 @@ export function parseTelegramUpdate(update: unknown, botUsername?: string): Inbo
   const message = typed.message;
   if (message?.chat?.id === undefined || message.from?.id === undefined) return null;
 
-  const attachments: FileAttachment[] = [];
+  const attachments: FileAttachment[] = telegramFileAttachments(message);
   const messageId = message.message_id === undefined ? undefined : String(message.message_id);
-
-  const photo = largestPhoto(message.photo);
-  if (photo?.file_id) {
-    attachments.push({
-      type: 'image',
-      fileKey: photo.file_id,
-      size: photo.file_size,
-      messageId,
-    });
-  }
-
-  if (message.document?.file_id) {
-    attachments.push({
-      type: 'file',
-      fileKey: message.document.file_id,
-      fileName: message.document.file_name,
-      mimeType: message.document.mime_type,
-      size: message.document.file_size,
-      messageId,
-    });
-  }
 
   const isVoice = Boolean(message.voice?.file_id);
   if (message.voice?.file_id) {
@@ -459,6 +441,12 @@ export function parseTelegramUpdate(update: unknown, botUsername?: string): Inbo
   }
 
   let text = message.text ?? message.caption ?? '';
+  // Topic messages reply to the topic's opening service message; that is not a quote.
+  const quoted = message.reply_to_message
+    && !(message.is_topic_message && message.reply_to_message.message_id === message.message_thread_id)
+    ? message.reply_to_message : undefined;
+  const quotedText = quoted ? quoted.text ?? quoted.caption ?? '' : '';
+  const quotedAttachments = quoted ? telegramFileAttachments(quoted).map((item) => ({ ...item, optional: true })) : [];
   const entities = message.text === undefined ? message.caption_entities : message.entities;
   const mentions = (entities ?? []).flatMap(entity => {
     const value = text.slice(entity.offset, entity.offset + entity.length);
@@ -475,8 +463,10 @@ export function parseTelegramUpdate(update: unknown, botUsername?: string): Inbo
     text = `/${addressedCommand[1]}${text.slice(addressedCommand[0].length)}`;
   }
   if (!text && attachments.length === 0) return null;
+  attachments.push(...quotedAttachments);
 
   return {
+    ...(quotedText || quotedAttachments.length > 0 ? { quotedText: quotedText || '[见附件]' } : {}),
     platform: 'telegram',
     chatId: String(message.chat.id),
     messageId,
@@ -511,6 +501,32 @@ export function parseTelegramCallback(update: unknown): CallbackQuery | null {
     messageId: String(messageId),
     threadId: !callback.message?.is_topic_message || callback.message.message_thread_id === undefined ? undefined : String(callback.message.message_thread_id),
   };
+}
+
+function telegramFileAttachments(message: TelegramMessage): FileAttachment[] {
+  const attachments: FileAttachment[] = [];
+  const messageId = message.message_id === undefined ? undefined : String(message.message_id);
+  const photo = largestPhoto(message.photo);
+  if (photo?.file_id) {
+    attachments.push({
+      type: 'image',
+      fileKey: photo.file_id,
+      size: photo.file_size,
+      messageId,
+    });
+  }
+  for (const file of [message.document, message.video, message.audio]) {
+    if (!file?.file_id) continue;
+    attachments.push({
+      type: 'file',
+      fileKey: file.file_id,
+      fileName: file.file_name,
+      mimeType: file.mime_type,
+      size: file.file_size,
+      messageId,
+    });
+  }
+  return attachments;
 }
 
 function largestPhoto(photos: TelegramPhotoSize[] | undefined): TelegramPhotoSize | undefined {

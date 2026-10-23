@@ -58,6 +58,17 @@ function buildCallbackSessionKey(callback: CallbackQuery, botName: string): Sess
   return buildSessionKey(callback.platform, callback.chatId, botName, callback.threadId);
 }
 
+export interface QuestionCallbackData {
+  token: string;
+  question: number;
+  option: number;
+}
+
+export function parseQuestionCallbackData(rawData: string): QuestionCallbackData | null {
+  const match = /^ask:([0-9a-f]{8}):(\d{1,2}):(\d{1,2})$/.exec(unwrapCallbackAction(rawData));
+  return match ? { token: match[1], question: Number(match[2]), option: Number(match[3]) } : null;
+}
+
 export function parseSessionResumeCallback(rawData: string): SessionResumeCallbackData | null {
   const compact = parseCompactResume(rawData);
   if (compact) return compact;

@@ -1,6 +1,7 @@
 import type { PlatformAdapter, SessionKey } from '../../types.js';
 import { scrubLog } from '../../security/logging.js';
 import type { AbortableOptions } from '../../abort.js';
+import { stripFileMarkers } from '../../agents/codex-file-markers.js';
 
 interface TelegramBufferState {
   chatId: string;
@@ -38,7 +39,7 @@ export class TelegramStreamController {
     }
     state.finalizing = true;
 
-    const text = state.buffer.trim();
+    const text = (state.buffer.includes('[[file:') ? stripFileMarkers(state.buffer) : state.buffer).trim();
     if (!text) {
       if (this.isCurrentState(sessionKey, state)) {
         this.states.delete(sessionKey);

@@ -5,7 +5,7 @@ import { buildChildEnv } from '../security/child-env.js';
 import { PassThrough, Writable } from 'node:stream';
 import { EventEmitter } from 'node:events';
 import { query } from '@anthropic-ai/claude-agent-sdk';
-import { resolveSafeFilePayloads } from './codex-file-markers.js';
+import { extractFileMarkerCandidates, resolveSafeFilePayloads } from './codex-file-markers.js';
 import { InputQueue } from './input-queue.js';
 import type {
   CanUseTool,
@@ -20,6 +20,7 @@ import type {
   AgentPlugin,
   AgentProcess,
   AgentEvent,
+  AgentQuestion,
   AgentCapabilities,
   SpawnOpts,
   UserMessage,
@@ -41,7 +42,14 @@ type ClaudeQueryFn = typeof query;
 type StdinPayload =
   | { type: 'user'; message: UserMessage }
   | { type: 'tool_use_permission_response'; tool_use_id: string; decision: 'allow' | 'deny' }
+  | { type: 'question_response'; tool_use_id: string; answers: Record<string, string> }
   | { type: 'cancel' };
+
+const HEARTBEAT_THROTTLE_MS = 30_000;
+const KEEP_ALIVE_INTERVAL_MS = 60_000;
+
+const FILE_SEND_NOTE = '要把文件发给聊天中的用户时：文件需放在当前工作目录内（必要时先复制进来），'
+  + '并在回复里单独写一行 [[file:相对路径]]；bridge 会在本轮结束后发送该文件，并在显示时隐藏这行标记。';
 
 export interface SDKEventMappingState {
   hasStreamedDeltas: boolean;
@@ -163,8 +171,32 @@ function asRecord(value: unknown): Record<string, unknown> {
   return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {};
 }
 
+// Only newly written files are auto-sent; edits to existing files (e.g. source code in a
+// project) would flood the chat. Anything else is sent via [[file:]] markers.
 function isFileWritingTool(toolName: string): boolean {
-  return toolName === 'Write' || toolName === 'Edit' || toolName === 'MultiEdit';
+  return toolName === 'Write';
+}
+
+export function parseAskUserQuestions(input: Record<string, unknown>): AgentQuestion[] | undefined {
+  if (!Array.isArray(input.questions) || input.questions.length === 0) return undefined;
+  const questions: AgentQuestion[] = [];
+  for (const raw of input.questions) {
+    const item = asRecord(raw);
+    if (typeof item.question !== 'string' || !Array.isArray(item.options)) return undefined;
+    const options = item.options.map(asRecord).filter((option) => typeof option.label === 'string')
+      .map((option) => ({
+        label: option.label as string,
+        ...(typeof option.description === 'string' ? { description: option.description } : {}),
+      }));
+    if (options.length === 0) return undefined;
+    questions.push({
+      question: item.question,
+      ...(typeof item.header === 'string' ? { header: item.header } : {}),
+      multiSelect: item.multiSelect === true,
+      options,
+    });
+  }
+  return questions;
 }
 
 function filePathFromToolInput(input: Record<string, unknown>): string | null {
@@ -193,7 +225,8 @@ function isThinkingBlockMutationErrorText(content: string): boolean {
 }
 
 function mapPermissionMode(permissionMode: SpawnOpts['permissionMode']): PermissionMode {
-  return permissionMode === 'bypass' ? 'bypassPermissions' : 'default';
+  if (permissionMode === 'bypass') return 'bypassPermissions';
+  return permissionMode === 'auto' ? 'auto' : 'default';
 }
 
 function isCancelMessage(payload: StdinPayload): boolean {
@@ -240,6 +273,11 @@ export class ClaudeCodeVirtualProcess implements AgentProcess {
   private bufferingResumeInput = false;
   private resumeAttemptHasSideEffects = false;
   private pendingPermissions = new Map<string, PendingPermissionResolver>();
+  private questionInputs = new Map<string, Record<string, unknown>>();
+  private backgroundTaskIds = new Set<string>();
+  private effectivePermissionMode?: PermissionMode;
+  private lastHeartbeatAt = Date.now();
+  private keepAliveTimer?: ReturnType<typeof setInterval>;
   private eventEmitter = new EventEmitter();
   private mappingState = createSDKEventMappingState();
 
@@ -280,7 +318,12 @@ export class ClaudeCodeVirtualProcess implements AgentProcess {
       return { behavior: 'deny', message: 'Isolation tool guard denied this request' };
     }
 
-    if (this.opts.autoApprove) {
+    if (toolName === 'AskUserQuestion') {
+      const questions = parseAskUserQuestions(input);
+      if (questions) return this.askUser(questions, input, context);
+    }
+
+    if (this.opts.autoApprove && !this.usesAutoModeApproval()) {
       return { behavior: 'allow', updatedInput: input };
     }
 
@@ -320,6 +363,86 @@ export class ClaudeCodeVirtualProcess implements AgentProcess {
     return result;
   };
 
+  private askUser(
+    questions: AgentQuestion[],
+    input: Record<string, unknown>,
+    context: { toolUseID: string; signal: AbortSignal },
+  ): Promise<PermissionResult> {
+    const toolUseID = context.toolUseID;
+    const result = new Promise<PermissionResult>((resolve) => {
+      const abort = () => {
+        this.settlePermission(toolUseID, { behavior: 'deny', message: 'Question was cancelled', toolUseID });
+      };
+      if (context.signal.aborted) {
+        resolve({ behavior: 'deny', message: 'Question was cancelled', toolUseID });
+        return;
+      }
+      this.questionInputs.set(toolUseID, input);
+      this.pendingPermissions.set(toolUseID, {
+        resolve,
+        cleanup: () => context.signal.removeEventListener('abort', abort),
+      });
+      context.signal.addEventListener('abort', abort, { once: true });
+    });
+
+    this.stdout.write({ type: 'question_request', id: toolUseID, questions } satisfies AgentEvent);
+    return result;
+  }
+
+  private resolveQuestion(toolUseID: string, answers: Record<string, string>): void {
+    const input = this.questionInputs.get(toolUseID);
+    if (!input) return;
+    // No answers keeps the original input, which the tool reports as "did not answer".
+    this.settlePermission(toolUseID, {
+      behavior: 'allow',
+      updatedInput: Object.keys(answers).length > 0 ? { ...input, answers } : input,
+    });
+  }
+
+  // In auto mode the classifier settles routine calls itself; whatever still reaches
+  // canUseTool (ask rules, the fallback after repeated denials) needs a human.
+  private usesAutoModeApproval(): boolean {
+    return this.opts.permissionMode === 'auto' && this.effectivePermissionMode === 'auto';
+  }
+
+  private noteSDKMessage(msg: SDKMessage): void {
+    if (msg.type === 'system') {
+      if (msg.subtype === 'task_started') this.backgroundTaskIds.add(msg.task_id);
+      if (msg.subtype === 'task_notification') this.backgroundTaskIds.delete(msg.task_id);
+      if (msg.subtype === 'task_updated' && ['completed', 'failed', 'killed'].includes(msg.patch.status ?? '')) {
+        this.backgroundTaskIds.delete(msg.task_id);
+      }
+      if ((msg.subtype === 'init' || msg.subtype === 'status') && msg.permissionMode) {
+        this.effectivePermissionMode = msg.permissionMode;
+      }
+    }
+    // Any SDK traffic (tool progress, task updates, thinking) proves the CLI is alive.
+    this.writeHeartbeat();
+  }
+
+  // Background tasks and pending questions emit nothing while they wait; heartbeat so
+  // the bridge's idle watchdog only reclaims a process that is truly idle.
+  private startKeepAlive(): void {
+    if (this.keepAliveTimer) return;
+    this.keepAliveTimer = setInterval(() => {
+      if (this.backgroundTaskIds.size > 0 || this.pendingPermissions.size > 0) this.writeHeartbeat();
+    }, KEEP_ALIVE_INTERVAL_MS);
+    this.keepAliveTimer.unref?.();
+  }
+
+  private stopKeepAlive(): void {
+    if (this.keepAliveTimer) clearInterval(this.keepAliveTimer);
+    this.keepAliveTimer = undefined;
+  }
+
+  private writeHeartbeat(): void {
+    if (this.terminated || this.exitEmitted) return;
+    const now = Date.now();
+    if (now - this.lastHeartbeatAt < HEARTBEAT_THROTTLE_MS) return;
+    this.lastHeartbeatAt = now;
+    this.stdout.write({ type: 'status' } satisfies AgentEvent);
+  }
+
   private handleStdinChunk(chunk: Buffer | string | Uint8Array): void {
     this.inputBuffer += Buffer.isBuffer(chunk) ? chunk.toString('utf8') : String(chunk);
     const lines = this.inputBuffer.split('\n');
@@ -340,6 +463,11 @@ export class ClaudeCodeVirtualProcess implements AgentProcess {
 
     if (payload.type === 'tool_use_permission_response') {
       this.resolvePermission(payload.tool_use_id, payload.decision);
+      return;
+    }
+
+    if (payload.type === 'question_response') {
+      this.resolveQuestion(payload.tool_use_id, payload.answers ?? {});
       return;
     }
 
@@ -368,6 +496,7 @@ export class ClaudeCodeVirtualProcess implements AgentProcess {
     if (this.terminated) return;
 
     this.activeQuery = true;
+    this.startKeepAlive();
 
     try {
       let resumeForAttempt = this.sdkSessionId;
@@ -410,6 +539,7 @@ export class ClaudeCodeVirtualProcess implements AgentProcess {
     const bufferedStatusEvents: AgentEvent[] = [];
     const pendingFilePathsByToolId = new Map<string, string>();
     const completedFilePaths: string[] = [];
+    let turnText = '';
     const attemptAbort = this.createAttemptAbortController();
     let hasSideEffectsSinceLastResult = false;
     let resumeFailed = false;
@@ -424,6 +554,7 @@ export class ClaudeCodeVirtualProcess implements AgentProcess {
       }) as Query;
 
       for await (const sdkMessage of queryInstance) {
+        this.noteSDKMessage(sdkMessage);
         const isSyntheticAssistant =
           sdkMessage.type === 'assistant' && sdkMessage.message?.model === '<synthetic>';
         const events = mapSDKEvent(sdkMessage, this.mappingState);
@@ -436,6 +567,8 @@ export class ClaudeCodeVirtualProcess implements AgentProcess {
             if (filePath) {
               pendingFilePathsByToolId.set(event.id, filePath);
             }
+          } else if (event.type === 'text') {
+            turnText += event.content;
           } else if (event.type === 'tool_result') {
             const filePath = pendingFilePathsByToolId.get(event.id);
             if (!filePath) continue;
@@ -468,12 +601,12 @@ export class ClaudeCodeVirtualProcess implements AgentProcess {
             hasSideEffectsSinceLastResult = true;
           }
 
-          // Attach createdFiles to result event
-          if (event.type === 'result' && completedFilePaths.length > 0) {
-            const resolved = await resolveCreatedFiles(
-              completedFilePaths,
-              this.opts.workingDirectory,
-            );
+          // Attach createdFiles (written files plus [[file:]] markers) to result event
+          if (event.type === 'result') {
+            const filesToSend = [...new Set([...completedFilePaths, ...extractFileMarkerCandidates(turnText)])];
+            const resolved = filesToSend.length > 0
+              ? await resolveCreatedFiles(filesToSend, this.opts.workingDirectory)
+              : [];
             if (resolved.length > 0) {
               event.createdFiles = resolved;
             }
@@ -503,6 +636,7 @@ export class ClaudeCodeVirtualProcess implements AgentProcess {
             resetTurnMappingState(this.mappingState);
             pendingFilePathsByToolId.clear();
             completedFilePaths.length = 0;
+            turnText = '';
           }
         }
       }
@@ -569,6 +703,9 @@ export class ClaudeCodeVirtualProcess implements AgentProcess {
   ): ClaudeQueryOptions {
     const permissionMode = mapPermissionMode(this.opts.permissionMode);
     const env = agentChildEnv('claude-code', this.opts);
+    const appendSystemPrompt = this.opts.appendSystemPrompt && !this.opts.isolation
+      ? `${this.opts.appendSystemPrompt}\n\n${FILE_SEND_NOTE}`
+      : this.opts.appendSystemPrompt;
     return {
       cwd: this.opts.workingDirectory,
       model: this.opts.model,
@@ -579,8 +716,8 @@ export class ClaudeCodeVirtualProcess implements AgentProcess {
       includePartialMessages: true,
       env,
       ...claudeCheckOptions(this.opts),
-      systemPrompt: this.opts.appendSystemPrompt
-        ? { type: 'preset', preset: 'claude_code', append: this.opts.appendSystemPrompt }
+      systemPrompt: appendSystemPrompt
+        ? { type: 'preset', preset: 'claude_code', append: appendSystemPrompt }
         : this.opts.systemPrompt,
       effort: this.opts.reasoningEffort,
       pathToClaudeCodeExecutable: this.opts.isolation ? this.opts.isolation.binaryPath : this.binary,
@@ -613,6 +750,7 @@ export class ClaudeCodeVirtualProcess implements AgentProcess {
       });
     }
     this.pendingPermissions.clear();
+    this.questionInputs.clear();
   }
 
   private settlePermission(toolUseID: string, result: PermissionResult): void {
@@ -620,6 +758,7 @@ export class ClaudeCodeVirtualProcess implements AgentProcess {
     if (!pending) return;
 
     this.pendingPermissions.delete(toolUseID);
+    this.questionInputs.delete(toolUseID);
     pending.cleanup();
     pending.resolve(result);
   }
@@ -635,6 +774,7 @@ export class ClaudeCodeVirtualProcess implements AgentProcess {
     if (this.terminated) return;
 
     this.terminated = true;
+    this.stopKeepAlive();
     this.abortController.abort();
     this.inputQueue.close();
     this.coldStartReplayInputs = [];
@@ -650,6 +790,7 @@ export class ClaudeCodeVirtualProcess implements AgentProcess {
     if (this.exitEmitted) return;
 
     this.exitEmitted = true;
+    this.stopKeepAlive();
     this.stdout.end();
     this.eventEmitter.emit('exit', code);
   }
@@ -737,6 +878,14 @@ export class ClaudeCodePlugin implements AgentPlugin {
       type: 'tool_use_permission_response',
       tool_use_id: requestId,
       decision,
+    }) + '\n';
+  }
+
+  formatQuestionResponse(requestId: string, answers: Record<string, string>): string {
+    return JSON.stringify({
+      type: 'question_response',
+      tool_use_id: requestId,
+      answers,
     }) + '\n';
   }
 

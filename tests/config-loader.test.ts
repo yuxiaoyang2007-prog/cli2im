@@ -81,6 +81,21 @@ ${notificationYaml}
     expect(loadAccessFixture({ permissionMode: undefined }).bots.testbot.permissionMode).toBe('blacklist');
   });
 
+  it('accepts auto permission mode and per-bot env for claude-code bots', () => {
+    const agents = { agents: { 'claude-code': { binary: '/usr/local/bin/claude' } } };
+    const result = loadAccessFixture({ agent: 'claude-code', permissionMode: 'auto', env: { EXAMPLE_API_KEY: 'key' } }, agents);
+    expect(result.bots.testbot.permissionMode).toBe('auto');
+    expect(result.bots.testbot.env).toEqual({ EXAMPLE_API_KEY: 'key' });
+  });
+
+  it('drops env entries left empty by an unset variable instead of disabling the bot', () => {
+    expect(loadAccessFixture({ env: { MISSING: null, SET: 'v' } }).bots.testbot.env).toEqual({ SET: 'v' });
+  });
+
+  it.each([{ permissionMode: 'auto' }, { env: { KEY: 1 } }, { env: 'KEY=1' }])('rejects %j outside its supported shape', (changes) => {
+    expect(() => loadAccessFixture(changes)).toThrow('Config error');
+  });
+
   it('loads explicit access grants and operational settings', () => {
     const result = loadAccessFixture({ enabled: true, adminUsers: [123, 'user'], allowPublic: false,
       sessionRoots: [tmpDir], projects: { demo: tmpDir }, shortcuts: { review: { prompt: 'Review current changes', description: 'Review' } },

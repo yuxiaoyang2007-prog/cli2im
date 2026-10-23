@@ -47,6 +47,7 @@ import {
   handlePermissionCallback,
   isCallbackAuthorized,
   parsePermissionCallbackData,
+  parseQuestionCallbackData,
   parseSessionResumeCallback,
 } from './runtime/callbacks.js';
 import { handleCLISessionResume, scanAgentSessions } from './runtime/session-resume.js';
@@ -80,6 +81,7 @@ import { canAccessSession, getBotAccessRejection, isBotAdmin } from './security/
 import { configureNetworkPolicy, refreshNetworkPolicy, assertNetworkReady, networkPolicyStatus } from './security/network-policy.js';
 import { BotLifecycle } from './runtime/bot-lifecycle.js';
 import { buildControlPanel, parseControlAction } from './runtime/control-panel.js';
+import { QuestionBoard, answersFromText, buildQuestionCard } from './runtime/questions.js';
 import { ProjectRegistry, buildProjectPanel, parseProjectAction } from './runtime/projects.js';
 import { bindReplyRoute, type ReplyRoute } from './runtime/reply-route.js';
 import { RecoveryStore } from './runtime/result-recovery.js';
@@ -179,6 +181,39 @@ async function main(): Promise<void> {
   const routes = new Map<SessionKey, ReplyRoute>();
   const cardScopes = new Map<string, { threadId?: string }>();
   const senders = new Map<SessionKey, InboundMessage>();
+  const questionBoard = new QuestionBoard();
+
+  async function submitQuestion(key: SessionKey, adapter: PlatformAdapter, chatId: string, answers: Record<string, string>): Promise<void> {
+    const pending = questionBoard.get(key);
+    if (!pending) return;
+    questionBoard.close(key, pending.requestId);
+    pending.answers = answers;
+    const delivered = agentManager.answerQuestion(key, pending.requestId, answers);
+    if (pending.messageId && adapter.replaceCard) {
+      await adapter.replaceCard(pending.messageId, buildQuestionCard(pending, delivered ? 'done' : 'expired'));
+    } else {
+      await adapter.send(chatId, { text: delivered ? `已提交：${Object.values(answers).join('；')}` : '这个问题已失效。', plainText: true });
+    }
+  }
+
+  async function handleQuestionCallback(key: SessionKey, adapter: PlatformAdapter, chatId: string, data: { token: string; question: number; option: number }): Promise<void> {
+    const pending = questionBoard.get(key);
+    if (!pending || pending.token !== data.token || !agentManager.hasPendingQuestion(key, pending.requestId)) {
+      if (pending && pending.token === data.token) questionBoard.close(key, pending.requestId);
+      await adapter.send(chatId, { text: '这个问题已失效。', plainText: true });
+      return;
+    }
+    if (questionBoard.select(pending, data.question, data.option)) {
+      await submitQuestion(key, adapter, chatId, pending.answers);
+    } else if (pending.messageId && adapter.replaceCard) {
+      await adapter.replaceCard(pending.messageId, buildQuestionCard(pending));
+    } else {
+      const question = pending.questions[data.question];
+      const answer = question ? pending.answers[question.question] : undefined;
+      const picked = [...(pending.selections.get(data.question) ?? [])].map((index) => question?.options[index]?.label).filter(Boolean);
+      await adapter.send(chatId, { text: answer ? `已记录：${answer}` : `当前已选：${picked.join(', ') || '无'}`, plainText: true });
+    }
+  }
   const batchers = new Map<string, MessageBatcher>();
   const toolGate = new ToolGate(config.dangerousPatterns);
   const typingTimers = new Map<string, ReturnType<typeof setInterval>>();
@@ -391,7 +426,7 @@ async function main(): Promise<void> {
         const resolvedBotName = findBotNameForConfig(params.botConfig);
         return resolveBotSpawnOpts({
           ...params,
-          env: { ...config.agents[params.botConfig.agent]?.env,
+          env: { ...config.agents[params.botConfig.agent]?.env, ...params.botConfig.env,
             ...(params.botConfig.larkCliConfigDir ? { LARKSUITE_CLI_CONFIG_DIR: params.botConfig.larkCliConfigDir } : {}),
             ...params.env },
           model: params.model ?? config.agents[params.botConfig.agent]?.defaultModel,
@@ -484,6 +519,25 @@ async function main(): Promise<void> {
           await adapter.send(chatId, { text: '危险操作已超时自动拒绝' });
         }
       },
+      onQuestion: async (_sk, requestId, questions) => {
+        if (!adapter) {
+          agentManager.answerQuestion(sessionKey, requestId, {});
+          return;
+        }
+        const pending = questionBoard.open(sessionKey, requestId, questions);
+        try {
+          pending.messageId = await adapter.send(chatId, { card: buildQuestionCard(pending) });
+        } catch (err) {
+          questionBoard.close(sessionKey, requestId);
+          agentManager.answerQuestion(sessionKey, requestId, {});
+          throw err;
+        }
+      },
+      onQuestionTimeout: async (_sk, requestId) => {
+        if (questionBoard.close(sessionKey, requestId) && adapter) {
+          await adapter.send(chatId, { text: '提问 30 分钟无人回答，已按未回答继续。' });
+        }
+      },
       onProcessExit: createRuntimeProcessExitHandler({
         onExit: async context => {
           const cancellation = busyTasks.cancel(sessionKey, context.signal);
@@ -562,6 +616,12 @@ async function main(): Promise<void> {
         callback.threadId = scope.threadId;
       }
       const key = buildSessionKey(callback.platform, callback.chatId, botName, callback.threadId);
+      const question = parseQuestionCallbackData(callback.data);
+      if (question) {
+        void handleQuestionCallback(key, bindReplyRoute(adapter, routes.get(key) ?? {}), callback.chatId, question)
+          .catch(() => console.error('[pipeline] question_callback_failed'));
+        return;
+      }
       senders.set(key, { platform: callback.platform, chatId: callback.chatId, userId: callback.userId, chatType: callback.chatType, messageId: callback.messageId, threadId: callback.threadId, text: '' });
       routes.set(key, callback.threadId ? { threadId: callback.threadId, replyToMessageId: callback.messageId } : {});
       if ((botConfig.memory || botConfig.isolation?.enabled) && parseSessionResumeCallback(callback.data)) {
@@ -698,6 +758,16 @@ async function main(): Promise<void> {
         return;
       }
 
+      // A text reply while Claude waits on AskUserQuestion is the answer, not a new prompt.
+      const pendingQuestion = !msg.isRelay && msg.text ? questionBoard.get(ctx.sessionKey) : undefined;
+      if (pendingQuestion) {
+        if (agentManager.hasPendingQuestion(ctx.sessionKey, pendingQuestion.requestId)) {
+          await submitQuestion(ctx.sessionKey, adapter, msg.chatId, answersFromText(pendingQuestion, msg.text));
+          return;
+        }
+        questionBoard.close(ctx.sessionKey, pendingQuestion.requestId);
+      }
+
       assertNetworkReady();
       const sessionKey = ctx.sessionKey;
       const checkPreparation = preparation.capture(sessionKey);
@@ -779,7 +849,11 @@ async function main(): Promise<void> {
       }
 
       ensureReady();
-      const messageText = senderHeader + msg.text;
+      const quote = msg.quotedText ? `[引用的消息]\n${msg.quotedText}\n[/引用的消息]\n\n` : '';
+      // Claude Code only dispatches slash commands and skills that start the prompt.
+      const messageText = botConfig.agent === 'claude-code' && msg.text.startsWith('/')
+        ? `${msg.text}\n\n${quote}${senderHeader.trimEnd()}`
+        : senderHeader + quote + msg.text;
       if (isolatedOpts) isolatedOpts.initialPrompt = messageText;
       const userMessage = await buildUserMessageForAgent(
         botConfig.agent,
@@ -811,7 +885,7 @@ async function main(): Promise<void> {
         const larkCliEnv: Record<string, string> = botConfig.larkCliConfigDir
           ? { LARKSUITE_CLI_CONFIG_DIR: botConfig.larkCliConfigDir }
           : {};
-        const spawnEnv = { ...config.agents[botConfig.agent]?.env, ...senderEnv, ...larkCliEnv };
+        const spawnEnv = { ...config.agents[botConfig.agent]?.env, ...botConfig.env, ...senderEnv, ...larkCliEnv };
 
         const spawnOpts = isolatedOpts ?? await resolveBotSpawnOpts({
           botConfig,

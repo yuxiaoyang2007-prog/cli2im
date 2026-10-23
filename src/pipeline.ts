@@ -174,6 +174,7 @@ export class InboundPipeline {
 
     if (!msg.isRelay) {
       msg.text = sanitizeInput(msg.text);
+      if (msg.quotedText) msg.quotedText = sanitizeInput(msg.quotedText);
     }
 
     const sessionKey = buildSessionKey(msg.platform, msg.chatId, botName, msg.threadId);

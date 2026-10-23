@@ -30,20 +30,25 @@ export async function downloadInboundAttachments(
   else await ensureTargetDirGitignore(targetDir);
   for (const attachment of msg.attachments) {
     if (attachment.localPath || !attachment.fileKey || !attachment.messageId) continue;
-    if (typeof attachment.size === 'number') {
-      assertWithinAttachmentDownloadLimit(attachment.size);
-    }
+    try {
+      if (typeof attachment.size === 'number') {
+        assertWithinAttachmentDownloadLimit(attachment.size);
+      }
 
-    const data = await adapter.downloadFile(
-      attachment.messageId,
-      attachment.fileKey,
-      attachment.type,
-    );
-    assertWithinAttachmentDownloadLimit(data.byteLength);
-    const path = join(targetDir, buildAttachmentFileName(attachment));
-    await writeFile(path, data, { mode: 0o600, flag: 'wx' });
-    attachment.localPath = path;
+      const data = await adapter.downloadFile(
+        attachment.messageId,
+        attachment.fileKey,
+        attachment.type,
+      );
+      assertWithinAttachmentDownloadLimit(data.byteLength);
+      const path = join(targetDir, buildAttachmentFileName(attachment));
+      await writeFile(path, data, { mode: 0o600, flag: 'wx' });
+      attachment.localPath = path;
+    } catch (err) {
+      if (!attachment.optional) throw err;
+    }
   }
+  msg.attachments = msg.attachments.filter((attachment) => !attachment.optional || attachment.localPath);
 }
 
 export function expandHome(p: string): string {

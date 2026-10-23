@@ -848,3 +848,70 @@ function deferred<T>() {
   });
   return { promise, resolve, reject };
 }
+
+describe('FeishuAdapter referenced messages', () => {
+  beforeEach(() => {
+    larkMocks.clients.length = 0;
+    vi.stubEnv('CLI2IM_NETWORK_REQUIRED', '0');
+  });
+  afterEach(() => { vi.unstubAllEnvs(); });
+
+  function setup(items: Record<string, unknown[]>) {
+    const adapter = new FeishuAdapter({ appId: 'app', appSecret: 'secret', botName: 'bot' });
+    const client = larkMocks.clients[larkMocks.clients.length - 1] as any;
+    client.im.message.get = vi.fn(async ({ path }: { path: { message_id: string } }) => (
+      items[path.message_id] ? { code: 0, data: { items: items[path.message_id] } } : { code: 230001 }
+    ));
+    const received: InboundMessage[] = [];
+    adapter.onMessage((msg) => received.push(msg));
+    const handle = (message: Record<string, unknown>) => (adapter as unknown as { handleMessage(data: unknown): void }).handleMessage({
+      event: { sender: { sender_type: 'user', sender_id: { open_id: 'ou_1' } }, message: { chat_id: 'oc_1', chat_type: 'p2p', ...message } },
+    });
+    return { client, received, handle };
+  }
+
+  it('keeps the user text and carries the quoted message separately', async () => {
+    const { received, handle } = setup({
+      om_parent: [{ message_id: 'om_parent', msg_type: 'interactive', body: { content: JSON.stringify({ elements: [[{ tag: 'text', text: '第二点是什么' }]] }) } }],
+    });
+    handle({ message_id: 'om_1', parent_id: 'om_parent', message_type: 'text', content: '{"text":"/stop"}' });
+    await vi.waitFor(() => expect(received).toHaveLength(1));
+    expect(received[0]).toMatchObject({ text: '/stop', quotedText: '第二点是什么' });
+  });
+
+  it('skips the implicit thread-root parent', () => {
+    const { client, received, handle } = setup({});
+    handle({ message_id: 'om_2', thread_id: 'omt_1', root_id: 'om_root', parent_id: 'om_root', message_type: 'text', content: '{"text":"hi"}' });
+    expect(received).toHaveLength(1);
+    expect(client.im.message.get).not.toHaveBeenCalled();
+  });
+
+  it('expands merged forwards and marks their images optional', async () => {
+    const { received, handle } = setup({
+      om_merge: [
+        { message_id: 'om_merge', msg_type: 'merge_forward' },
+        { message_id: 'om_c1', upper_message_id: 'om_merge', msg_type: 'text', body: { content: '{"text":"第一句"}' } },
+        { message_id: 'om_c2', upper_message_id: 'om_merge', msg_type: 'image', body: { content: '{"image_key":"img_c2"}' } },
+      ],
+    });
+    handle({ message_id: 'om_merge', message_type: 'merge_forward', content: '{}' });
+    await vi.waitFor(() => expect(received).toHaveLength(1));
+    expect(received[0].text).toContain('[合并转发的聊天记录]');
+    expect(received[0].text).toContain('- 第一句');
+    expect(received[0].attachments).toEqual([expect.objectContaining({ fileKey: 'img_c2', messageId: 'om_c2', optional: true })]);
+  });
+
+  it('falls back to the bare message when the quoted message cannot be read', async () => {
+    const { received, handle } = setup({});
+    handle({ message_id: 'om_3', parent_id: 'om_missing', message_type: 'text', content: '{"text":"看这个"}' });
+    await vi.waitFor(() => expect(received).toHaveLength(1));
+    expect(received[0].text).toBe('看这个');
+    expect(received[0].quotedText).toBeUndefined();
+  });
+
+  it('treats video messages as file attachments', () => {
+    const { received, handle } = setup({});
+    handle({ message_id: 'om_4', message_type: 'media', content: JSON.stringify({ file_key: 'vid_key', file_name: 'clip.mp4', image_key: 'thumb' }) });
+    expect(received[0].attachments).toEqual([expect.objectContaining({ type: 'file', fileKey: 'vid_key', fileName: 'clip.mp4' })]);
+  });
+});

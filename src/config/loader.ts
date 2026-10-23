@@ -209,8 +209,16 @@ function validateBotConfig(name: string, bot: BotConfig): void {
     throw new Error(`Config error: bot "${name}" workingDirectory must be a path`);
   }
   if (bot.permissionMode === undefined) bot.permissionMode = 'blacklist';
-  if (bot.permissionMode !== 'bypass' && bot.permissionMode !== 'blacklist') {
-    throw new Error(`Config error: bot "${name}" permissionMode must be bypass or blacklist`);
+  if (bot.permissionMode !== 'bypass' && bot.permissionMode !== 'blacklist' && bot.permissionMode !== 'auto') {
+    throw new Error(`Config error: bot "${name}" permissionMode must be bypass, blacklist or auto`);
+  }
+  if (bot.permissionMode === 'auto' && (bot.agent !== 'claude-code' || bot.isolation?.enabled)) {
+    throw new Error(`Config error: bot "${name}" permissionMode auto requires a non-isolated claude-code bot`);
+  }
+  // An unset ${VAR} leaves an empty YAML value; treat it as absent rather than disabling the bot.
+  if (isRecord(bot.env)) bot.env = Object.fromEntries(Object.entries(bot.env).filter(([, value]) => value != null)) as Record<string, string>;
+  if (bot.env != null && (!isRecord(bot.env) || Object.values(bot.env).some((value) => typeof value !== 'string'))) {
+    throw new Error(`Config error: bot "${name}" env must map names to strings`);
   }
   if (bot.platform === 'feishu' && (!bot.feishu?.appId || !bot.feishu?.appSecret)) {
     throw new Error(`Config error: bot "${name}" missing feishu appId/appSecret`);

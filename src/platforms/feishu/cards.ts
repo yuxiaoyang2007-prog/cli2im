@@ -1,6 +1,11 @@
 import type { FeishuAdapter } from './adapter.js';
 import type { AgentEvent } from '../../types.js';
 import type { AbortableOptions } from '../../abort.js';
+import { stripFileMarkers } from '../../agents/codex-file-markers.js';
+
+// Long silent steps (builds, background tasks, waiting on a question) still refresh the
+// card so the chat can tell a busy turn from a stuck one.
+const LIVENESS_INTERVAL_MS = 30_000;
 
 interface StreamingCardState {
   chatId: string;
@@ -12,6 +17,7 @@ interface StreamingCardState {
   lastUpdateLength: number;
   updateSeq: number;
   timer: ReturnType<typeof setTimeout> | null;
+  ticker: ReturnType<typeof setInterval> | null;
   finalized: boolean;
   startedAt: number;
   // Serializes patch (updateCard) calls for this card in call order. The Feishu
@@ -47,7 +53,8 @@ export class StreamingCardController {
       title,
     }, options);
 
-    this.cards.set(sessionKey, {
+    this.stopTicker(this.cards.get(sessionKey));
+    const card: StreamingCardState = {
       chatId,
       messageId,
       content: '',
@@ -57,10 +64,31 @@ export class StreamingCardController {
       lastUpdateLength: 0,
       updateSeq: 0,
       timer: null,
+      ticker: null,
       finalized: false,
       startedAt: Date.now(),
       patchChain: Promise.resolve(),
-    });
+    };
+    this.cards.set(sessionKey, card);
+    this.startTicker(sessionKey, card, options);
+  }
+
+  private startTicker(sessionKey: string, card: StreamingCardState, options: AbortableOptions): void {
+    this.stopTicker(card);
+    card.ticker = setInterval(() => {
+      if (card.finalized || !this.isCurrentCard(sessionKey, card) || options.signal?.aborted) {
+        this.stopTicker(card);
+        return;
+      }
+      void this.flushUpdate(sessionKey, card, options);
+    }, LIVENESS_INTERVAL_MS);
+    card.ticker.unref?.();
+  }
+
+  private stopTicker(card: StreamingCardState | undefined): void {
+    if (!card?.ticker) return;
+    clearInterval(card.ticker);
+    card.ticker = null;
   }
 
   // Serialize a patch behind any in-flight patches for this card so a slow
@@ -95,6 +123,7 @@ export class StreamingCardController {
       // status / result / a stray late delta of the finished turn do not reopen.
       if (!this.isContentEvent(event) && event.type !== 'error') return;
       this.reopenCard(card);
+      this.startTicker(sessionKey, card, options);
       // fall through to render this event on the reopened card
     }
 
@@ -226,6 +255,7 @@ export class StreamingCardController {
     if (options.signal?.aborted || !this.isCurrentCard(sessionKey, card) || card.finalized) return;
 
     card.finalized = true;
+    this.stopTicker(card);
     if (card.timer) {
       clearTimeout(card.timer);
       card.timer = null;
@@ -263,12 +293,18 @@ export class StreamingCardController {
       parts.push('*Thinking...*');
     }
 
-    if (card.content) {
-      parts.push(card.content);
+    const content = card.content.includes('[[file:') ? stripFileMarkers(card.content) : card.content;
+    if (content) {
+      parts.push(content);
     }
 
     if (card.toolStatus) {
       parts.push(card.toolStatus);
+    }
+
+    const elapsed = Math.round((Date.now() - card.startedAt) / 1000);
+    if (!card.finalized && elapsed * 1000 >= LIVENESS_INTERVAL_MS) {
+      parts.push(`⏳ 运行中 · ${this.formatDuration(elapsed)}`);
     }
 
     return parts.join('\n\n') || 'Processing...';

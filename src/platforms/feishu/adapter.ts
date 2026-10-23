@@ -9,6 +9,7 @@ import type {
   FilePayload,
   CardPayload,
   CallbackQuery,
+  FileAttachment,
 } from '../../types.js';
 import type { AbortableOptions } from '../../abort.js';
 import { throwIfAborted } from '../../abort.js';
@@ -447,58 +448,9 @@ export class FeishuAdapter implements PlatformAdapter {
     const sender = event.sender;
     if (sender?.sender_type === 'app') return;
 
-    let text = '';
-    const attachments = [];
-    if (message.message_type === 'text') {
-      try {
-        const content = JSON.parse(message.content ?? '{}');
-        text = content.text ?? '';
-      } catch {
-        text = message.content ?? '';
-      }
-    } else if (message.message_type === 'image') {
-      const content = parseMessageContent(message.content);
-      if (typeof content.image_key === 'string') {
-        attachments.push({
-          type: 'image' as const,
-          fileKey: content.image_key,
-          messageId: message.message_id,
-          mimeType: 'image/png',
-        });
-      }
-    } else if (message.message_type === 'audio') {
-      const content = parseMessageContent(message.content);
-      const fileKey = content.file_key ?? content.fileKey;
-      if (typeof fileKey === 'string') {
-        attachments.push({
-          type: 'audio' as const,
-          fileKey,
-          messageId: message.message_id,
-          mimeType: 'audio/ogg',
-        });
-      }
-    } else if (message.message_type === 'file') {
-      const content = parseMessageContent(message.content);
-      if (typeof content.file_key === 'string') {
-        attachments.push({
-          type: 'file' as const,
-          fileKey: content.file_key,
-          messageId: message.message_id,
-          fileName: typeof content.file_name === 'string' ? content.file_name : undefined,
-        });
-      }
-    } else if (message.message_type === 'post') {
-      const { extractedText, imageKeys } = parsePostContent(message.content);
-      text = extractedText;
-      for (const key of imageKeys) {
-        attachments.push({
-          type: 'image' as const,
-          fileKey: key,
-          messageId: message.message_id,
-          mimeType: 'image/png',
-        });
-      }
-    }
+    const parsed = parseFeishuMessageContent(message.message_type, message.content, message.message_id);
+    const attachments = parsed.attachments;
+    let text = parsed.text;
 
     let isVoice = message.message_type === 'audio';
     text = text.replace(/@_user_\d+\s*/g, '').trim();
@@ -507,20 +459,75 @@ export class FeishuAdapter implements PlatformAdapter {
       .map((mention: FeishuMention) => mention.id?.open_id)
       .filter((openId: string | undefined): openId is string => Boolean(openId));
 
-    this.messageHandler({
+    const dispatch = (finalText: string, finalAttachments: FileAttachment[], quotedText?: string) => this.messageHandler?.({
+      ...(quotedText ? { quotedText } : {}),
       platform: 'feishu',
       chatId: message.chat_id,
       messageId: message.message_id,
       threadId: message.thread_id,
       userId: sender?.sender_id?.open_id ?? '',
       userName: sender?.sender_id?.open_id,
-      text,
+      text: finalText,
       chatType: message.chat_type,
-      attachments: attachments.length > 0 ? attachments : undefined,
+      attachments: finalAttachments.length > 0 ? finalAttachments : undefined,
       isVoice,
       mentions,
       raw: data,
     });
+
+    if (isQuotedReply(message) || message.message_type === 'merge_forward') {
+      void this.expandReferencedMessages(message, text, attachments)
+        .catch(() => {
+          console.warn(`[feishu] referenced_message_fetch_failed bot=${this.config.botName}`);
+          return { text, attachments, quotedText: undefined };
+        })
+        .then((expanded) => dispatch(expanded.text, expanded.attachments, expanded.quotedText));
+      return;
+    }
+    dispatch(text, attachments);
+  }
+
+  // Quoted replies and merged forwards only carry message ids; fetch their content so
+  // the agent sees what the user points at.
+  private async expandReferencedMessages(
+    message: NonNullable<FeishuMessageEvent['message']>,
+    text: string,
+    attachments: FileAttachment[],
+  ): Promise<{ text: string; attachments: FileAttachment[]; quotedText?: string }> {
+    const sections: string[] = [];
+    const extra: FileAttachment[] = [];
+    let quotedText: string | undefined;
+    if (message.message_type === 'merge_forward' && message.message_id) {
+      const children = (await this.fetchMessageItems(message.message_id))
+        .filter((item) => item.upper_message_id === message.message_id);
+      const lines: string[] = [];
+      for (const child of children) {
+        const content = parseFeishuMessageContent(child.msg_type, child.body?.content, child.message_id);
+        extra.push(...content.attachments);
+        lines.push(`- ${content.text || `[${child.msg_type ?? '未知'}消息]`}`);
+      }
+      sections.push(`[合并转发的聊天记录]\n${lines.join('\n') || '（没有可读内容）'}`);
+    }
+    if (isQuotedReply(message) && message.parent_id) {
+      const [parent] = await this.fetchMessageItems(message.parent_id);
+      if (parent) {
+        const content = parseFeishuMessageContent(parent.msg_type, parent.body?.content, parent.message_id);
+        extra.push(...content.attachments);
+        quotedText = content.text || (content.attachments.length > 0 ? '[见附件]' : undefined);
+      }
+    }
+    return {
+      quotedText,
+      text: [...sections, text].filter(Boolean).join('\n\n'),
+      attachments: [...attachments, ...extra.slice(0, MAX_REFERENCED_ATTACHMENTS).map((item) => ({ ...item, optional: true }))],
+    };
+  }
+
+  private async fetchMessageItems(messageId: string): Promise<FeishuMessageItem[]> {
+    const response = await atFeishuSdkBoundary(() => this.client.im.message.get({ path: { message_id: messageId } }));
+    assertSuccessfulFeishuResponse(response, 'message get');
+    const items = (response as { data?: { items?: unknown } }).data?.items;
+    return Array.isArray(items) ? items as FeishuMessageItem[] : [];
   }
 
   private handleCardAction(data: unknown): unknown {
@@ -650,6 +657,95 @@ interface FeishuCardAction {
   };
 }
 
+interface FeishuMessageItem {
+  message_id?: string;
+  msg_type?: string;
+  upper_message_id?: string;
+  body?: { content?: string };
+}
+
+const MAX_REFERENCED_ATTACHMENTS = 10;
+const MAX_CARD_TEXT_CHARS = 8_000;
+
+// Cards (including this bot's own replies) carry their visible text under these keys.
+function collectCardText(value: unknown, out: string[]): void {
+  if (Array.isArray(value)) {
+    for (const item of value) collectCardText(item, out);
+  } else if (value && typeof value === 'object') {
+    for (const [key, item] of Object.entries(value)) {
+      if ((key === 'text' || key === 'content' || key === 'title') && typeof item === 'string') {
+        if (item.trim()) out.push(item.trim());
+      } else {
+        collectCardText(item, out);
+      }
+    }
+  }
+}
+
+function parseFeishuMessageContent(
+  messageType: string | undefined,
+  rawContent: string | undefined,
+  messageId: string | undefined,
+): { text: string; attachments: FileAttachment[] } {
+  let text = '';
+  const attachments: FileAttachment[] = [];
+  if (messageType === 'text') {
+    try {
+      const content = JSON.parse(rawContent ?? '{}');
+      text = content.text ?? '';
+    } catch {
+      text = rawContent ?? '';
+    }
+  } else if (messageType === 'image') {
+    const content = parseMessageContent(rawContent);
+    if (typeof content.image_key === 'string') {
+      attachments.push({
+        type: 'image' as const,
+        fileKey: content.image_key,
+        messageId,
+        mimeType: 'image/png',
+      });
+    }
+  } else if (messageType === 'audio') {
+    const content = parseMessageContent(rawContent);
+    const fileKey = content.file_key ?? content.fileKey;
+    if (typeof fileKey === 'string') {
+      attachments.push({
+        type: 'audio' as const,
+        fileKey,
+        messageId,
+        mimeType: 'audio/ogg',
+      });
+    }
+  } else if (messageType === 'file' || messageType === 'media') {
+    const content = parseMessageContent(rawContent);
+    if (typeof content.file_key === 'string') {
+      attachments.push({
+        type: 'file' as const,
+        fileKey: content.file_key,
+        messageId,
+        fileName: typeof content.file_name === 'string' ? content.file_name : undefined,
+      });
+    }
+  } else if (messageType === 'interactive') {
+    const parts: string[] = [];
+    collectCardText(parseMessageContent(rawContent), parts);
+    text = parts.join('\n').slice(0, MAX_CARD_TEXT_CHARS);
+  } else if (messageType === 'post') {
+    const { extractedText, imageKeys } = parsePostContent(rawContent);
+    text = extractedText;
+    for (const key of imageKeys) {
+      attachments.push({
+        type: 'image' as const,
+        fileKey: key,
+        messageId,
+        mimeType: 'image/png',
+      });
+    }
+  }
+  return { text, attachments };
+}
+
 interface FeishuMessageEvent {
   sender?: {
     sender_type?: string;
@@ -664,8 +760,15 @@ interface FeishuMessageEvent {
     chat_type?: string;
     message_type?: string;
     content?: string;
+    parent_id?: string;
+    root_id?: string;
     mentions?: FeishuMention[];
   };
+}
+
+// Thread messages point parent_id at the thread root by default; only explicit replies quote.
+function isQuotedReply(message: NonNullable<FeishuMessageEvent['message']>): boolean {
+  return !!message.parent_id && !(message.thread_id && message.parent_id === message.root_id);
 }
 
 function unwrapEvent(data: unknown): FeishuMessageEvent {

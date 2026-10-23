@@ -76,11 +76,9 @@ describe('ClaudeCodePlugin runtime instructions (appendSystemPrompt)', () => {
     proc.stdin.write(plugin.formatStdinMessage({ role: 'user', content: 'hi' }));
     await waitFor(() => stdoutEvents.some((event) => event.type === 'result'));
 
-    expect(captured.systemPrompt).toEqual({
-      type: 'preset',
-      preset: 'claude_code',
-      append: 'Always answer in French.',
-    });
+    expect(captured.systemPrompt).toMatchObject({ type: 'preset', preset: 'claude_code' });
+    expect(captured.systemPrompt.append).toMatch(/^Always answer in French\.\n\n/);
+    expect(captured.systemPrompt.append).toContain('[[file:');
   });
 
   it('leaves systemPrompt untouched when no runtime instructions are set', async () => {
@@ -1211,13 +1209,12 @@ describe('ClaudeCodeVirtualProcess query lifecycle', () => {
     }
   });
 
-  it('tracks Edit-created files as createdFiles', async () => {
+  it('does not auto-send files that were only edited', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'cli2im-cc-edit-'));
     try {
-      const outPath = join(dir, 'created.ts');
+      writeFileSync(join(dir, 'existing.ts'), 'export const ok = true;\n');
       const queryFn = vi.fn(() => (async function* () {
-        yield assistantToolUse('tu_edit', 'Edit', { file_path: 'created.ts' });
-        writeFileSync(outPath, 'export const ok = true;\n');
+        yield assistantToolUse('tu_edit', 'Edit', { file_path: 'existing.ts' });
         yield toolResult('tu_edit', false);
         yield successResult('ses_edit');
       })());
@@ -1229,13 +1226,31 @@ describe('ClaudeCodeVirtualProcess query lifecycle', () => {
       proc.stdin.write(plugin.formatStdinMessage({ role: 'user', content: 'edit file' }));
 
       await waitFor(() => stdoutEvents.some((event) => event.type === 'result'));
-      const result = stdoutEvents.find((event) => event.type === 'result');
-      expect(result).toMatchObject({
-        type: 'result',
-        createdFiles: [expect.objectContaining({
-          path: realpathSync(outPath),
-          name: 'created.ts',
-        })],
+      expect(stdoutEvents.find((event) => event.type === 'result')).not.toHaveProperty('createdFiles');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('sends files named by [[file:]] markers in the turn text', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'cli2im-cc-marker-'));
+    try {
+      const outPath = join(dir, 'report.xlsx');
+      writeFileSync(outPath, 'data');
+      const queryFn = vi.fn(() => (async function* () {
+        yield assistantText('表格生成好了。\n[[file:report.xlsx]]\n[[file:../outside.xlsx]]');
+        yield successResult('ses_marker');
+      })());
+      const plugin = new ClaudeCodePlugin('/usr/local/bin/claude', queryFn as any);
+      const proc = plugin.spawn({ ...baseOpts(), workingDirectory: dir });
+      const stdoutEvents: AgentEvent[] = [];
+      proc.stdout.on('data', (event: AgentEvent) => stdoutEvents.push(event));
+
+      proc.stdin.write(plugin.formatStdinMessage({ role: 'user', content: 'make a report' }));
+
+      await waitFor(() => stdoutEvents.some((event) => event.type === 'result'));
+      expect(stdoutEvents.find((event) => event.type === 'result')).toMatchObject({
+        createdFiles: [expect.objectContaining({ path: realpathSync(outPath), name: 'report.xlsx' })],
       });
     } finally {
       rmSync(dir, { recursive: true, force: true });
