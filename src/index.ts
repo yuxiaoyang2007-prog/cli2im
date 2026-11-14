@@ -3,19 +3,10 @@ export { resolveBotSpawnOpts, readAgentsInstructions, DEFAULT_AGENTS_FILE, MAX_A
 export type { ResolveBotSpawnOptsInput, BotSpawnOptsResolver } from './runtime/spawn-options.js';
 import { loadRuntimeConfig } from './config/loader.js';
 import { SessionStore } from './session/store.js';
-import { CLISessionScanner } from './session/cli-scanner.js';
-import { CodexSessionScanner } from './session/codex-scanner.js';
-import { GeminiSessionScanner } from './session/gemini-scanner.js';
-import { AntigravitySessionScanner } from './session/antigravity-scanner.js';
 import { ChatQueue, MessageBatcher, QueueCancelledError } from './session/queue.js';
 import { AgentManager, type AgentManagerEvents } from './agents/manager.js';
 import { ToolGate } from './agents/tool-gate.js';
-import { ClaudeCodePlugin } from './agents/claude-code.js';
-import { CodexPlugin } from './agents/codex.js';
-import { GeminiPlugin } from './agents/gemini.js';
-import { AgyPlugin } from './agents/agy.js';
-import { ZcodePlugin } from './agents/zcode.js';
-import { KimiWorkPlugin } from './agents/kimi-work.js';
+import { createStaticAgentPlugin, hotReloadAgentPlugin } from './agents/plugin-loader.js';
 import { FeishuAdapter } from './platforms/feishu/adapter.js';
 import { TelegramAdapter } from './platforms/telegram/adapter.js';
 import { TelegramStreamController } from './platforms/telegram/stream.js';
@@ -32,25 +23,32 @@ import {
 import {
   buildPermissionBlockedCard,
   buildHandoffNotification,
-  buildHandoffReleaseNotification,
-  buildCLISessionCard,
 } from './platforms/feishu/markdown.js';
-import { buildCLISessionText } from './platforms/telegram/markdown.js';
 import { sanitizeVoiceTranscript } from './security/validators.js';
 import {
   buildUserMessageForAgent,
   downloadInboundAttachments,
   expandHome,
 } from './media.js';
-import { initContentGuard, contentGuardStatus } from './security/content-guard.js';
+import {
+  initContentGuard,
+  contentGuardStatus,
+  contentGuardBackend,
+  scanUntrustedExternalText,
+} from './security/content-guard.js';
+import { applyHotConfigReload } from './config/reload.js';
+import { deliverCliNotification } from './notifications/cli-notify.js';
+import { runOnlineDoctorProbes, formatOnlineDoctorSection } from './services/doctor-online.js';
+import { renderDashboardHtml } from './services/dashboard.js';
 import {
   handlePermissionCallback,
   isCallbackAuthorized,
+  parseModelOrEffortAction,
   parsePermissionCallbackData,
   parseQuestionCallbackData,
   parseSessionResumeCallback,
 } from './runtime/callbacks.js';
-import { handleCLISessionResume, scanAgentSessions } from './runtime/session-resume.js';
+import { handleCLISessionResume } from './runtime/session-resume.js';
 import { transcribeAudio } from './services/speech.js';
 import { sendVoiceReply } from './runtime/voice-reply.js';
 import type {
@@ -72,17 +70,17 @@ import {
 } from './runtime/session-scoped-cleanup.js';
 import { ensurePrivateDirectorySync, getCli2imDataDir } from './util/data-dir.js';
 import { homedir } from 'node:os';
-import { join, relative, isAbsolute } from 'node:path';
+import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { readFile, realpath, stat } from 'node:fs/promises';
+import { readFile } from 'node:fs/promises';
 import { CodexNotificationService } from './notifications/service.js';
 import { buildSessionKey } from './types.js';
-import { canAccessSession, getBotAccessRejection, isBotAdmin } from './security/access-policy.js';
+import { getBotAccessRejection } from './security/access-policy.js';
 import { configureNetworkPolicy, refreshNetworkPolicy, assertNetworkReady, networkPolicyStatus } from './security/network-policy.js';
 import { BotLifecycle } from './runtime/bot-lifecycle.js';
-import { buildControlPanel, parseControlAction } from './runtime/control-panel.js';
+import { buildQueueNoticeCard, parseControlAction, parseQueueSteerAction } from './runtime/control-panel.js';
 import { QuestionBoard, answersFromText, buildQuestionCard } from './runtime/questions.js';
-import { ProjectRegistry, buildProjectPanel, parseProjectAction } from './runtime/projects.js';
+import { parseProjectAction } from './runtime/projects.js';
 import { bindReplyRoute, type ReplyRoute } from './runtime/reply-route.js';
 import { RecoveryStore } from './runtime/result-recovery.js';
 import { TaskTracker } from './runtime/task-tracker.js';
@@ -98,43 +96,23 @@ import { MemoryStore } from './memory/store.js';
 import { MemoryInjector } from './memory/inject.js';
 import { MemorySessions } from './memory/sessions.js';
 import { resolvePeople, resolveRuntimeMemoryIdentity } from './memory/principal.js';
-import { handleMemoryCommand, type MemoryCommandContext } from './memory/commands.js';
+import type { MemoryCommandContext } from './memory/commands.js';
 import { resolveExecutionScope, ensureExecutionSession } from './runtime/execution-scope.js';
-import { textPage } from './runtime/text-page.js';
 import { PreparationGuard } from './runtime/preparation-guard.js';
+import { loadDataDirDotEnv } from './config/dotenv.js';
+import { rotateLogFileIfNeeded, pruneStaleMediaFiles } from './util/housekeeping.js';
 import { saveBotEnabled } from './config/runtime-update.js';
 import { runDoctor, formatDoctorReport, formatServiceInventory } from './services/doctor.js';
+import {
+  handleBridgeCommand,
+  type BridgeControls,
+  type BridgeCommandSender,
+  type RuntimeCommandState,
+} from './commands/bridge-commands.js';
+export { handleBridgeCommand, type BridgeControls, type BridgeCommandSender };
 
-const CONFIG_PATH = process.env.CLI2IM_CONFIG ?? join(homedir(), '.cli2im', 'config.yaml');
+let CONFIG_PATH = process.env.CLI2IM_CONFIG ?? join(homedir(), '.cli2im', 'config.yaml');
 const startedAt = Date.now();
-
-interface RuntimeCommandState {
-  fastModeBySession: Map<SessionKey, boolean>;
-}
-
-export interface BridgeControls {
-  resumeIsolated?: Parameters<typeof handleCLISessionResume>[0]['resumeIsolated'];
-  isolatedSessions?: () => Promise<import('./isolation/provenance.js').SessionProvenance[]>;
-  memory?: MemoryCommandContext;
-  defaultModel?: string;
-  queue?: ChatQueue;
-  lifecycle?: BotLifecycle;
-  runPrompt?: (prompt: string) => Promise<void>;
-  doctor?: () => Promise<string>;
-  capturePreparation?: (key: SessionKey) => () => void;
-  cancelScope?: (key: SessionKey) => void;
-  readResult?: (key: SessionKey) => Promise<import('./runtime/result-recovery.js').RecoveredResult | null>;
-  controlBot?: (name: string, action: 'start' | 'stop' | 'restart') => Promise<void>;
-}
-
-
-export interface BridgeCommandSender {
-  platform: string;
-  chatType?: string;
-  userId: string;
-  threadId?: string;
-  messageId?: string;
-}
 
 export function logInboundMessageSummary(
   botName: string,
@@ -156,6 +134,8 @@ export function logInboundMessageSummary(
 }
 
 async function main(): Promise<void> {
+  loadDataDirDotEnv();
+  CONFIG_PATH = process.env.CLI2IM_CONFIG ?? join(homedir(), '.cli2im', 'config.yaml');
   console.log('[cli2im] Starting...');
 
   const { config, botErrors, botIdentities } = loadRuntimeConfig(CONFIG_PATH);
@@ -167,12 +147,29 @@ async function main(): Promise<void> {
 
   const dataDir = getCli2imDataDir();
   const mediaDir = join(dataDir, 'media');
+  const logPath = join(dataDir, 'logs', 'cli2im.log');
   ensurePrivateDirectorySync(dataDir);
   ensurePrivateDirectorySync(mediaDir);
   ensurePrivateDirectorySync(join(dataDir, 'logs'));
 
-  const store = await SessionStore.create(config.session.dbPath.replace('~', homedir()));
+  const store = await SessionStore.create(config.session.dbPath.replace('~', homedir()), {
+    coalesceMs: 250,
+  });
   await store.markInterruptedTasks();
+  try {
+    if (rotateLogFileIfNeeded(logPath)) console.log('[housekeeping] Rotated cli2im.log');
+    const prunedMedia = pruneStaleMediaFiles(mediaDir);
+    if (prunedMedia > 0) console.log(`[housekeeping] Pruned ${prunedMedia} stale media file(s)`);
+    const prunedDb = store.pruneStaleRecords({ pruneMissingCursorFiles: true });
+    if (prunedDb.deletedCursors + prunedDb.deletedDeliveries + prunedDb.deletedTasks > 0) {
+      console.log(
+        `[housekeeping] Pruned stale DB records cursors=${prunedDb.deletedCursors}`
+        + ` deliveries=${prunedDb.deletedDeliveries} tasks=${prunedDb.deletedTasks}`,
+      );
+    }
+  } catch (err) {
+    console.warn(`[housekeeping] startup_failed reason=${scrubLog(err instanceof Error ? err.message : String(err))}`);
+  }
   const queue = new ChatQueue();
   const preparation = new PreparationGuard();
   const recovery = new RecoveryStore(join(dataDir, 'recovery'));
@@ -181,7 +178,36 @@ async function main(): Promise<void> {
   const routes = new Map<SessionKey, ReplyRoute>();
   const cardScopes = new Map<string, { threadId?: string }>();
   const senders = new Map<SessionKey, InboundMessage>();
+  let configUpdate = Promise.resolve();
+  const reloadRuntimeConfig = () => {
+    const run = configUpdate.catch(() => {}).then(() =>
+      applyHotConfigReload({
+        config,
+        configPath: CONFIG_PATH,
+        envPath: join(dataDir, '.env'),
+        toolGate,
+      }),
+    );
+    configUpdate = run.then(() => {}, () => {});
+    return run;
+  };
   const questionBoard = new QuestionBoard();
+  const pendingQueuedMsgs = new Map<SessionKey, InboundMessage[]>();
+  const queueNoticeIds = new Map<SessionKey, string>();
+
+  function popMergedQueuedMessage(key: SessionKey): InboundMessage | undefined {
+    const items = pendingQueuedMsgs.get(key);
+    pendingQueuedMsgs.delete(key);
+    if (!items?.length) return undefined;
+    if (items.length === 1) return items[0];
+    const base: InboundMessage = { ...items[items.length - 1] };
+    base.text = items.map((m) => m.text).filter(Boolean).join('\n\n');
+    const quoted = items.map((m) => m.quotedText).filter(Boolean).join('\n\n');
+    if (quoted) base.quotedText = quoted;
+    const attachments = items.flatMap((m) => m.attachments ?? []);
+    if (attachments.length) base.attachments = attachments;
+    return base;
+  }
 
   async function submitQuestion(key: SessionKey, adapter: PlatformAdapter, chatId: string, answers: Record<string, string>): Promise<void> {
     const pending = questionBoard.get(key);
@@ -272,7 +298,9 @@ async function main(): Promise<void> {
         ...(bot.larkCliConfigDir ? { LARKSUITE_CLI_CONFIG_DIR: bot.larkCliConfigDir } : {}) },
       model: prefs.model ?? config.agents[bot.agent]?.defaultModel, autoApprove: bot.autoApprove,
       turnTimeoutMs: bot.turnTimeoutMs, idleTimeoutMs: bot.idleTimeoutMs, sandboxMode: bot.sandboxMode,
-      reasoningEffort: runtimeState.fastModeBySession.get(key) ? 'low' : config.agents[bot.agent]?.defaultEffort });
+      reasoningEffort: runtimeState.fastModeBySession.get(key)
+        ? 'low'
+        : (prefs.effort ?? config.agents[bot.agent]?.defaultEffort) });
     const policy = await isolation.prepare(key, identity.principal, resolveExecutionScope(bot, message).scopeKey, opts, [...people.entries()].sort(), requireVerified, inspectOnly);
     opts.isolation = policy;
     return opts;
@@ -341,19 +369,8 @@ async function main(): Promise<void> {
   }
 
   for (const [name, agentConfig] of Object.entries(config.agents)) {
-    if (name === 'claude-code') {
-      agentManager.registerPlugin(new ClaudeCodePlugin(agentConfig.binary));
-    } else if (name === 'codex') {
-      agentManager.registerPlugin(new CodexPlugin(agentConfig.binary));
-    } else if (name === 'gemini') {
-      agentManager.registerPlugin(new GeminiPlugin(agentConfig.binary));
-    } else if (name === 'agy') {
-      agentManager.registerPlugin(new AgyPlugin(agentConfig.binary));
-    } else if (name === 'zcode') {
-      agentManager.registerPlugin(new ZcodePlugin(agentConfig.binary));
-    } else if (name === 'kimi-work') {
-      agentManager.registerPlugin(new KimiWorkPlugin(agentConfig));
-    }
+    const plugin = createStaticAgentPlugin(name, agentConfig);
+    if (plugin) agentManager.registerPlugin(plugin);
   }
 
   for (const [botName, botConfig] of Object.entries(config.bots)) {
@@ -368,6 +385,7 @@ async function main(): Promise<void> {
       const cardController = new StreamingCardController(adapter, {
         intervalMs: config.streaming.intervalMs,
         minDeltaChars: config.streaming.minDeltaChars,
+        interactiveStop: true,
       });
       cardControllers.set(botName, cardController);
     } else if (botConfig.platform === 'telegram' && botConfig.telegram) {
@@ -376,7 +394,14 @@ async function main(): Promise<void> {
         botName,
       });
       adapters.set(botName, adapter);
-      telegramStreams.set(botName, new TelegramStreamController(adapter, config.streaming.intervalMs, key => routes.get(key) ?? {}));
+      telegramStreams.set(
+        botName,
+        new TelegramStreamController(
+          adapter,
+          Math.max(1000, config.streaming.intervalMs || 1200),
+          key => routes.get(key) ?? {},
+        ),
+      );
     }
   }
 
@@ -577,17 +602,42 @@ async function main(): Promise<void> {
       try {
         if (!isCallback && !await recovery.acceptIncoming(msg.platform, botName, msg.messageId ? `${msg.chatId}:${msg.messageId}` : '')) return;
         if (!lifecycle.status(botName).acceptsMessages) return;
-        if (['stop', 'kill'].includes(parseBridgeCommand(msg.text)?.command ?? '')) {
+        const parsedCmd = parseBridgeCommand(msg.text);
+        if (['stop', 'kill'].includes(parsedCmd?.command ?? '')) {
           preparation.cancel(key);
           busyTasks.cancel(key);
+          pendingQueuedMsgs.delete(key);
+          queueNoticeIds.delete(key);
         }
         const memory = memoryContext(botName, msg);
         if (memory) {
-          if (['remember', 'memory', 'forget'].includes(parseBridgeCommand(msg.text)?.command ?? '')) memorySessions.track(key, memory.identity.principal);
-          else if (await memorySessions.bind(key, memory.identity.principal) && !parseBridgeCommand(msg.text)) {
+          if (['remember', 'memory', 'forget'].includes(parsedCmd?.command ?? '')) memorySessions.track(key, memory.identity.principal);
+          else if (await memorySessions.bind(key, memory.identity.principal) && !parsedCmd) {
             await bindReplyRoute(adapter, msg.threadId ? { threadId: msg.threadId, replyToMessageId: msg.messageId } : {}).send(msg.chatId,
               { text: '原会话身份或记忆代次已变化，已开始新会话。旧记录仍保留。' });
           }
+        }
+        if (
+          !isCallback
+          && !msg.isRelay
+          && !parsedCmd
+          && config.newMessageBehavior !== 'interrupt'
+          && busyTasks.has(key)
+          && !questionBoard.get(key)
+        ) {
+          const list = pendingQueuedMsgs.get(key) ?? [];
+          list.push(msg);
+          pendingQueuedMsgs.set(key, list);
+          const pendingCount = queue.status(key).pending + list.length;
+          const noticeRoute = bindReplyRoute(
+            adapter,
+            msg.threadId ? { threadId: msg.threadId, replyToMessageId: msg.messageId } : {},
+          );
+          void noticeRoute.send(msg.chatId, {
+            card: buildQueueNoticeCard(pendingCount, msg.text),
+          }).then((noticeId) => {
+            if (noticeId) queueNoticeIds.set(key, noticeId);
+          }).catch(() => {});
         }
         await batcher.enqueue(key, msg, processMessage);
       }
@@ -607,6 +657,75 @@ async function main(): Promise<void> {
         chatType: callback.chatType, messageId: callback.messageId, threadId: callback.threadId,
         text, mentions: getAdapterBotOpenId(adapter) ? [getAdapterBotOpenId(adapter)!] : [],
       }, true),
+      steerCancelQueue: async (callback) => {
+        const key = buildSessionKey(callback.platform, callback.chatId, botName, callback.threadId);
+        const batchCancelled = batcher.cancel(key);
+        const queueCancelled = queue.cancelPending(key);
+        const hadQueued = pendingQueuedMsgs.has(key);
+        pendingQueuedMsgs.delete(key);
+        const noticeId = queueNoticeIds.get(key);
+        queueNoticeIds.delete(key);
+        const route = bindReplyRoute(
+          adapter,
+          callback.threadId ? { threadId: callback.threadId, replyToMessageId: callback.messageId } : {},
+        );
+        const content = batchCancelled > 0 || queueCancelled > 0 || hadQueued
+          ? '已取消待执行的排队消息。'
+          : '当前没有待取消的排队消息。';
+        if (noticeId && adapter.replaceCard) {
+          await adapter.replaceCard(noticeId, {
+            type: 'final',
+            title: '排队已取消',
+            content,
+          }).catch(() => {});
+        } else {
+          await route.send(callback.chatId, { text: content, plainText: true });
+        }
+      },
+      steerInterrupt: async (callback) => {
+        const key = buildSessionKey(callback.platform, callback.chatId, botName, callback.threadId);
+        const mergedQueued = popMergedQueuedMessage(key);
+        const noticeId = queueNoticeIds.get(key);
+        queueNoticeIds.delete(key);
+        preparation.cancel(key);
+        batcher.cancel(key);
+        queue.cancelPending(key);
+        busyTasks.cancel(key);
+        await queue.control(key, async () => {
+          agentManager.cancelAgent(key);
+          cardControllers.get(botName)?.interruptCard(key);
+          clearSessionScopedBuffers(key, {
+            voiceSessions,
+            tgStreamController: telegramStreams.get(botName),
+          });
+          if ((await store.getPreferences(key)).taskState === 'running') {
+            await store.updatePreferences(key, { taskState: 'interrupted', taskUpdatedAt: Date.now() });
+          }
+        });
+        const route = bindReplyRoute(
+          adapter,
+          callback.threadId ? { threadId: callback.threadId, replyToMessageId: callback.messageId } : {},
+        );
+        if (noticeId && adapter.replaceCard) {
+          await adapter.replaceCard(noticeId, {
+            type: 'final',
+            title: '⚡ 已中断并插队执行',
+            headerTemplate: 'green',
+            content: mergedQueued ? '已中断当前任务，正在立即执行该消息。' : '已发送中断信号。',
+          }).catch(() => {});
+        } else {
+          await route.send(callback.chatId, {
+            text: mergedQueued ? '已中断当前任务，正在立即执行该消息。' : '已发送中断信号。',
+            plainText: true,
+          });
+        }
+        if (mergedQueued) {
+          void queue.enqueue(key, () => processMessage(mergedQueued)).catch((error) => {
+            if (error instanceof QueueCancelledError) return;
+            return reportFailure(error, key, mergedQueued);
+          });
+        }
+      },
     });
     adapter.onCallback?.(callback => {
       if (!lifecycle.status(botName).acceptsMessages || !isCallbackAuthorized(callback, botConfig)) return;
@@ -669,6 +788,22 @@ async function main(): Promise<void> {
     return async (msg) => {
       const scopedKey = buildSessionKey(msg.platform, msg.chatId, botName, msg.threadId);
       if (!lifecycle.status(botName).acceptsMessages) throw new QueueCancelledError();
+      if (!msg.isRelay && !parseBridgeCommand(msg.text)) {
+        const queued = pendingQueuedMsgs.get(scopedKey);
+        if (queued?.length) {
+          if (queue.status(scopedKey).pending === 0) {
+            pendingQueuedMsgs.delete(scopedKey);
+            queueNoticeIds.delete(scopedKey);
+          } else {
+            const remaining = queued.filter((item) => item !== msg && item.messageId !== msg.messageId);
+            if (remaining.length > 0) pendingQueuedMsgs.set(scopedKey, remaining);
+            else {
+              pendingQueuedMsgs.delete(scopedKey);
+              queueNoticeIds.delete(scopedKey);
+            }
+          }
+        }
+      }
       senders.set(scopedKey, msg);
       routes.set(scopedKey, msg.threadId ? { threadId: msg.threadId, replyToMessageId: msg.messageId } : {});
       const adapter = bindReplyRoute(baseAdapter, routes.get(scopedKey) ?? {}, messageId => {
@@ -739,7 +874,7 @@ async function main(): Promise<void> {
             messageId: msg.messageId,
           },
           notificationService,
-          { defaultModel: config.agents[botConfig.agent]?.defaultModel, queue, lifecycle, memory,
+          { defaultModel: config.agents[botConfig.agent]?.defaultModel, defaultEffort: config.agents[botConfig.agent]?.defaultEffort, queue, lifecycle, memory,
             resumeIsolated: (callback, id) => resumeIsolated(callback, id, botName),
             isolatedSessions: async () => {
               const cwd = (await store.getByKey(ctx.sessionKey))?.workingDirectory ?? resolveExecutionScope(botConfig, msg).workingDirectory;
@@ -750,7 +885,7 @@ async function main(): Promise<void> {
               return isolation.listDomain({ bot: botName, principal: identity.principal, scope: cwd, policyFingerprint: opts.isolation!.fingerprint });
             },
             runPrompt: prompt => processMessagePrompt(botName, msg, prompt),
-            doctor: diagnose, controlBot, readResult: key => recovery.read(key),
+            doctor: diagnose, controlBot, reloadConfig: reloadRuntimeConfig, readResult: key => recovery.read(key),
             capturePreparation: captureReadiness,
             cancelScope: key => { preparation.cancel(key); busyTasks.cancel(key); },
           },
@@ -849,7 +984,8 @@ async function main(): Promise<void> {
       }
 
       ensureReady();
-      const quote = msg.quotedText ? `[引用的消息]\n${msg.quotedText}\n[/引用的消息]\n\n` : '';
+      const safeQuoted = msg.quotedText ? scanUntrustedExternalText('quoted_message', msg.quotedText) : '';
+      const quote = safeQuoted ? `[引用的消息]\n${safeQuoted}\n[/引用的消息]\n\n` : '';
       // Claude Code only dispatches slash commands and skills that start the prompt.
       const messageText = botConfig.agent === 'claude-code' && msg.text.startsWith('/')
         ? `${msg.text}\n\n${quote}${senderHeader.trimEnd()}`
@@ -887,18 +1023,19 @@ async function main(): Promise<void> {
           : {};
         const spawnEnv = { ...config.agents[botConfig.agent]?.env, ...botConfig.env, ...senderEnv, ...larkCliEnv };
 
+        const sessionPrefs = await store.getPreferences(sessionKey);
         const spawnOpts = isolatedOpts ?? await resolveBotSpawnOpts({
           botConfig,
           workingDirectory: session.workingDirectory,
           env: spawnEnv,
-          model: (await store.getPreferences(sessionKey)).model ?? config.agents[botConfig.agent]?.defaultModel,
+          model: sessionPrefs.model ?? config.agents[botConfig.agent]?.defaultModel,
           autoApprove: botConfig.autoApprove,
           turnTimeoutMs: botConfig.turnTimeoutMs,
           idleTimeoutMs: botConfig.idleTimeoutMs,
           sandboxMode: botConfig.sandboxMode,
           reasoningEffort: runtimeState.fastModeBySession.get(sessionKey)
             ? 'low'
-            : config.agents[botConfig.agent]?.defaultEffort,
+            : (sessionPrefs.effort ?? config.agents[botConfig.agent]?.defaultEffort),
           initialPrompt: messageText,
         });
 
@@ -966,16 +1103,37 @@ async function main(): Promise<void> {
     if (processor) await processor({ ...original, text: prompt });
   }
 
-  let configUpdate = Promise.resolve();
-  async function controlBot(name: string, action: 'start' | 'stop' | 'restart'): Promise<void> {
-    if (!config.bots[name]) throw new Error('Unknown bot');
+  async function controlBot(name: string, action: 'start' | 'stop' | 'restart' | 'reload'): Promise<void> {
+    const botConfig = config.bots[name];
+    if (!botConfig) throw new Error('Unknown bot');
+    if (action === 'reload') {
+      const agentConfig = config.agents[botConfig.agent];
+      if (!agentConfig) throw new Error(`Unknown agent: ${botConfig.agent}`);
+      await hotReloadAgentPlugin({
+        agentManager,
+        agentName: botConfig.agent,
+        agentConfig,
+      });
+      const botSessions = await store.listByBot(name);
+      for (const s of botSessions) {
+        if (
+          agentManager.hasProcess(s.key)
+          && !busyTasks.has(s.key)
+          && (await store.getPreferences(s.key)).taskState !== 'running'
+        ) {
+          agentManager.killAgent(s.key);
+        }
+      }
+      console.log(`[cli2im] Reloaded plugin agent=${scrubLog(botConfig.agent)} via bot=${scrubLog(name)}`);
+      return;
+    }
     if (action !== 'stop') assertNetworkReady();
     if (action === 'restart') { await lifecycle.restart(name, 'cancel'); return; }
     const enabled = action === 'start';
     const update = configUpdate.catch(() => {}).then(() => saveBotEnabled(CONFIG_PATH, name, enabled));
     configUpdate = update;
     await update;
-    config.bots[name].enabled = enabled;
+    botConfig.enabled = enabled;
     await lifecycle.setEnabled(name, enabled, 'cancel');
   }
   function isolationIdentityMapping() {
@@ -983,7 +1141,7 @@ async function main(): Promise<void> {
     for (const [name, adapter] of adapters) if (adapter.appKey) telegramIds.set(name, adapter.appKey);
     return [...resolvePeople(config.memory?.people, botIdentities, telegramIds).entries()].sort();
   }
-  async function diagnose(): Promise<string> {
+  async function diagnose(options?: { online?: boolean }): Promise<string> {
     const network = networkPolicyStatus();
     const report = await runDoctor({ config, lifecycle: lifecycle.list(),
       getPlugin: name => agentManager.getPlugin(name),
@@ -992,7 +1150,42 @@ async function main(): Promise<void> {
       activeTasks: busyTasks.size(),
     });
     const isolationReport = await runIsolationDoctor({ config, runtime: isolation, paths: policyPaths(config), identityMapping: isolationIdentityMapping(), force: true });
-    return formatDoctorReport(report) + '\n\n' + formatIsolationReport(isolationReport) + '\n\n' + formatServiceInventory(report.services);
+    let output = formatDoctorReport(report) + '\n\n' + formatIsolationReport(isolationReport) + '\n\n' + formatServiceInventory(report.services);
+    if (options?.online) {
+      const online = await runOnlineDoctorProbes(config);
+      output += '\n\n' + formatOnlineDoctorSection(online);
+    }
+    return output;
+  }
+
+  async function buildDashboardHtml(): Promise<string> {
+    const network = networkPolicyStatus();
+    const watchTargets = await store.listWatchTargets();
+    const bots = lifecycle.list().map((status) => {
+      const bot = config.bots[status.name];
+      const agent = bot ? config.agents[bot.agent] : undefined;
+      return {
+        name: status.name,
+        platform: bot?.platform ?? 'feishu',
+        agent: bot?.agent ?? 'unknown',
+        model: agent?.defaultModel,
+        effort: agent?.defaultEffort,
+        state: status.state,
+        acceptsMessages: status.acceptsMessages,
+        error: status.error,
+      };
+    });
+    return renderDashboardHtml({
+      generatedAt: Date.now(),
+      uptimeMs: Date.now() - startedAt,
+      activeTasks: busyTasks.size(),
+      rssMb: Math.round(process.memoryUsage().rss / (1024 * 1024)),
+      contentGuardStatus: contentGuardStatus(),
+      contentGuardBackend: contentGuardBackend(),
+      networkSummary: `${network.mode}; ${network.dns}`,
+      watchTargets: watchTargets.length,
+      bots,
+    });
   }
 
   const httpServer = new HttpServer(config.server.token, {
@@ -1011,9 +1204,19 @@ async function main(): Promise<void> {
       }
       return handoffService.acceptHandoff(req, { ensureReady: requestReady ?? captureReadiness(key) });
     },
-    getBotStatus: () => lifecycle.list(),
+    getBotStatus: () => lifecycle.list().map((status) => {
+      const bot = config.bots[status.name];
+      return {
+        ...status,
+        platform: bot?.platform,
+        agent: bot?.agent,
+      };
+    }),
     controlBot,
+    reloadConfig: reloadRuntimeConfig,
     doctor: diagnose,
+    notify: (body) => deliverCliNotification(body, { config, store, adapters }),
+    getDashboardHtml: buildDashboardHtml,
     releaseHandoff: (sessionKey) => handoffService.releaseHandoff(sessionKey as SessionKey),
     getStatus: () => ({
       uptime: Date.now() - startedAt,
@@ -1044,14 +1247,14 @@ async function main(): Promise<void> {
   const stopIsolationMonitor = isolation.monitor();
   await httpServer.start(config.server.host, config.server.port);
 
-  for (const [botName, adapter] of adapters) {
+  await Promise.allSettled([...adapters.entries()].map(async ([botName, adapter]) => {
     try {
       await lifecycle.start(botName);
       console.log(`[cli2im] Bot "${scrubLog(botName)}" state=${lifecycle.status(botName).state} platform=${scrubLog(adapter.name)}`);
-    } catch (err) {
+    } catch {
       console.error(`[cli2im] Bot "${scrubLog(botName)}" connection_failed`);
     }
-  }
+  }));
 
   await startNotificationServiceBeforeReady(notificationService);
 
@@ -1070,9 +1273,38 @@ async function main(): Promise<void> {
     })().catch(() => console.error('[network] refresh_failed')).finally(() => { networkChecking = false; });
   }, 10000) : undefined;
 
+  const logRotateTimer = setInterval(() => {
+    if (shuttingDown) return;
+    try {
+      if (rotateLogFileIfNeeded(logPath)) console.log('[housekeeping] Rotated cli2im.log');
+    } catch (err) {
+      console.warn(`[housekeeping] log_rotate_failed reason=${scrubLog(err instanceof Error ? err.message : String(err))}`);
+    }
+  }, 3600_000);
+  logRotateTimer.unref();
+
+  const housekeepingTimer = setInterval(() => {
+    if (shuttingDown) return;
+    try {
+      const prunedMedia = pruneStaleMediaFiles(mediaDir);
+      const prunedDb = store.pruneStaleRecords({ pruneMissingCursorFiles: true });
+      if (prunedMedia > 0 || prunedDb.deletedCursors + prunedDb.deletedDeliveries + prunedDb.deletedTasks > 0) {
+        console.log(
+          `[housekeeping] periodic media=${prunedMedia} cursors=${prunedDb.deletedCursors}`
+          + ` deliveries=${prunedDb.deletedDeliveries} tasks=${prunedDb.deletedTasks}`,
+        );
+      }
+    } catch (err) {
+      console.warn(`[housekeeping] periodic_failed reason=${scrubLog(err instanceof Error ? err.message : String(err))}`);
+    }
+  }, 24 * 3600_000);
+  housekeepingTimer.unref();
+
   const shutdown = async () => {
     if (shuttingDown) return;
     shuttingDown = true;
+    clearInterval(logRotateTimer);
+    clearInterval(housekeepingTimer);
     if (networkTimer) clearInterval(networkTimer);
     stopIsolationMonitor();
     console.log('[cli2im] Shutting down...');
@@ -1080,12 +1312,17 @@ async function main(): Promise<void> {
     await notificationService?.stop();
     await agentManager.shutdownPlugins();
     await lifecycle.stopAll('cancel');
-    store.save();
+    store.flush();
     store.close();
     process.exit(0);
   };
   process.on('SIGTERM', () => void shutdown());
   process.on('SIGINT', () => void shutdown());
+  process.on('SIGHUP', () => {
+    void reloadRuntimeConfig()
+      .then((res) => console.log(`[config] Hot-reloaded via SIGHUP bots=${res.updatedBots.length} warnings=${res.warnings.length}`))
+      .catch((err) => console.warn(`[config] Hot-reload failed: ${scrubLog(err instanceof Error ? err.message : String(err))}`));
+  });
 }
 
 export async function startNotificationServiceBeforeReady(
@@ -1094,404 +1331,6 @@ export async function startNotificationServiceBeforeReady(
 ): Promise<void> {
   await service?.start();
   reportReady();
-}
-
-export async function handleBridgeCommand(
-  cmd: { command: string; args: string[] },
-  sessionKey: SessionKey,
-  botName: string,
-  chatId: string,
-  adapter: PlatformAdapter,
-  store: SessionStore,
-  agentManager: AgentManager,
-  handoffService: HandoffService,
-  cardController: StreamingCardController | undefined,
-  tgStreamController: TelegramStreamController | undefined,
-  voiceSessions: Map<SessionKey, string>,
-  runtimeState: RuntimeCommandState,
-  botConfig: BotConfig,
-  commandSender?: BridgeCommandSender,
-  notificationService?: CodexNotificationService,
-  controls: BridgeControls = {},
-): Promise<void> {
-  const actor = { userId: commandSender?.userId ?? '', chatId, chatType: commandSender?.chatType };
-  const visibleSessions = async () => {
-    if (botConfig.isolation?.enabled) return [];
-    const sessions = await store.listByBot(botName);
-    return (await Promise.all(sessions.map(async session =>
-      await canAccessSession({ bot: botConfig, actor, sessionKey, session }) ? session : null)))
-      .filter((session): session is NonNullable<typeof session> => session !== null);
-  };
-  const projects = new ProjectRegistry({
-    projects: botConfig.projects, shortcuts: botConfig.shortcuts,
-    validateDirectory: async (candidate) => {
-      const path = await resolveStrictDirectory(candidate);
-      if (botConfig.isolation?.enabled) {
-        if (!contains(resolveExecutionScope(botConfig, actor).workingDirectory, path)) throw new Error('目录不在当前隔离范围');
-        return path;
-      }
-      if (isBotAdmin(botConfig, actor.userId)) return path;
-      const roots = [resolveExecutionScope(botConfig, actor).workingDirectory,
-        ...Object.values(botConfig.projects ?? {})];
-      const canonicalRoots = await Promise.all(roots.map(root => resolveStrictDirectory(root).catch(() => '')));
-      if (!isPathWithinAnyRoot(path, canonicalRoots.filter(Boolean))) throw new Error('这个目录不在当前机器人的项目范围内');
-      return path;
-    },
-    loadRecent: async key => (await store.getPreferences(key as SessionKey)).recentDirectories ?? [],
-    saveRecent: async (key, recentDirectories) => store.updatePreferences(key as SessionKey, { recentDirectories }),
-  });
-  switch (cmd.command) {
-    case 'remember':
-    case 'memory':
-    case 'forget': {
-      if (getBotAccessRejection(actor, botConfig)) return;
-      await adapter.send(chatId, { text: await handleMemoryCommand(cmd, botConfig, actor.userId, controls.memory), plainText: true });
-      break;
-    }
-    case 'notify-me': {
-      if (
-        !notificationService
-        || botName !== notificationService.botName
-        || commandSender?.platform !== 'feishu'
-        || commandSender.chatType !== 'p2p'
-        || !botConfig.allowFrom.map(String).includes(commandSender.userId)
-      ) {
-        await adapter.send(chatId, { text: '通知绑定失败：请使用获授权的 codexbot 飞书私聊。' });
-        break;
-      }
-      await notificationService.bindTarget({
-        botName,
-        platform: 'feishu',
-        chatId,
-        userId: commandSender.userId,
-      });
-      await adapter.send(chatId, {
-        text: 'Codex 通知已绑定到当前私聊。后续只发送项目、任务和状态。',
-      });
-      break;
-    }
-
-    case 'new': {
-      controls.cancelScope?.(sessionKey);
-      agentManager.forgetSession(sessionKey);
-      clearSessionScopedBuffers(sessionKey, { voiceSessions, tgStreamController });
-      const existingSession = await store.getByKey(sessionKey);
-      if (existingSession) await store.delete(existingSession.id);
-      await store.updatePreferences(sessionKey, { taskState: undefined });
-      store.save();
-      await adapter.send(chatId, { text: '新会话已创建，发消息开始' });
-      break;
-    }
-
-    case 'help':
-    case 'status': {
-      const session = await store.getByKey(sessionKey);
-      const prefs = await store.getPreferences(sessionKey);
-      const running = prefs.taskState === 'running';
-      const supported = ['/new', '/projects', '/status', '/stop'];
-      if (agentManager.getPlugin(botConfig.agent)?.capabilities.sessionResume) supported.push('/sessions');
-      await adapter.send(chatId, { card: buildControlPanel({
-        botName, agentName: botConfig.agent, model: prefs.model ?? controls.defaultModel,
-        projectName: session?.workingDirectory ?? botConfig.workingDirectory, running,
-        queued: controls.queue?.status(sessionKey).pending,
-        error: prefs.taskState === 'interrupted' ? '上次任务中途停止，未自动重跑' : undefined,
-        supportedCommands: supported,
-      }) });
-      break;
-    }
-    case 'projects': {
-      if (cmd.args.length) {
-        await handleBridgeCommand({ command: 'cwd', args: [cmd.args.join(' ')] }, sessionKey, botName, chatId,
-          adapter, store, agentManager, handoffService, cardController, tgStreamController,
-          voiceSessions, runtimeState, botConfig, commandSender, notificationService, controls);
-      } else await adapter.send(chatId, { card: buildProjectPanel(await projects.list(sessionKey)) });
-      break;
-    }
-    case 'task': {
-      if (!cmd.args[0]) {
-        const shortcuts = projects.listShortcuts();
-        await adapter.send(chatId, { text: shortcuts.length ? shortcuts.map(item => `/task ${item.name} · ${item.description}`).join('\n') : '尚未配置快捷任务' });
-        break;
-      }
-      try {
-        const shortcut = await projects.resolveShortcut(sessionKey, cmd.args[0]);
-        if (shortcut.directory) {
-          if ((await store.getPreferences(sessionKey)).taskState === 'running') throw new Error('请先停止当前任务再切换项目');
-          controls.cancelScope?.(sessionKey);
-          agentManager.forgetSession(sessionKey);
-          const current = await store.getOrCreate(sessionKey, { agentName: botConfig.agent, workingDirectory: shortcut.directory });
-          await store.updateWorkingDirectory(current.id, shortcut.directory);
-          await store.clearAgentSessionId(current.id);
-          store.save();
-        }
-        if (!controls.runPrompt) throw new Error('当前入口不支持快捷任务');
-        await controls.runPrompt(shortcut.prompt);
-      } catch (error) { await adapter.send(chatId, { text: error instanceof Error ? error.message : '快捷任务失败' }); }
-      break;
-    }
-    case 'result': {
-      const result = await controls.readResult?.(sessionKey);
-      const text = result
-        ? `上次保存的结果（${formatDateTime(result.savedAt)}）：\n${result.text || '任务已结束，没有可恢复的文字。'}${result.truncated ? '\n结果过长，这里只保留前 1 MiB。' : ''}`
-        : '当前对话还没有保存的结果。';
-      await adapter.send(chatId, { text: textPage(text, cmd.args[0], 'result'), plainText: true });
-      break;
-    }
-    case 'doctor': {
-      if (!isBotAdmin(botConfig, actor.userId)) { await adapter.send(chatId, { text: '只有该机器人的管理员可以查看运行诊断' }); break; }
-      const report = controls.doctor ? await controls.doctor() : '运行诊断未接入';
-      await adapter.send(chatId, { text: textPage(report, cmd.args[0], 'doctor'), plainText: true });
-      break;
-    }
-    case 'bots': {
-      if (!isBotAdmin(botConfig, actor.userId) || !controls.lifecycle) {
-        await adapter.send(chatId, { text: '只有该机器人的管理员可以管理启停' }); break;
-      }
-      const [action, target = botName] = cmd.args;
-      if (target !== botName) { await adapter.send(chatId, { text: '请通过目标机器人或本机管理命令操作，避免跨机器人更改' }); break; }
-      if (!action) { await adapter.send(chatId, { text: `${botName}: ${controls.lifecycle.status(botName).state}` }); break; }
-      if (!['start','stop','restart'].includes(action)) { await adapter.send(chatId, { text: '用法：/bots start|stop|restart' }); break; }
-      await adapter.send(chatId, { text: `正在${action === 'stop' ? '停止' : action === 'start' ? '启动' : '重启'}当前机器人，当前任务会中断。` });
-      if (controls.controlBot) { await controls.controlBot(botName, action as 'start' | 'stop' | 'restart'); break; }
-      if (action === 'stop') await controls.lifecycle.stop(botName, 'cancel');
-      else if (action === 'start') await controls.lifecycle.start(botName);
-      else await controls.lifecycle.restart(botName, 'cancel');
-      break;
-    }
-
-    case 'thinking': {
-      if (!cardController) {
-        await adapter.send(chatId, { text: '当前平台不支持思考卡片显示切换' });
-        break;
-      }
-      const nextVisible = !cardController.isThinkingVisible(sessionKey);
-      cardController.setThinkingVisible(sessionKey, nextVisible);
-      await adapter.send(chatId, {
-        text: nextVisible ? '思考显示已开启' : '思考显示已关闭',
-      });
-      break;
-    }
-
-    case 'fast': {
-      const nextFastMode = !(runtimeState.fastModeBySession.get(sessionKey) ?? false);
-      if (nextFastMode) {
-        runtimeState.fastModeBySession.set(sessionKey, true);
-      } else {
-        runtimeState.fastModeBySession.delete(sessionKey);
-      }
-
-      const suffix = agentManager.hasProcess(sessionKey) ? '，下次进程启动生效' : '';
-      await adapter.send(chatId, {
-        text: nextFastMode ? `快速模式已开启${suffix}` : `快速模式已关闭${suffix}`,
-      });
-      break;
-    }
-
-    case 'stop': {
-      agentManager.cancelAgent(sessionKey);
-      cardController?.interruptCard(sessionKey);
-      clearSessionScopedBuffers(sessionKey, { voiceSessions, tgStreamController });
-      if ((await store.getPreferences(sessionKey)).taskState === 'running')
-        await store.updatePreferences(sessionKey, { taskState: 'interrupted', taskUpdatedAt: Date.now() });
-      await adapter.send(chatId, { text: '已发送中断信号' });
-      break;
-    }
-
-    case 'kill': {
-      agentManager.killAgent(sessionKey);
-      cardController?.interruptCard(sessionKey);
-      clearSessionScopedBuffers(sessionKey, { voiceSessions, tgStreamController });
-      if ((await store.getPreferences(sessionKey)).taskState === 'running')
-        await store.updatePreferences(sessionKey, { taskState: 'interrupted', taskUpdatedAt: Date.now() });
-      await adapter.send(chatId, { text: '已强制终止进程' });
-      break;
-    }
-
-    case 'cwd': {
-      const newDir = cmd.args.join(' ');
-      if (!newDir) {
-        await adapter.send(chatId, { text: '用法: /cwd <path>' });
-        break;
-      }
-      let resolvedNewDir: string;
-      try {
-        resolvedNewDir = await projects.select(sessionKey, newDir);
-      } catch {
-        await adapter.send(chatId, { text: `无效路径: \`${newDir}\`` });
-        break;
-      }
-      clearSessionScopedBuffers(sessionKey, { voiceSessions, tgStreamController });
-      controls.cancelScope?.(sessionKey);
-      agentManager.forgetSession(sessionKey);
-      const session = await store.getOrCreate(sessionKey, { agentName: botConfig.agent, workingDirectory: resolvedNewDir });
-      await store.updateWorkingDirectory(session.id, resolvedNewDir);
-      await store.clearAgentSessionId(session.id);
-      await store.updatePreferences(sessionKey, { taskState: undefined, taskUpdatedAt: undefined });
-      store.save();
-      await adapter.send(chatId, { text: `工作目录已切换到 ${resolvedNewDir}，下一条消息会新建该项目的对话` });
-      break;
-    }
-
-    case 'switch':
-    case 'resume': {
-      const sessionId = cmd.args[0];
-      if (!sessionId || !commandSender) {
-        await adapter.send(chatId, { text: '用法：/resume <历史对话编号>' }); break;
-      }
-      await handleCLISessionResume({
-        callback: { ...commandSender, chatId, data: '', messageId: commandSender.messageId ?? '' },
-        resume: { sessionId, cwd: '' }, botName, botConfig, adapter, store, agentManager, handoffService,
-        cardController, tgStreamController, ensureReady: controls.capturePreparation?.(sessionKey), resumeIsolated: controls.resumeIsolated,
-      });
-      store.save();
-      break;
-    }
-
-    case 'handoff': {
-      if (botConfig.isolation?.enabled) { await adapter.send(chatId, { text: '隔离机器人禁用 handoff' }); break; }
-      try {
-        const result = await handoffService.releaseHandoff(sessionKey);
-        controls.cancelScope?.(sessionKey);
-        if ((await store.getPreferences(sessionKey)).taskState === 'running')
-          await store.updatePreferences(sessionKey, { taskState: 'interrupted', taskUpdatedAt: Date.now() });
-        agentManager.cancelAgent(sessionKey);
-        clearSessionScopedBuffers(sessionKey, { voiceSessions, tgStreamController });
-        await adapter.send(chatId, {
-          text: buildHandoffReleaseNotification(result),
-        });
-      } catch (err) {
-        await adapter.send(chatId, {
-          text: err instanceof Error ? err.message : String(err),
-        });
-      }
-      break;
-    }
-
-    case 'perm': {
-      const [decision, requestId] = cmd.args;
-      if (!decision || !requestId || !['allow', 'allow_session', 'deny'].includes(decision)) {
-        await adapter.send(chatId, { text: '用法: /perm allow|allow_session|deny <requestId>' });
-        break;
-      }
-
-      const accepted = decision === 'deny'
-        ? agentManager.denyPermission(sessionKey, requestId)
-        : agentManager.approvePermission(sessionKey, requestId);
-      if (!accepted) {
-        await adapter.send(chatId, { text: `审批失败或已过期: \`${requestId}\`` });
-        break;
-      }
-
-      await adapter.send(chatId, {
-        text: decision === 'deny'
-          ? `已拒绝权限请求: \`${requestId}\``
-          : `已批准权限请求: \`${requestId}\``,
-      });
-      break;
-    }
-
-    case 'force-approve': {
-      const pending = agentManager.getPendingPermissionForSession(sessionKey);
-      if (!pending) {
-        await adapter.send(chatId, { text: '没有待审批的危险操作' });
-        break;
-      }
-      const approved = agentManager.approvePermission(sessionKey, pending.requestId);
-      if (approved) {
-        await adapter.send(chatId, { text: `已批准执行: \`${pending.command}\`` });
-      } else {
-        await adapter.send(chatId, { text: '批准失败（可能已超时）' });
-      }
-      break;
-    }
-
-    case 'list': {
-      const sessions = await visibleSessions();
-      if (sessions.length === 0) {
-        await adapter.send(chatId, { text: '没有活跃会话' });
-        break;
-      }
-      const lines = sessions.map(
-        (session) => `- \`${session.agentSessionId ?? session.id}\` ${session.state} | ${session.workingDirectory}`,
-      );
-      await adapter.send(chatId, { text: `**会话列表:**\n${lines.join('\n')}` });
-      break;
-    }
-
-    case 'sessions': {
-      if (botConfig.isolation?.enabled) {
-        const records = await controls.isolatedSessions?.() ?? [];
-        await adapter.send(chatId, { text: records.length ? records.map(r => `- ${r.agentSessionId}`).join('\n') : '当前隔离范围没有可恢复的会话' });
-        break;
-      }
-      const sub = cmd.args[0];
-
-      if (sub === 'bot') {
-        const sessions = await visibleSessions();
-        if (sessions.length === 0) {
-          await adapter.send(chatId, { text: '没有活跃会话' });
-          break;
-        }
-        const lines = sessions.map((session) => {
-          const [, sessionChatId] = session.key.split(':');
-          const processState = agentManager.hasProcess(session.key) ? 'Running' : 'Idle';
-          const lastActive = formatDateTime(session.lastActiveAt);
-          return [
-            `- \`${session.agentSessionId ?? session.id}\``,
-            `${session.state}/${processState}`,
-            `chat: \`${sessionChatId}\``,
-            `agent: ${session.agentName}`,
-            `cwd: \`${session.workingDirectory}\``,
-            `last: ${lastActive}`,
-          ].join(' | ');
-        });
-        await adapter.send(chatId, { text: `**会话列表:**\n${lines.join('\n')}` });
-        break;
-      }
-
-      const requestedAgent = ({ codex: 'codex', gemini: 'gemini', agy: 'agy', antigravity: 'agy', claude: 'claude-code' } as Record<string,string>)[sub ?? ''] ?? botConfig.agent;
-      if (requestedAgent !== botConfig.agent) { await adapter.send(chatId, { text: '请在对应 AI 的机器人中查看历史对话' }); break; }
-      const agentLabel = agentManager.getPlugin(botConfig.agent)?.displayName ?? botConfig.agent;
-      const bindings = await store.listSessionAccess(sessionKey);
-      const sessions = await scanAgentSessions(botConfig.agent, { accept: async candidate => {
-        const binding = bindings.find(item => item.agentName === botConfig.agent && item.agentSessionId === candidate.sessionId);
-        return canAccessSession({ bot: botConfig, actor, sessionKey,
-          session: binding ?? { ...candidate, agentName: botConfig.agent } });
-      } });
-
-      if (sessions.length === 0) {
-        await adapter.send(chatId, { text: `没有找到 ${agentLabel} CLI 会话` });
-        break;
-      }
-      if (adapter.name === 'telegram') {
-        await adapter.send(chatId, { card: buildCLISessionText(sessions, agentLabel) });
-      } else {
-        await adapter.send(chatId, { card: buildCLISessionCard(sessions, agentLabel) });
-      }
-      break;
-    }
-
-    case 'model': {
-      const model = cmd.args[0];
-      if (!model) {
-        const selected = (await store.getPreferences(sessionKey)).model ?? controls.defaultModel ?? 'AI 默认模型';
-        await adapter.send(chatId, { text: `当前选择：${selected}。用法：/model <模型名>；/model default 恢复默认。` }); break;
-      }
-      if (!/^[A-Za-z0-9][A-Za-z0-9_.:/\[\]-]{0,127}$/.test(model)) {
-        await adapter.send(chatId, { text: '模型名格式无效' }); break;
-      }
-      if ((await store.getPreferences(sessionKey)).taskState === 'running') {
-        await adapter.send(chatId, { text: '请等待当前任务完成，或先 /stop 再切换模型' }); break;
-      }
-      await store.updatePreferences(sessionKey, { model: model === 'default' ? undefined : model });
-      agentManager.killAgent(sessionKey);
-      await adapter.send(chatId, { text: `模型选择已保存：${model === 'default' ? '默认模型' : model}；下一条消息启动时使用。模型是否可用由该 AI 服务确认。` });
-      break;
-    }
-
-    default:
-      await adapter.send(chatId, { text: `未知指令: /${cmd.command}` });
-  }
 }
 
 export function createCallbackHandler(params: {
@@ -1509,6 +1348,8 @@ export function createCallbackHandler(params: {
   resumeIsolated?: Parameters<typeof handleCLISessionResume>[0]['resumeIsolated'];
   capturePreparation?: (key: SessionKey) => () => void;
   handleControl?: (callback: import('./types.js').CallbackQuery, text: string) => Promise<void>;
+  steerInterrupt?: (callback: import('./types.js').CallbackQuery) => Promise<void>;
+  steerCancelQueue?: (callback: import('./types.js').CallbackQuery) => Promise<void>;
 }): (callback: import('./types.js').CallbackQuery) => void {
   const {
     botName,
@@ -1524,6 +1365,22 @@ export function createCallbackHandler(params: {
   } = params;
 
   return (callback) => {
+    const steer = parseQueueSteerAction(callback.data);
+    if (steer) {
+      if (!isCallbackAuthorized(callback, botConfig)) return;
+      const handler = steer === 'interrupt_now' ? params.steerInterrupt : params.steerCancelQueue;
+      void handler?.(callback).catch(() => console.error('[pipeline] steer_failed'));
+      return;
+    }
+    const modelOrEffort = parseModelOrEffortAction(callback.data);
+    if (modelOrEffort) {
+      if (!isCallbackAuthorized(callback, botConfig)) return;
+      const cmdText = modelOrEffort.kind === 'model'
+        ? `/model ${modelOrEffort.model}`
+        : `/effort ${modelOrEffort.effort}`;
+      void params.handleControl?.(callback, cmdText).catch(() => console.error('[pipeline] model_effort_failed'));
+      return;
+    }
     const control = parseControlAction(callback.data);
     const project = parseProjectAction(callback.data);
     if (control || project) {
@@ -1614,38 +1471,6 @@ export async function sendAgentMessageOrNotify(params: {
   );
   await adapter.send(chatId, { text: '消息未送达（会话正在切换或重启），请重发' });
   return false;
-}
-
-async function resolveStrictDirectory(path: string): Promise<string> {
-  const resolved = await realpath(expandHome(path));
-  const info = await stat(resolved);
-  if (!info.isDirectory()) {
-    throw new Error(`Invalid working directory: ${path}`);
-  }
-  return resolved;
-}
-
-function uniquePaths(paths: string[]): string[] {
-  return [...new Set(paths)];
-}
-
-async function resolveExistingDirectories(paths: string[]): Promise<string[]> {
-  const resolved: string[] = [];
-  for (const path of paths) {
-    try {
-      resolved.push(await resolveStrictDirectory(path));
-    } catch {
-      // Missing inactive bot roots should not prevent the current bot from starting.
-    }
-  }
-  return uniquePaths(resolved);
-}
-
-function isPathWithinAnyRoot(path: string, roots: string[]): boolean {
-  return roots.some((root) => {
-    const rel = relative(root, path);
-    return rel === '' || (!!rel && !rel.startsWith('..') && !rel.startsWith('/'));
-  });
 }
 
 export function createHandoffSpawnResume(
@@ -1747,10 +1572,6 @@ export async function startAgentProcessForSession(params: {
 
   params.ensureReady?.();
   await agentManager.spawnAgent(sessionKey, agentName, spawnOpts, handlers);
-}
-
-function formatDateTime(value: number): string {
-  return new Date(value).toLocaleString('zh-CN', { hour12: false });
 }
 
 function getAdapterBotOpenId(adapter: PlatformAdapter): string | undefined {

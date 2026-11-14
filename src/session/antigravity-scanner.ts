@@ -8,7 +8,15 @@ interface AntigravityRecord {
   content?: unknown;
 }
 
+interface TranscriptCandidate {
+  conversationId: string;
+  transcriptPath: string;
+  mtimeMs: number;
+  size: number;
+}
+
 const DEFAULT_LIMIT = 15;
+const STAT_CONCURRENCY = 32;
 
 // Antigravity (`agy`) stores one directory per conversation under
 //   <antigravityDir>/brain/<conversationId>/.system_generated/logs/transcript.jsonl
@@ -23,6 +31,7 @@ export class AntigravitySessionScanner {
 
   async scan(opts: { limit?: number } = {}): Promise<CLISession[]> {
     const limit = opts.limit ?? DEFAULT_LIMIT;
+    if (limit <= 0) return [];
     const brainDir = join(this.antigravityDir, 'brain');
 
     let conversationIds: string[];
@@ -34,45 +43,68 @@ export class AntigravitySessionScanner {
       return [];
     }
 
-    const sessions: CLISession[] = [];
+    const candidates: TranscriptCandidate[] = [];
+    let cursor = 0;
+    const workerCount = Math.min(STAT_CONCURRENCY, conversationIds.length);
 
-    await Promise.all(conversationIds.map(async (conversationId) => {
-      const transcriptPath = join(
-        brainDir,
-        conversationId,
-        '.system_generated',
-        'logs',
-        'transcript.jsonl',
-      );
+    await Promise.all(
+      Array.from({ length: workerCount }, async () => {
+        while (cursor < conversationIds.length) {
+          const conversationId = conversationIds[cursor++]!;
+          const transcriptPath = join(
+            brainDir,
+            conversationId,
+            '.system_generated',
+            'logs',
+            'transcript.jsonl',
+          );
+          try {
+            const fileStat = await stat(transcriptPath);
+            if (fileStat.isFile() && fileStat.size > 0) {
+              candidates.push({
+                conversationId,
+                transcriptPath,
+                mtimeMs: fileStat.mtimeMs,
+                size: fileStat.size,
+              });
+            }
+          } catch {
+            // skip missing / inaccessible transcript
+          }
+        }
+      }),
+    );
+
+    candidates.sort((a, b) => b.mtimeMs - a.mtimeMs);
+
+    const sessions: CLISession[] = [];
+    for (const candidate of candidates) {
+      if (sessions.length >= limit) break;
       try {
-        const session = await this.parseTranscript(transcriptPath, conversationId);
+        const session = await this.parseCandidate(candidate);
         if (session) sessions.push(session);
       } catch {
-        // skip corrupted / missing transcript
+        // skip corrupted transcript
       }
-    }));
+    }
 
-    sessions.sort((a, b) => b.lastModified - a.lastModified);
-    return sessions.slice(0, limit);
+    return sessions;
   }
 
-  private async parseTranscript(filePath: string, conversationId: string): Promise<CLISession | null> {
-    const fileStat = await stat(filePath);
-    if (!fileStat.isFile() || fileStat.size === 0) return null;
-
-    const raw = await readHeadTailWindow(filePath);
+  private async parseCandidate(candidate: TranscriptCandidate): Promise<CLISession | null> {
+    const raw = await readHeadTailWindow(candidate.transcriptPath);
     const lines = raw.split('\n').filter((l) => l.trim());
     if (lines.length === 0) return null;
 
-    const title = extractFirstUserRequest(lines) || conversationId.slice(0, 8);
+    const title = extractFirstUserRequest(lines) || candidate.conversationId.slice(0, 8);
 
     return {
-      sessionId: conversationId,
+      sessionId: candidate.conversationId,
       cwd: '',
       title,
-      lastModified: fileStat.mtimeMs,
+      lastModified: candidate.mtimeMs,
       status: 'historical' as CLISessionStatus,
-      fileSize: fileStat.size,
+      fileSize: candidate.size,
     };
   }
 }

@@ -23,6 +23,23 @@ async function main() {
     banner: { js: "import { createRequire as _cR } from 'module'; const require = _cR(import.meta.url);" },
   });
 
+  const agentEntryPoints = ['claude-code', 'codex', 'gemini', 'agy', 'zcode', 'kimi-work'];
+  await Promise.all(
+    agentEntryPoints.map((agent) =>
+      build({
+        entryPoints: [`src/agents/${agent}.ts`],
+        bundle: true,
+        platform: 'node',
+        target: 'node22',
+        format: 'esm',
+        outfile: join(buildDir, 'agents', `${agent}.js`),
+        external: ['sql.js', '@larksuiteoapi/node-sdk', '@openai/codex-sdk', '@anthropic-ai/claude-agent-sdk', 'content-guard'],
+        sourcemap: true,
+        banner: { js: "import { createRequire as _cR } from 'module'; const require = _cR(import.meta.url);" },
+      }),
+    ),
+  );
+
   await build({
     entryPoints: ['cli/cli2im.ts'],
     bundle: true,

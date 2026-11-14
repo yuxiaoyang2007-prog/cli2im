@@ -9,6 +9,7 @@ declare module 'sql.js' {
   export interface Database {
     run(sql: string, params?: unknown[]): Database;
     prepare(sql: string): Statement;
+    getRowsModified(): number;
     export(): Uint8Array;
     close(): void;
   }

@@ -9,8 +9,11 @@ export interface ServerDeps {
   releaseHandoff: (sessionKey: string) => Promise<{ sessionId: string; resumeCommand: string }>;
   getStatus: () => { uptime: number; activeSessions: number; bots: string[] };
   getBotStatus?: () => unknown;
-  controlBot?: (name: string, action: 'start' | 'stop' | 'restart') => Promise<void>;
-  doctor?: () => Promise<unknown>;
+  controlBot?: (name: string, action: 'start' | 'stop' | 'restart' | 'reload') => Promise<void>;
+  doctor?: (options?: { online?: boolean }) => Promise<unknown>;
+  reloadConfig?: () => Promise<{ reloadedAt: number; updatedBots: string[]; warnings: string[] }>;
+  notify?: (body: Record<string, unknown>) => Promise<{ success: boolean; botName?: string; error?: string }>;
+  getDashboardHtml?: () => Promise<string> | string;
 }
 
 export interface HandoffValidationConfig {
@@ -84,6 +87,26 @@ export class HttpServer {
       return;
     }
 
+    if (path === '/dashboard' && req.method === 'GET' && this.deps.getDashboardHtml) {
+      const queryToken = url.searchParams.get('token');
+      const authorized = isAuthorizedBearerToken(req.headers.authorization, this.token)
+        || (typeof queryToken === 'string' && isAuthorizedRawToken(queryToken, this.token));
+      if (!authorized) {
+        this.json(res, 401, { error: 'Unauthorized' });
+        return;
+      }
+      const html = await this.deps.getDashboardHtml();
+      res.writeHead(200, {
+        'Content-Type': 'text/html; charset=utf-8',
+        'Cache-Control': 'no-store',
+        'Referrer-Policy': 'no-referrer',
+        'X-Content-Type-Options': 'nosniff',
+        'X-Frame-Options': 'DENY',
+      });
+      res.end(html);
+      return;
+    }
+
     const authHeader = req.headers.authorization;
     if (!isAuthorizedBearerToken(authHeader, this.token)) {
       this.json(res, 401, { error: 'Unauthorized' });
@@ -95,14 +118,24 @@ export class HttpServer {
         this.json(res, 200, this.deps.getBotStatus()); return;
       }
       if (path === '/api/doctor' && req.method === 'GET' && this.deps.doctor) {
-        this.json(res, 200, await this.deps.doctor()); return;
+        const online = url.searchParams.get('online') === '1';
+        this.json(res, 200, await this.deps.doctor({ online })); return;
+      }
+      if (path === '/api/notify' && req.method === 'POST' && this.deps.notify) {
+        const body = await this.readBody(req, 65_536);
+        const result = await this.deps.notify(body);
+        this.json(res, result.success ? 200 : 400, result);
+        return;
+      }
+      if (path === '/api/config/reload' && req.method === 'POST' && this.deps.reloadConfig) {
+        this.json(res, 200, await this.deps.reloadConfig()); return;
       }
       if (path === '/api/bots' && req.method === 'POST' && this.deps.controlBot) {
         const body = await this.readBody(req, 8192);
-        if (typeof body.name !== 'string' || !['start', 'stop', 'restart'].includes(String(body.action))) {
-          this.json(res, 400, { error: 'Expected name and action: start/stop/restart' }); return;
+        if (typeof body.name !== 'string' || !['start', 'stop', 'restart', 'reload'].includes(String(body.action))) {
+          this.json(res, 400, { error: 'Expected name and action: start/stop/restart/reload' }); return;
         }
-        await this.deps.controlBot(body.name, body.action as 'start' | 'stop' | 'restart');
+        await this.deps.controlBot(body.name, body.action as 'start' | 'stop' | 'restart' | 'reload');
         this.json(res, 200, { success: true }); return;
       }
       if (path === '/api/handoff/accept' && req.method === 'POST') {
@@ -252,5 +285,12 @@ export function isAuthorizedBearerToken(authHeader: string | undefined, token: s
   const actual = Buffer.from(authHeader);
   if (actual.length !== expected.length) return false;
 
+  return timingSafeEqual(actual, expected);
+}
+
+function isAuthorizedRawToken(candidate: string, token: string): boolean {
+  const expected = Buffer.from(token);
+  const actual = Buffer.from(candidate);
+  if (actual.length !== expected.length) return false;
   return timingSafeEqual(actual, expected);
 }

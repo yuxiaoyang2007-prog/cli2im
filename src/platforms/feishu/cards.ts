@@ -1,18 +1,49 @@
 import type { FeishuAdapter } from './adapter.js';
-import type { AgentEvent } from '../../types.js';
+import type { AgentEvent, CardButton, CardPayload, TokenUsage } from '../../types.js';
 import type { AbortableOptions } from '../../abort.js';
 import { stripFileMarkers } from '../../agents/codex-file-markers.js';
+
+const STOP_CARD_BUTTON: CardButton = {
+  text: '⏹ 停止',
+  value: 'control:stop',
+  type: 'danger',
+};
 
 // Long silent steps (builds, background tasks, waiting on a question) still refresh the
 // card so the chat can tell a busy turn from a stuck one.
 const LIVENESS_INTERVAL_MS = 30_000;
+export const MAX_CARD_DISPLAY_CHARS = 22_000;
+export const CONTINUATION_CHUNK_CHARS = 20_000;
+
+export function splitCardChunks(text: string, maxChars = CONTINUATION_CHUNK_CHARS): string[] {
+  if (!text) return [''];
+  if (text.length <= maxChars || maxChars <= 0) return [text];
+
+  const chunks: string[] = [];
+  let remaining = text;
+  while (remaining.length > maxChars) {
+    const slice = remaining.slice(0, maxChars);
+    let cut = slice.lastIndexOf('\n\n');
+    if (cut < Math.floor(maxChars * 0.4)) cut = slice.lastIndexOf('\n');
+    if (cut < Math.floor(maxChars * 0.4)) cut = slice.lastIndexOf(' ');
+    if (cut <= 0) cut = maxChars;
+
+    const head = remaining.slice(0, cut).trimEnd();
+    if (head) chunks.push(head);
+    remaining = remaining.slice(cut).trimStart();
+  }
+  if (remaining) chunks.push(remaining);
+  return chunks;
+}
 
 interface StreamingCardState {
   chatId: string;
   messageId: string | null;
+  title: string;
   content: string;
   toolStatus: string;
   thinking: string;
+  usage?: TokenUsage;
   lastUpdateAt: number;
   lastUpdateLength: number;
   updateSeq: number;
@@ -30,6 +61,7 @@ interface StreamingCardState {
 interface ThrottleConfig {
   intervalMs: number;
   minDeltaChars: number;
+  interactiveStop?: boolean;
 }
 
 export class StreamingCardController {
@@ -47,19 +79,23 @@ export class StreamingCardController {
   }
 
   async startCard(chatId: string, sessionKey: string, title: string, initialText?: string, options: AbortableOptions = {}): Promise<void> {
-    const messageId = await this.adapter.sendCard(chatId, {
+    const startPayload: CardPayload = {
       type: 'streaming',
       content: initialText ?? 'Processing...',
       title,
-    }, options);
+      ...(this.throttle.interactiveStop ? { buttons: [STOP_CARD_BUTTON] } : {}),
+    };
+    const messageId = await this.adapter.sendCard(chatId, startPayload, options);
 
     this.stopTicker(this.cards.get(sessionKey));
     const card: StreamingCardState = {
       chatId,
       messageId,
+      title,
       content: '',
       toolStatus: '',
       thinking: '',
+      usage: undefined,
       lastUpdateAt: 0,
       lastUpdateLength: 0,
       updateSeq: 0,
@@ -99,11 +135,22 @@ export class StreamingCardController {
     display: string,
     seq: number,
     options: AbortableOptions,
+    final = false,
   ): Promise<void> {
-    const run = () =>
-      options.signal
+    const replaceCardFn = this.adapter.replaceCard;
+    const run = () => {
+      if (this.throttle.interactiveStop && typeof replaceCardFn === 'function') {
+        const payload: CardPayload = final
+          ? { type: 'final', title: card.title, content: display }
+          : { type: 'streaming', title: card.title, content: display, buttons: [STOP_CARD_BUTTON] };
+        return options.signal
+          ? replaceCardFn.call(this.adapter, messageId, payload, { signal: options.signal })
+          : replaceCardFn.call(this.adapter, messageId, payload);
+      }
+      return options.signal
         ? this.adapter.updateCard(messageId, display, seq, { signal: options.signal })
         : this.adapter.updateCard(messageId, display, seq);
+    };
     const result = card.patchChain.then(run);
     card.patchChain = result.catch(() => {});
     return result;
@@ -154,6 +201,7 @@ export class StreamingCardController {
         break;
 
       case 'result':
+        card.usage = event.usage;
         void this.finalizeCard(sessionKey, 'completed', card, options);
         break;
 
@@ -184,6 +232,7 @@ export class StreamingCardController {
     card.content = card.content ? `${card.content}\n\n---\n\n` : '';
     card.toolStatus = '';
     card.thinking = '';
+    card.usage = undefined;
     card.finalized = false;
     card.startedAt = Date.now();
     card.lastUpdateAt = 0;
@@ -265,14 +314,45 @@ export class StreamingCardController {
     const statusText =
       status === 'completed' ? 'Completed' : status === 'error' ? 'Error' : 'Interrupted';
 
-    const footer = `\n\n---\n${statusText} · ${this.formatDuration(elapsed)}`;
-    const display = this.buildDisplayContent(sessionKey, card) + footer;
+    const usageText = card.usage && (card.usage.inputTokens > 0 || card.usage.outputTokens > 0)
+      ? ` · in ${this.formatTokens(card.usage.inputTokens)} / out ${this.formatTokens(card.usage.outputTokens)}`
+      : '';
+    const footer = `\n\n---\n${statusText} · ${this.formatDuration(elapsed)}${usageText}`;
+    const fullDisplay = this.buildDisplayContent(sessionKey, card) + footer;
 
     if (card.messageId && !options.signal?.aborted) {
-      try {
-        await this.patchCard(card, card.messageId, display, ++card.updateSeq, options);
-      } catch {
-        // Best effort final update.
+      if (fullDisplay.length <= MAX_CARD_DISPLAY_CHARS) {
+        try {
+          await this.patchCard(card, card.messageId, fullDisplay, ++card.updateSeq, options, true);
+        } catch {
+          // Best effort final update.
+        }
+      } else {
+        const cleaned = (card.content.includes('[[file:') ? stripFileMarkers(card.content) : card.content).trim();
+        const chunks = splitCardChunks(cleaned, CONTINUATION_CHUNK_CHARS);
+        const total = chunks.length;
+        const firstBody = total > 1
+          ? `${chunks[0]}\n\n---\n*(1/${total} · 续下张卡片)*`
+          : chunks[0] + footer;
+        try {
+          await this.patchCard(card, card.messageId, firstBody, ++card.updateSeq, options, true);
+        } catch {
+          // Best effort final update.
+        }
+        for (let i = 1; i < total; i += 1) {
+          if (options.signal?.aborted) break;
+          const isLast = i === total - 1;
+          const body = isLast
+            ? `${chunks[i]}\n\n*(${i + 1}/${total})*${footer}`
+            : `${chunks[i]}\n\n*(${i + 1}/${total} · 续下张卡片)*`;
+          try {
+            await card.patchChain.then(() =>
+              this.adapter.sendCard(card.chatId, { type: 'final', content: body }, options),
+            );
+          } catch {
+            // Best effort continuation card.
+          }
+        }
       }
     }
 
@@ -290,10 +370,15 @@ export class StreamingCardController {
     const parts: string[] = [];
 
     if (card.thinking && this.isThinkingVisible(sessionKey)) {
-      parts.push('*Thinking...*');
+      const cleanedThinking = card.thinking.replace(/\s+/g, ' ').trim();
+      const preview = cleanedThinking.length > 240 ? `…${cleanedThinking.slice(-240)}` : cleanedThinking;
+      parts.push(preview ? `*Thinking...*\n> ${preview}` : '*Thinking...*');
     }
 
-    const content = card.content.includes('[[file:') ? stripFileMarkers(card.content) : card.content;
+    const rawContent = card.content.includes('[[file:') ? stripFileMarkers(card.content) : card.content;
+    const content = !card.finalized && rawContent.length > CONTINUATION_CHUNK_CHARS
+      ? `*(前文已折叠 ${rawContent.length - CONTINUATION_CHUNK_CHARS} 字，正在流式输出最新内容…)*\n\n${rawContent.slice(-CONTINUATION_CHUNK_CHARS)}`
+      : rawContent;
     if (content) {
       parts.push(content);
     }
@@ -314,5 +399,11 @@ export class StreamingCardController {
     const mins = Math.floor(seconds / 60);
     const secs = seconds % 60;
     return mins > 0 ? `${mins}m ${secs}s` : `${secs}s`;
+  }
+
+  private formatTokens(count: number): string {
+    if (count >= 1_000_000) return `${(count / 1_000_000).toFixed(1)}M`;
+    if (count >= 1_000) return `${(count / 1_000).toFixed(1)}k`;
+    return String(count);
   }
 }

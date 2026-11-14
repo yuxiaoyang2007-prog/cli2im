@@ -30,12 +30,15 @@ describe('isBridgeCommand', () => {
     expect(isBridgeCommand('/handoff')).toBe(true);
     expect(isBridgeCommand('/force-approve')).toBe(true);
     expect(isBridgeCommand('/model opus')).toBe(true);
+    expect(isBridgeCommand('/effort xhigh')).toBe(true);
     expect(isBridgeCommand('/clear')).toBe(true);
     expect(isBridgeCommand('/thinking')).toBe(true);
     expect(isBridgeCommand('/fast')).toBe(true);
     expect(isBridgeCommand('/perm allow req_123')).toBe(true);
     expect(isBridgeCommand('/sessions')).toBe(true);
     expect(isBridgeCommand('/notify-me')).toBe(true);
+    expect(isBridgeCommand('/watch')).toBe(true);
+    expect(isBridgeCommand('/diff-review')).toBe(true);
     expect(isBridgeCommand('/help')).toBe(true);
     expect(isBridgeCommand('/projects')).toBe(true);
     expect(isBridgeCommand('/cd demo')).toBe(true);

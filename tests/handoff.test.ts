@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { HandoffService } from '../src/services/handoff.js';
+import { HandoffService, buildResumeCommand } from '../src/services/handoff.js';
 import { PreparationGuard } from '../src/runtime/preparation-guard.js';
 
 describe('HandoffService', () => {
@@ -227,5 +227,9 @@ describe('HandoffService', () => {
     );
     expect(mockGetSession).not.toHaveBeenCalled();
     expect(mockUpdateState).not.toHaveBeenCalled();
+  });
+
+  it('builds the agy resume command with --conversation', () => {
+    expect(buildResumeCommand('agy', 'conv_123')).toBe('agy --conversation conv_123');
   });
 });

@@ -10,6 +10,11 @@ import type { StreamingCardController } from '../platforms/feishu/cards.js';
 import type { TelegramStreamController } from '../platforms/telegram/stream.js';
 import { scrubLog } from '../security/logging.js';
 import { assertOutboundFileMatches } from '../security/outbound-file.js';
+import {
+  extractFileMarkerCandidates,
+  resolveSafeFilePayloads,
+  stripFileMarkers,
+} from '../agents/codex-file-markers.js';
 import type { SendVoiceReplyOptions } from './voice-reply.js';
 import { isAbortError } from '../abort.js';
 
@@ -70,6 +75,7 @@ export function createRuntimeEventHandler(
     const ensureActive = () => ensureCurrent() && !signal.aborted;
     if (!ensureActive()) return;
     if (event.type === 'text') recoveryText = (recoveryText + event.content).slice(0, 1_048_576);
+    const turnTextSnapshot = recoveryText;
     if (event.type === 'result' || event.type === 'error') {
       const finalText = recoveryText + (event.type === 'error' ? '\n任务执行失败。' : '');
       recoveryText = '';
@@ -78,7 +84,9 @@ export function createRuntimeEventHandler(
     }
 
     const isVoiceSession = voiceSessions.has(sessionKey);
-    console.log(`[event] bot=${scrubLog(botName)} type=${event.type} voice=${isVoiceSession} hasCard=${!!cardController} hasTgStream=${!!tgStream}`);
+    if ((event.type !== 'text' && event.type !== 'thinking') || process.env.CLI2IM_DEBUG_EVENTS === '1') {
+      console.log(`[event] bot=${scrubLog(botName)} type=${event.type} voice=${isVoiceSession} hasCard=${!!cardController} hasTgStream=${!!tgStream}`);
+    }
 
     if ((event.type === 'result' || event.type === 'status') && event.sessionId) {
       deps.onSessionId?.(event.sessionId);
@@ -129,8 +137,13 @@ export function createRuntimeEventHandler(
         if (tgStream) {
           tgStream.appendText(sessionKey, chatId, event.content);
         } else {
-          await adapter.send(chatId, { text: event.content }, { signal });
-          if (!ensureActive()) return;
+          const cleaned = event.content.includes('[[file:')
+            ? stripFileMarkers(event.content).trim()
+            : event.content;
+          if (cleaned) {
+            await adapter.send(chatId, { text: cleaned }, { signal });
+            if (!ensureActive()) return;
+          }
         }
       } else if (event.type === 'error') {
         if (!ensureActive()) return;
@@ -183,24 +196,41 @@ export function createRuntimeEventHandler(
       if (!ensureActive()) return;
     }
 
-    if (event.type === 'result' && event.createdFiles?.length && adapter?.sendFile) {
-      const files = dedupeCreatedFiles(event.createdFiles);
-      for (const file of files) {
+    if (event.type === 'result' && adapter?.sendFile) {
+      const markerCandidates = turnTextSnapshot.includes('[[file:')
+        ? extractFileMarkerCandidates(turnTextSnapshot)
+        : [];
+      let markerPayloads: Array<string | FilePayload> = [];
+      if (markerCandidates.length > 0) {
+        const workDir = (await store.getByKey(sessionKey))?.workingDirectory
+          ?? relayDeps.config.bots[botName]?.workingDirectory;
         if (!ensureActive()) return;
-        try {
-          if (!deps.readOutbound && !(await isCreatedFileCurrent(file))) {
-            console.warn('[file-send] skipped_changed_or_missing_file');
-            continue;
+        if (workDir) {
+          markerPayloads = await resolveSafeFilePayloads(markerCandidates, workDir);
+          if (!ensureActive()) return;
+        }
+      }
+
+      const combinedFiles = [...(event.createdFiles ?? []), ...markerPayloads];
+      if (combinedFiles.length > 0) {
+        const files = dedupeCreatedFiles(combinedFiles);
+        for (const file of files) {
+          if (!ensureActive()) return;
+          try {
+            if (!deps.readOutbound && !(await isCreatedFileCurrent(file))) {
+              console.warn('[file-send] skipped_changed_or_missing_file');
+              continue;
+            }
+            if (!ensureActive()) return;
+            const outgoing = deps.readOutbound ? await deps.readOutbound(file, signal) : file;
+            if (!ensureActive()) return;
+            await adapter.sendFile(chatId, outgoing, { signal });
+          } catch (err) {
+            if (isAbortError(err) || signal.aborted) return;
+            console.warn('[file-send] delivery_failed');
           }
           if (!ensureActive()) return;
-          const outgoing = deps.readOutbound ? await deps.readOutbound(file, signal) : file;
-          if (!ensureActive()) return;
-          await adapter.sendFile(chatId, outgoing, { signal });
-        } catch (err) {
-          if (isAbortError(err) || signal.aborted) return;
-          console.warn('[file-send] delivery_failed');
         }
-        if (!ensureActive()) return;
       }
     }
     } catch (err) {

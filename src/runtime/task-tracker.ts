@@ -74,6 +74,10 @@ export class TaskTracker {
     };
   }
 
+  has(key: string): boolean {
+    return (this.scopes.get(key)?.pending.size ?? 0) > 0;
+  }
+
   size(): number {
     return this.keys().length;
   }

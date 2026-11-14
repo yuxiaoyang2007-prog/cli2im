@@ -130,6 +130,15 @@ export class AgentManager {
     return count;
   }
 
+  activeProcessCountForAgent(agentName: string): number {
+    let count = 0;
+    for (const entry of this.contexts.values()) {
+      const context = entry.kind === 'process' ? entry : entry.previous;
+      if (context && !context.signal.aborted && context.agentName === agentName) count += 1;
+    }
+    return count;
+  }
+
   isSessionInUse(agentName: string, agentSessionId: string, exceptSessionKey: SessionKey): boolean {
     if (!agentSessionId) return false;
     for (const [key, entry] of this.contexts) {

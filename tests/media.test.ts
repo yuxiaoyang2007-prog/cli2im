@@ -108,6 +108,19 @@ describe('attachment bridge helpers', () => {
     });
   });
 
+  it('injects image Read instructions for agy user messages', async () => {
+    const attachment = {
+      type: 'image' as const,
+      localPath: '/tmp/agy-picture.png',
+      mimeType: 'image/png',
+    };
+
+    const msg = await buildUserMessageForAgent('agy', 'describe this image', [attachment]);
+    expect(typeof msg.content).toBe('string');
+    expect(msg.content).toContain('/tmp/agy-picture.png');
+    expect(msg.content).toContain('Read');
+  });
+
   it('converts Claude Code images to base64 blocks and injects file paths into text', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'cli2im-target-'));
     const imagePath = join(dir, 'picture.png');

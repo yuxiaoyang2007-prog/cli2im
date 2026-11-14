@@ -456,6 +456,46 @@ describe('TelegramAdapter', () => {
     expect(JSON.stringify(consoleSpy.mock.calls)).not.toMatch(/TOKEN|api.telegram/);
   });
 
+  it('logs HTTP status 409 on polling conflict and backs off exponentially before resetting on recovery', async () => {
+    const adapter = new TelegramAdapter({ token: 'TOKEN', botName: 'testbot' });
+    const fetchMock = vi.mocked(fetch);
+    fetchMock
+      .mockResolvedValueOnce(new Response(JSON.stringify({ ok: false, error_code: 409, description: 'Conflict: TOKEN' }), { status: 409 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ ok: false, error_code: 409, description: 'Conflict: TOKEN' }), { status: 409 }))
+      .mockResolvedValueOnce(jsonResponse({ ok: true, result: [] }))
+      .mockResolvedValueOnce(jsonResponse({ ok: true, result: [] }));
+
+    const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    await adapter.connect();
+
+    // First poll runs immediately (0ms) -> 409 conflict #1 -> schedules at 5000ms
+    await vi.advanceTimersByTimeAsync(0);
+    expect(consoleSpy).toHaveBeenCalledWith('Telegram polling failed:', { status: 409 });
+    expect(JSON.stringify(consoleSpy.mock.calls)).not.toMatch(/TOKEN|api.telegram/);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    // At +4999ms, retry #2 must NOT have fired yet
+    await vi.advanceTimersByTimeAsync(4999);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    // At +5000ms, retry #2 fires -> 409 conflict #2 -> schedules at 10000ms
+    await vi.advanceTimersByTimeAsync(1);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+
+    // At +9999ms, retry #3 must NOT have fired yet
+    await vi.advanceTimersByTimeAsync(9999);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+
+    // At +10000ms, retry #3 fires -> clean empty poll resets failure counter -> next at 1000ms
+    await vi.advanceTimersByTimeAsync(1);
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(fetchMock).toHaveBeenCalledTimes(4);
+
+    await adapter.disconnect();
+  });
+
   it('routes text and voice into the explicitly supplied topic', async () => {
     const adapter = new TelegramAdapter({ token: 'TOKEN', botName: 'testbot' });
     const fetchMock = vi.mocked(fetch);
@@ -611,6 +651,42 @@ describe('TelegramAdapter', () => {
     ).toEqual({ offset: 11 });
     expect(handler).toHaveBeenCalledTimes(1);
     expect(handler).toHaveBeenCalledWith(expect.objectContaining({ userId: '46', text: 'allowed' }));
+  });
+
+  it('falls back to plain text on HTTP 400 MarkdownV2 errors during send and editMessage', async () => {
+    const adapter = new TelegramAdapter({ token: 'TOKEN', botName: 'testbot' });
+    const fetchMock = vi.mocked(fetch);
+    fetchMock
+      .mockResolvedValueOnce(new Response(JSON.stringify({ ok: false, error_code: 400, description: 'Bad Request: TOKEN' }), { status: 400 }))
+      .mockResolvedValueOnce(jsonResponse({ ok: true, result: { message_id: 201 } }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ ok: false, error_code: 400, description: 'Bad Request: TOKEN' }), { status: 400 }))
+      .mockResolvedValueOnce(jsonResponse({ ok: true, result: true }));
+
+    const msgId = await adapter.send('1001', { text: 'bad [markdown' });
+    expect(msgId).toBe('201');
+    await adapter.editMessage('1001', '201', 'edited [markdown');
+
+    const secondSend = JSON.parse(String(fetchMock.mock.calls[1]?.[1]?.body));
+    expect(secondSend.parse_mode).toBeUndefined();
+    expect(secondSend.text).toBe('bad [markdown');
+
+    const secondEdit = JSON.parse(String(fetchMock.mock.calls[3]?.[1]?.body));
+    expect(secondEdit.parse_mode).toBeUndefined();
+    expect(secondEdit.text).toBe('edited [markdown');
+  });
+
+  it('aborts hung short API requests on apiTimeoutMs without leaking URL or token', async () => {
+    const adapter = new TelegramAdapter({ token: 'TOKEN', botName: 'testbot', apiTimeoutMs: 500 });
+    const fetchMock = vi.mocked(fetch);
+    fetchMock.mockImplementationOnce(() => new Promise<Response>(() => {}));
+
+    const sendPromise = adapter.send('1001', { text: 'hello' }).catch((err: unknown) => err);
+    await vi.advanceTimersByTimeAsync(500);
+    const err = await sendPromise;
+
+    expect(err).toBeInstanceOf(Error);
+    expect((err as Error).message).toBe('Telegram network request timed out');
+    expect((err as Error).message).not.toMatch(/TOKEN|api\.telegram/);
   });
 });
 

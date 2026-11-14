@@ -177,4 +177,49 @@ describe('persisted bridge choices and session boundaries', () => {
     expect(manager.killAgent).not.toHaveBeenCalled();
     expect(vi.mocked(adapter.send)).toHaveBeenCalledWith('chat', { text: expect.stringContaining('无效路径') });
   });
+
+  it('sends interactive /model and /effort picker cards when called without arguments', async () => {
+    await run('model', []);
+    expect(vi.mocked(adapter.send)).toHaveBeenLastCalledWith('chat', {
+      card: expect.objectContaining({
+        type: 'final',
+        title: '切换模型',
+        buttons: expect.arrayContaining([
+          expect.objectContaining({ value: 'model:gpt-6-astra' }),
+          expect.objectContaining({ value: 'model:default' }),
+        ]),
+      }),
+    });
+
+    await run('effort', []);
+    expect(vi.mocked(adapter.send)).toHaveBeenLastCalledWith('chat', {
+      card: expect.objectContaining({
+        type: 'final',
+        title: '切换推理强度 (Effort)',
+        buttons: expect.arrayContaining([
+          expect.objectContaining({ value: 'effort:low' }),
+          expect.objectContaining({ value: 'effort:xhigh' }),
+          expect.objectContaining({ value: 'effort:default' }),
+        ]),
+      }),
+    });
+  });
+
+  it('persists /effort preference across reloads and guards running tasks', async () => {
+    await run('effort', ['xhigh']);
+    expect(manager.killAgent).toHaveBeenCalledWith(scope);
+    store.close();
+    store = await SessionStore.create(join(dir, 'state.db'));
+    expect((await store.getPreferences(scope)).effort).toBe('xhigh');
+
+    await store.updatePreferences(scope, { taskState: 'running' });
+    vi.mocked(manager.killAgent).mockClear();
+    await run('effort', ['low']);
+    expect((await store.getPreferences(scope)).effort).toBe('xhigh');
+    expect(manager.killAgent).not.toHaveBeenCalled();
+
+    await store.updatePreferences(scope, { taskState: 'completed' });
+    await run('effort', ['default']);
+    expect((await store.getPreferences(scope)).effort).toBeUndefined();
+  });
 });

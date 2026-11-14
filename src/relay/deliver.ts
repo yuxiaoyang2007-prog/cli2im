@@ -20,6 +20,16 @@ export interface RelayDeps {
   queue: ChatQueue;
 }
 
+export function selectDirectedRelayTargets(text: string, candidates: string[]): string[] {
+  if (candidates.length === 0 || !text) return candidates;
+  const matched = candidates.filter((candidate) => {
+    const escaped = candidate.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const regex = new RegExp(`(?:^|[^A-Za-z0-9_.-])@${escaped}(?=$|[^A-Za-z0-9_-])`, 'i');
+    return regex.test(text);
+  });
+  return matched.length > 0 ? matched : candidates;
+}
+
 export async function relayToOtherBots(
   sourceBotName: string,
   chatId: string,
@@ -34,11 +44,12 @@ export async function relayToOtherBots(
   const sourceConfig = config.bots[sourceBotName];
   const group = { chatId, chatType: 'group' };
   if (!sourceConfig?.relay?.enabled || sourceConfig.enabled === false || getGroupAccessRejection(group, sourceConfig)) return;
-  const targets = relayManager.getRelayTargets(sourceBotName, chatId).filter((name) => {
+  const eligibleTargets = relayManager.getRelayTargets(sourceBotName, chatId).filter((name) => {
     const target = config.bots[name];
     return target?.enabled !== false && target?.relay?.enabled && target.platform === sourceConfig.platform
       && target.relay.allowFromBots?.includes(sourceBotName) && !getGroupAccessRejection(group, target);
   });
+  const targets = selectDirectedRelayTargets(text, eligibleTargets);
   console.log(`[relay] targets=${targets.length} textLen=${text.length}`);
   if (targets.length === 0) return;
 

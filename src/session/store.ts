@@ -57,15 +57,32 @@ export interface RuntimePreferences {
   memoryPrincipal?: string;
   memoryGeneration?: number;
   model?: string;
+  effort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max';
   recentDirectories?: string[];
   taskState?: 'running' | 'completed' | 'failed' | 'interrupted';
   taskUpdatedAt?: number;
+}
+
+export interface WatchTarget {
+  botName: string;
+  platform: 'feishu' | 'telegram';
+  chatId: string;
+  threadId?: string;
+  userId: string;
+  updatedAt: number;
+}
+
+export interface SessionStoreOptions {
+  coalesceMs?: number;
 }
 
 export class SessionStore {
   private db: Database;
   private dbPath: string;
   private privacyPublicationPending = false;
+  private coalesceMs: number;
+  private saveTimer: ReturnType<typeof setTimeout> | null = null;
+  private closed = false;
 
   private ensureProvenanceTable(): void {
     this.db.run(`CREATE TABLE IF NOT EXISTS isolation_provenance (
@@ -97,12 +114,13 @@ export class SessionStore {
     } finally { stmt.free(); }
   }
 
-  private constructor(db: Database, dbPath: string) {
+  private constructor(db: Database, dbPath: string, coalesceMs = 0) {
     this.db = db;
     this.dbPath = dbPath;
+    this.coalesceMs = Math.max(0, coalesceMs);
   }
 
-  static async create(dbPath: string): Promise<SessionStore> {
+  static async create(dbPath: string, options: SessionStoreOptions = {}): Promise<SessionStore> {
     const SQL = await initSqlJs({
       locateFile: (file: string) => join(sqlWasmDir, file),
     });
@@ -183,6 +201,17 @@ export class SessionStore {
     `);
 
     db.run(`
+      CREATE TABLE IF NOT EXISTS bot_watch_targets (
+        bot_name TEXT PRIMARY KEY,
+        platform TEXT NOT NULL,
+        chat_id TEXT NOT NULL,
+        thread_id TEXT,
+        user_id TEXT NOT NULL,
+        updated_at INTEGER NOT NULL
+      )
+    `);
+
+    db.run(`
       CREATE TABLE IF NOT EXISTS notification_cursors (
         file_path TEXT PRIMARY KEY,
         file_id TEXT NOT NULL,
@@ -229,12 +258,12 @@ export class SessionStore {
       ON notification_tasks(session_id, updated_at)
     `);
 
-    const store = new SessionStore(db, dbPath);
+    const store = new SessionStore(db, dbPath, options.coalesceMs ?? 0);
     if (openedExistingSnapshot) {
       compactDatabaseForPrivacy(db);
       saveDatabaseSnapshotPair(dbPath, Buffer.from(db.export()));
     } else if (cursorSchemaMigrated || deliverySchemaMigrated) {
-      store.save();
+      store.flush();
     }
     return store;
   }
@@ -317,6 +346,15 @@ export class SessionStore {
 
   async getSessionAccess(agentName: string, agentSessionId: string): Promise<SessionAccessBinding[]> {
     return this.readSessionAccess('agent_name = ? AND agent_session_id = ?', [agentName, agentSessionId]);
+  }
+
+  async grantSessionAccess(binding: SessionAccessBinding): Promise<void> {
+    this.db.run(
+      `INSERT OR REPLACE INTO session_access (agent_name, agent_session_id, scope_key, working_directory)
+       VALUES (?, ?, ?, ?)`,
+      [binding.agentName, binding.agentSessionId, binding.key, binding.workingDirectory],
+    );
+    this.save();
   }
 
   private readSessionAccess(where: string, values: string[]): SessionAccessBinding[] {
@@ -466,6 +504,61 @@ export class SessionStore {
       userId: row.user_id as string,
       updatedAt: row.updated_at as number,
     };
+  }
+
+  async setWatchTarget(target: WatchTarget): Promise<void> {
+    this.db.run(
+      `INSERT INTO bot_watch_targets (bot_name, platform, chat_id, thread_id, user_id, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?)
+       ON CONFLICT(bot_name) DO UPDATE SET
+         platform = excluded.platform,
+         chat_id = excluded.chat_id,
+         thread_id = excluded.thread_id,
+         user_id = excluded.user_id,
+         updated_at = excluded.updated_at`,
+      [
+        target.botName,
+        target.platform,
+        target.chatId,
+        target.threadId ?? null,
+        target.userId,
+        target.updatedAt,
+      ],
+    );
+    this.save();
+  }
+
+  async getWatchTarget(botName: string): Promise<WatchTarget | null> {
+    const stmt = this.db.prepare(
+      'SELECT bot_name, platform, chat_id, thread_id, user_id, updated_at FROM bot_watch_targets WHERE bot_name = ?',
+    );
+    stmt.bind([botName]);
+    if (!stmt.step()) {
+      stmt.free();
+      return null;
+    }
+    const row = stmt.getAsObject();
+    stmt.free();
+    return rowToWatchTarget(row);
+  }
+
+  async removeWatchTarget(botName: string): Promise<boolean> {
+    this.db.run('DELETE FROM bot_watch_targets WHERE bot_name = ?', [botName]);
+    const removed = (this.db as Database & { getRowsModified(): number }).getRowsModified() > 0;
+    if (removed) this.save();
+    return removed;
+  }
+
+  async listWatchTargets(): Promise<WatchTarget[]> {
+    const stmt = this.db.prepare(
+      'SELECT bot_name, platform, chat_id, thread_id, user_id, updated_at FROM bot_watch_targets ORDER BY updated_at DESC',
+    );
+    const list: WatchTarget[] = [];
+    while (stmt.step()) {
+      list.push(rowToWatchTarget(stmt.getAsObject()));
+    }
+    stmt.free();
+    return list;
   }
 
   async upsertCodexTask(task: StoredCodexTask): Promise<void> {
@@ -730,8 +823,85 @@ export class SessionStore {
     this.saveTerminalSnapshot();
   }
 
+  pruneStaleRecords(opts: {
+    now?: number;
+    cursorMaxAgeMs?: number;
+    deliveryMaxAgeMs?: number;
+    taskMaxAgeMs?: number;
+    pruneMissingCursorFiles?: boolean;
+  } = {}): { deletedCursors: number; deletedDeliveries: number; deletedTasks: number } {
+    const now = opts.now ?? Date.now();
+    const cursorCutoff = now - (opts.cursorMaxAgeMs ?? 14 * 24 * 3600_000);
+    const deliveryCutoff = now - (opts.deliveryMaxAgeMs ?? 14 * 24 * 3600_000);
+    const taskCutoff = now - (opts.taskMaxAgeMs ?? 30 * 24 * 3600_000);
+    const pruneMissingCursorFiles = opts.pruneMissingCursorFiles === true;
+
+    const cursorStmt = this.db.prepare('SELECT file_path, updated_at FROM notification_cursors');
+    const staleCursorPaths: string[] = [];
+    while (cursorStmt.step()) {
+      const row = cursorStmt.getAsObject();
+      const filePath = typeof row.file_path === 'string' ? row.file_path : '';
+      const updatedAt = typeof row.updated_at === 'number' ? row.updated_at : 0;
+      if (!filePath) continue;
+      if (updatedAt < cursorCutoff || (pruneMissingCursorFiles && !existsSync(filePath))) {
+        staleCursorPaths.push(filePath);
+      }
+    }
+    cursorStmt.free();
+
+    let deletedCursors = 0;
+    for (const filePath of staleCursorPaths) {
+      this.db.run('DELETE FROM notification_cursors WHERE file_path = ?', [filePath]);
+      deletedCursors += this.db.getRowsModified();
+    }
+
+    this.db.run(
+      `DELETE FROM notification_deliveries
+       WHERE status IN ('delivered', 'failed', 'discarded')
+         AND COALESCE(delivered_at, last_attempt_at, first_attempt_at, 0) < ?`,
+      [deliveryCutoff],
+    );
+    const deletedDeliveries = this.db.getRowsModified();
+
+    this.db.run(
+      `DELETE FROM notification_tasks
+       WHERE UPPER(state) IN ('COMPLETED', 'ENDED_UNREPORTED', 'CANCELLED', 'FAILED', 'INTERRUPTED')
+         AND updated_at < ?`,
+      [taskCutoff],
+    );
+    const deletedTasks = this.db.getRowsModified();
+
+    if (deletedCursors + deletedDeliveries + deletedTasks > 0) {
+      compactDatabaseForPrivacy(this.db);
+      this.save();
+    }
+
+    return { deletedCursors, deletedDeliveries, deletedTasks };
+  }
+
   save(): void {
-    if (this.dbPath === ':memory:') return;
+    if (this.dbPath === ':memory:' || this.closed) return;
+    if (this.coalesceMs > 0 && !this.privacyPublicationPending) {
+      if (!this.saveTimer) {
+        this.saveTimer = setTimeout(() => {
+          this.saveTimer = null;
+          if (!this.closed) {
+            this.flush();
+          }
+        }, this.coalesceMs);
+        this.saveTimer.unref?.();
+      }
+      return;
+    }
+    this.flush();
+  }
+
+  flush(): void {
+    if (this.saveTimer) {
+      clearTimeout(this.saveTimer);
+      this.saveTimer = null;
+    }
+    if (this.dbPath === ':memory:' || this.closed) return;
     const data = this.db.export();
     if (this.privacyPublicationPending) {
       saveDatabaseSnapshotPair(this.dbPath, Buffer.from(data));
@@ -742,10 +912,15 @@ export class SessionStore {
   }
 
   private saveTerminalSnapshot(): void {
-    this.save();
+    this.flush();
   }
 
   close(): void {
+    if (this.closed) return;
+    if (this.saveTimer) {
+      this.flush();
+    }
+    this.closed = true;
     this.db.close();
   }
 
@@ -790,6 +965,17 @@ function assertCodexTask(task: StoredCodexTask): void {
   ) {
     throw new Error('Invalid Codex task');
   }
+}
+
+function rowToWatchTarget(row: Record<string, unknown>): WatchTarget {
+  return {
+    botName: row.bot_name as string,
+    platform: row.platform as WatchTarget['platform'],
+    chatId: row.chat_id as string,
+    ...(typeof row.thread_id === 'string' && row.thread_id ? { threadId: row.thread_id } : {}),
+    userId: row.user_id as string,
+    updatedAt: row.updated_at as number,
+  };
 }
 
 function rowToCodexTask(row: Record<string, unknown>): StoredCodexTask {

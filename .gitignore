@@ -12,6 +12,7 @@ config.yaml
 
 # SQLite database
 *.db
+*.db.bak
 *.db-journal
 
 # OS

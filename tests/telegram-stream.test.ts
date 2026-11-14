@@ -1,8 +1,11 @@
-import { describe, expect, it, vi } from 'vitest';
-import { TelegramStreamController } from '../src/platforms/telegram/stream.js';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { TelegramStreamController, splitTelegramChunks } from '../src/platforms/telegram/stream.js';
 import type { PlatformAdapter, SessionKey } from '../src/types.js';
 
 describe('TelegramStreamController', () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
   it('does not send buffered text twice when finalize is called concurrently', async () => {
     const sendGate = deferred<string>();
     const adapter = {
@@ -61,6 +64,31 @@ describe('TelegramStreamController', () => {
     await controller.finalize(sessionKey, { signal: abortController.signal });
 
     expect(adapter.send).not.toHaveBeenCalled();
+  });
+
+  it('streams throttled updates via editMessage and splits finalized output >3800 chars', async () => {
+    vi.useFakeTimers();
+    const adapter = {
+      send: vi.fn(async () => 'live_1'),
+      editMessage: vi.fn(async () => undefined),
+    } as unknown as PlatformAdapter;
+    const controller = new TelegramStreamController(adapter, 1000);
+    const sessionKey = 'telegram:chat_1:agy-tg' as SessionKey;
+
+    controller.appendText(sessionKey, 'chat_1', 'first half ');
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(adapter.send).toHaveBeenCalledTimes(1);
+    expect(adapter.send).toHaveBeenCalledWith('chat_1', { text: 'first half' });
+
+    const longBody = 'A'.repeat(2500) + '\n\n' + 'B'.repeat(2500);
+    controller.appendText(sessionKey, 'chat_1', longBody);
+    await controller.finalize(sessionKey);
+
+    expect(adapter.editMessage).toHaveBeenCalledTimes(1);
+    expect(adapter.editMessage).toHaveBeenCalledWith('chat_1', 'live_1', expect.stringContaining('first half'));
+    expect(adapter.send).toHaveBeenCalledTimes(2);
+    const chunks = splitTelegramChunks('first half ' + longBody);
+    expect(chunks.length).toBe(2);
   });
 });
 

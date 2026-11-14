@@ -20,6 +20,23 @@ export interface SessionResumeCallbackData {
   cwd: string;
 }
 
+export type ModelOrEffortAction =
+  | { kind: 'model'; model: string }
+  | { kind: 'effort'; effort: string };
+
+export function parseModelOrEffortAction(rawData: string): ModelOrEffortAction | null {
+  const data = unwrapCallbackAction(rawData);
+  if (data.startsWith('model:')) {
+    const model = data.slice('model:'.length).trim();
+    return model ? { kind: 'model', model } : null;
+  }
+  if (data.startsWith('effort:')) {
+    const effort = data.slice('effort:'.length).trim();
+    return effort ? { kind: 'effort', effort } : null;
+  }
+  return null;
+}
+
 export function isCallbackAuthorized(callback: CallbackQuery, botConfig: BotConfig): boolean {
   return !getBotAccessRejection(callback, botConfig);
 }

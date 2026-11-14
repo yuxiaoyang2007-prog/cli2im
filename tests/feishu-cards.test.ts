@@ -197,6 +197,32 @@ describe('StreamingCardController', () => {
     await Promise.resolve();
     expect(adapter.updateCard).not.toHaveBeenCalled();
   });
+
+  it('splits oversized finalized content across continuation cards instead of overflowing Feishu patch limit', async () => {
+    const adapter = {
+      sendCard: vi.fn().mockResolvedValue('msg_1'),
+      updateCard: vi.fn().mockResolvedValue(undefined),
+    } as unknown as FeishuAdapter;
+    const controller = new StreamingCardController(adapter);
+    const sessionKey = 'feishu:chat_1:agy_bot';
+
+    await controller.startCard('chat_1', sessionKey, 'agy');
+    const huge = `${'Paragraph one.\n'.repeat(1200)}\n\n${'Paragraph two.\n'.repeat(1200)}`;
+    controller.handleEvent(sessionKey, { type: 'text', content: huge });
+    controller.handleEvent(sessionKey, { type: 'result', sessionId: 'ses_1' });
+
+    await vi.waitFor(() => expect(adapter.sendCard).toHaveBeenCalledTimes(2));
+    expect(adapter.updateCard).toHaveBeenCalledWith(
+      'msg_1',
+      expect.stringContaining('1/2'),
+      expect.any(Number),
+    );
+    expect(adapter.sendCard).toHaveBeenLastCalledWith(
+      'chat_1',
+      expect.objectContaining({ type: 'final', content: expect.stringContaining('2/2') }),
+      expect.any(Object),
+    );
+  });
 });
 
 describe('buildCLISessionCard', () => {

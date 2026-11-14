@@ -24,6 +24,8 @@ export interface TelegramAdapterConfig {
   token: string;
   allowedUsers?: string[];
   botName: string;
+  apiTimeoutMs?: number;
+  pollRequestTimeoutMs?: number;
 }
 
 interface TelegramApiResponse<T> {
@@ -123,6 +125,7 @@ export class TelegramAdapter implements PlatformAdapter {
   private identityController?: AbortController;
   private identityTimer?: ReturnType<typeof setTimeout>;
   private identityRetryMs = 1000;
+  private pollFailures = 0;
 
   constructor(config: TelegramAdapterConfig) {
     this.config = config;
@@ -136,6 +139,7 @@ export class TelegramAdapter implements PlatformAdapter {
     this.botUsername = undefined;
     this.botId = undefined;
     this.identityRetryMs = 1000;
+    this.pollFailures = 0;
     await this.lookupIdentity(generation);
     if (!this.isCurrentPoll(generation)) return;
     this.offset = this.readOffset();
@@ -168,6 +172,7 @@ export class TelegramAdapter implements PlatformAdapter {
 
   async disconnect(): Promise<void> {
     this.polling = false;
+    this.pollFailures = 0;
     this.pollGeneration += 1;
     this.pollController?.abort();
     this.pollController = undefined;
@@ -217,7 +222,18 @@ export class TelegramAdapter implements PlatformAdapter {
       };
     }
 
-    const result = await this.botApi<{ message_id?: number | string }>('sendMessage', payload, options);
+    let result: { message_id?: number | string };
+    try {
+      result = await this.botApi<{ message_id?: number | string }>('sendMessage', payload, options);
+    } catch (err) {
+      if (!content.plainText && (err as { status?: number })?.status === 400) {
+        const fallbackPayload: Record<string, unknown> = { ...payload, text };
+        delete fallbackPayload.parse_mode;
+        result = await this.botApi<{ message_id?: number | string }>('sendMessage', fallbackPayload, options);
+      } else {
+        throw err;
+      }
+    }
     throwIfAborted(options.signal);
 
     return String(result.message_id ?? '');
@@ -228,12 +244,25 @@ export class TelegramAdapter implements PlatformAdapter {
   }
 
   async editMessage(chatId: string, msgId: string, content: string): Promise<void> {
-    await this.botApi('editMessageText', {
-      chat_id: chatId,
-      message_id: msgId,
-      text: toTelegramMarkdownV2(content),
-      parse_mode: 'MarkdownV2',
-    });
+    try {
+      await this.botApi('editMessageText', {
+        chat_id: chatId,
+        message_id: msgId,
+        text: toTelegramMarkdownV2(content),
+        parse_mode: 'MarkdownV2',
+      });
+    } catch (err) {
+      if ((err as { status?: number })?.status !== 400) throw err;
+      try {
+        await this.botApi('editMessageText', {
+          chat_id: chatId,
+          message_id: msgId,
+          text: content,
+        });
+      } catch (fallbackErr) {
+        if ((fallbackErr as { status?: number })?.status !== 400) throw fallbackErr;
+      }
+    }
   }
 
   async deleteMessage(chatId: string, msgId: string): Promise<void> {
@@ -286,6 +315,7 @@ export class TelegramAdapter implements PlatformAdapter {
     const resp = await telegramFetch(
       `https://api.telegram.org/file/bot${this.config.token}/${file.file_path}`,
       { signal: options.signal },
+      60_000,
     );
     throwIfAborted(options.signal);
     if (!resp.ok) {
@@ -316,6 +346,7 @@ export class TelegramAdapter implements PlatformAdapter {
     if (!this.isCurrentPoll(generation) || this.pollController) return;
     const controller = new AbortController();
     this.pollController = controller;
+    let nextDelayMs = 1000;
 
     try {
       const updates = await this.botApi<TelegramUpdate[]>('getUpdates', {
@@ -323,6 +354,7 @@ export class TelegramAdapter implements PlatformAdapter {
         timeout: 50,
         allowed_updates: ['message', 'callback_query'],
       }, { signal: controller.signal });
+      this.pollFailures = 0;
 
       for (const update of updates) {
         if (!this.isCurrentPoll(generation)) return;
@@ -335,10 +367,14 @@ export class TelegramAdapter implements PlatformAdapter {
     } catch (err) {
       if (this.isCurrentPoll(generation) && !controller.signal.aborted) {
         console.error('Telegram polling failed:', safeErrorFields(err));
+        this.pollFailures += 1;
+        const status = (err as { status?: number })?.status;
+        const baseMs = status === 409 ? 5000 : 1000;
+        nextDelayMs = Math.min(baseMs * (2 ** (this.pollFailures - 1)), 30_000);
       }
     } finally {
       if (this.pollController === controller) this.pollController = undefined;
-      this.schedulePoll(1000, generation);
+      this.schedulePoll(nextDelayMs, generation);
     }
   }
 
@@ -381,7 +417,11 @@ export class TelegramAdapter implements PlatformAdapter {
             signal: options.signal,
           };
 
-    const resp = await telegramFetch(`https://api.telegram.org/bot${this.config.token}/${method}`, init);
+    const timeoutMs =
+      method === 'getUpdates'
+        ? (this.config.pollRequestTimeoutMs ?? 65_000)
+        : (this.config.apiTimeoutMs ?? 15_000);
+    const resp = await telegramFetch(`https://api.telegram.org/bot${this.config.token}/${method}`, init, timeoutMs);
     throwIfAborted(options.signal);
     let body: TelegramApiResponse<T>;
     try {
@@ -390,9 +430,8 @@ export class TelegramAdapter implements PlatformAdapter {
       throw new Error('Telegram returned an invalid response');
     }
     if (!resp.ok || !body.ok) {
-      throw new Error(
-        `Telegram ${method} failed: HTTP ${resp.status}`,
-      );
+      const status = typeof body.error_code === 'number' ? body.error_code : resp.status;
+      throw Object.assign(new Error(`Telegram ${method} failed: HTTP ${resp.status}`), { status });
     }
 
     return body.result as T;
@@ -549,13 +588,34 @@ function appendTelegramRoute(form: FormData, options: AbortableOptions): void {
   }
 }
 
-async function telegramFetch(url: string, options: RequestInit): Promise<Response> {
+async function telegramFetch(url: string, options: RequestInit, timeoutMs = 15_000): Promise<Response> {
+  const internalController = options.signal ? undefined : new AbortController();
+  const fetchOptions = internalController ? { ...options, signal: internalController.signal } : options;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let timedOut = false;
+
+  const timeoutPromise = timeoutMs > 0
+    ? new Promise<never>((_, reject) => {
+        timer = setTimeout(() => {
+          timedOut = true;
+          internalController?.abort();
+          reject(new Error('Telegram network request timed out'));
+        }, timeoutMs);
+        timer.unref?.();
+      })
+    : undefined;
+
   try {
-    return await fetch(url, options);
+    const fetchPromise = fetch(url, fetchOptions);
+    void fetchPromise.catch(() => undefined);
+    return timeoutPromise ? await Promise.race([fetchPromise, timeoutPromise]) : await fetchPromise;
   } catch (error) {
     // Preserve cancellation semantics, but never attach a URL-bearing cause.
     if (options.signal?.aborted) throw new DOMException('Operation aborted', 'AbortError');
+    if (timedOut) throw new Error('Telegram network request timed out');
     throw Object.assign(new Error('Telegram network request failed'), safeErrorFields(error));
+  } finally {
+    if (timer) clearTimeout(timer);
   }
 }
 

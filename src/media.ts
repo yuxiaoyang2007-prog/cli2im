@@ -80,7 +80,7 @@ export async function buildUserMessageForAgent(
     // blocks (which the model adapter rejects) and not as a bare "Attached
     // files" list (which the agent ignores). The download step above already
     // wrote each image to `attachment.localPath`.
-    if (agentName === 'zcode') {
+    if (agentName === 'zcode' || agentName === 'agy') {
       return { role: 'user', content: appendImageReadInstruction(text, attachments) };
     }
     return { role: 'user', content: contentText };

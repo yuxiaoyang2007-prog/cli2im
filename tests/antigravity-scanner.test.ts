@@ -96,4 +96,16 @@ describe('AntigravitySessionScanner', () => {
     expect(sessions).toHaveLength(1);
     expect(sessions[0]?.sessionId).toBe('new');
   });
+
+  it('stats all candidates and returns only top N newest across many conversations', async () => {
+    const agyDir = makeAntigravityDir();
+    for (let i = 0; i < 10; i++) {
+      await writeConversation(agyDir, `conv-${i}`, `request-${i}`);
+      await new Promise((r) => setTimeout(r, 5));
+    }
+
+    const sessions = await new AntigravitySessionScanner(agyDir).scan({ limit: 2 });
+
+    expect(sessions.map((s) => s.sessionId)).toEqual(['conv-9', 'conv-8']);
+  });
 });

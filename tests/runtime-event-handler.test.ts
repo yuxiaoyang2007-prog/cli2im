@@ -305,6 +305,53 @@ describe('createRuntimeEventHandler stale continuation guard', () => {
       rmSync(dir, { recursive: true, force: true });
     }
   });
+
+  it('extracts and sends [[file:...]] marker outputs across agents even without createdFiles', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'cli2im-event-marker-'));
+    try {
+      const reportPath = join(dir, 'summary.md');
+      writeFileSync(reportPath, '# Summary\nOK');
+      const adapter = adapterStub();
+      const relayToOtherBotsFn = vi.fn();
+      const store = {
+        getByKey: vi.fn(async () => ({
+          id: 's1',
+          key: sessionKey,
+          agentName: 'agy',
+          workingDirectory: dir,
+          state: 'active' as const,
+          createdAt: 0,
+          lastActiveAt: 0,
+        })),
+        updateAgentSessionId: vi.fn(async () => undefined),
+      };
+      const handler = createRuntimeEventHandler({
+        sessionKey,
+        store,
+        voiceSessions: new Map(),
+        adapter,
+        voiceResponseBuffer: { value: '' },
+        stopTyping: vi.fn(),
+        sendVoiceReply: vi.fn(),
+        relayDeps: { config: { bots: { sourcebot: { workingDirectory: dir } } } } as unknown as RelayDeps,
+        relayToOtherBotsFn,
+      });
+
+      const active = context(() => true);
+      await handler(sessionKey, { type: 'text', content: '已完成。[[file:summary.md]]' }, active);
+      await handler(sessionKey, { type: 'result', sessionId: 'ses_agy' }, active);
+
+      expect(adapter.send).toHaveBeenCalledWith('chat_1', { text: '已完成。' }, expect.any(Object));
+      expect(adapter.sendFile).toHaveBeenCalledTimes(1);
+      expect(adapter.sendFile).toHaveBeenCalledWith(
+        'chat_1',
+        expect.objectContaining({ name: 'summary.md' }),
+        expect.any(Object),
+      );
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });
 
 describe('F05 relay termination without model calls', () => {

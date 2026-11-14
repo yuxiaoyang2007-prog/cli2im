@@ -146,7 +146,7 @@ export function buildResumeCommand(agentName: string, sessionId: string): string
     case 'claude-code': return `claude --resume ${sessionId}`;
     case 'codex': return `codex resume ${sessionId}`;
     case 'gemini': return `gemini --resume ${sessionId}`;
-    case 'agy': return `agy --resume ${sessionId}`;
+    case 'agy': return `agy --conversation ${sessionId}`;
     default: throw new Error(UNSUPPORTED_HANDOFF);
   }
 }

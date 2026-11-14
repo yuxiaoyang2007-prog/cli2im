@@ -233,6 +233,31 @@ describe('HttpServer handoff validation', () => {
       await server.stop();
     }
   });
+
+  it('triggers config reload via authenticated POST /api/config/reload', async () => {
+    const reloadConfig = vi.fn().mockResolvedValue({
+      reloadedAt: 12345,
+      updatedBots: ['ccbot'],
+      warnings: [],
+    });
+    const server = new HttpServer('secret-token', deps({ reloadConfig }));
+    await server.start('127.0.0.1', 0);
+    try {
+      const address = (server as unknown as { server: { address: () => { port: number } } }).server.address();
+      const unauth = await fetch(`http://127.0.0.1:${address.port}/api/config/reload`, { method: 'POST' });
+      expect(unauth.status).toBe(401);
+
+      const auth = await fetch(`http://127.0.0.1:${address.port}/api/config/reload`, {
+        method: 'POST',
+        headers: { authorization: 'Bearer secret-token' },
+      });
+      expect(auth.status).toBe(200);
+      expect(await auth.json()).toEqual({ reloadedAt: 12345, updatedBots: ['ccbot'], warnings: [] });
+      expect(reloadConfig).toHaveBeenCalledTimes(1);
+    } finally {
+      await server.stop();
+    }
+  });
 });
 
 function deps(overrides: Partial<ConstructorParameters<typeof HttpServer>[1]> = {}): ConstructorParameters<typeof HttpServer>[1] {
