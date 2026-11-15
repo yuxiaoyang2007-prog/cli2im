@@ -26,7 +26,7 @@ export interface SpawnOpts {
    * conversation by agents that support an append hook (claude-code).
    */
   appendSystemPrompt?: string;
-  reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max';
+  reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';
   sandboxMode?: string;
   autoApprove?: boolean;
   turnTimeoutMs?: number;
@@ -61,6 +61,8 @@ export interface AgentPlugin {
   formatCancelMessage?(): string;
   /** Answers keyed by question text; an empty record means the user did not answer. */
   formatQuestionResponse?(requestId: string, answers: Record<string, string>): string;
+  /** Optional live model discovery (e.g. `agy models`) used by `/model` picker cards. */
+  listModels?(): Promise<string[]>;
   shutdown?(): Promise<void>;
   capabilities: AgentCapabilities;
 }
@@ -343,7 +345,7 @@ export interface BotConfig {
 export interface AgentConfig {
   binary: string;
   defaultModel?: string;
-  defaultEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max';
+  defaultEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';
   env?: Record<string, string>;
 }
 

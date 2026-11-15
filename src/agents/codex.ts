@@ -3,8 +3,8 @@ import { buildChildEnv } from '../security/child-env.js';
 import { canonicalPath } from '../runtime/execution-scope.js';
 import { contains } from '../isolation/policy.js';
 import { randomUUID } from 'node:crypto';
-import { mkdir, readdir, stat, writeFile } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
+import { mkdir, readdir, readFile, stat, writeFile } from 'node:fs/promises';
+import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Readable, Transform, Writable, type TransformCallback } from 'node:stream';
 import { formatAttachmentMetadataFields } from '../security/attachment-metadata.js';
@@ -261,10 +261,48 @@ export function shouldRetryFreshThread(err: unknown): boolean {
   return /resuming session with different model|no such session|is archived|unarchive|session not found/i.test(message);
 }
 
+/** Parse ~/.codex/models_cache.json, excluding hidden/unsupported entries and sorting by priority. */
+export function parseCodexModelsCache(raw: string): string[] {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return [];
+  }
+  const list = Array.isArray(parsed)
+    ? parsed
+    : (parsed && typeof parsed === 'object' && Array.isArray((parsed as { models?: unknown }).models)
+      ? (parsed as { models: unknown[] }).models
+      : []);
+  const visible = list
+    .filter((item): item is { slug: string; visibility?: string; supported_in_api?: boolean; priority?: number } =>
+      Boolean(item && typeof item === 'object' && typeof (item as { slug?: unknown }).slug === 'string')
+      && (item as { slug: string }).slug.trim().length > 0
+      && (item as { visibility?: unknown }).visibility !== 'hide'
+      && (item as { supported_in_api?: unknown }).supported_in_api !== false,
+    )
+    .map((item, idx) => ({
+      slug: item.slug.trim(),
+      priority: typeof item.priority === 'number' ? item.priority : Number.MAX_SAFE_INTEGER,
+      idx,
+    }))
+    .sort((a, b) => (a.priority - b.priority) || (a.idx - b.idx));
+  const seen = new Set<string>();
+  const result: string[] = [];
+  for (const entry of visible) {
+    if (!seen.has(entry.slug)) {
+      seen.add(entry.slug);
+      result.push(entry.slug);
+    }
+  }
+  return result;
+}
+
 export class CodexPlugin implements AgentPlugin {
   name = 'codex';
   displayName = 'Codex';
   private binary: string;
+  private readonly codexHomeDir?: string;
 
   capabilities: AgentCapabilities = {
     streamJson: false,
@@ -274,8 +312,19 @@ export class CodexPlugin implements AgentPlugin {
     slashCommands: [],
   };
 
-  constructor(binary: string) {
+  constructor(binary: string, codexHomeDir?: string) {
     this.binary = binary;
+    this.codexHomeDir = codexHomeDir;
+  }
+
+  async listModels(): Promise<string[]> {
+    const codexHome = this.codexHomeDir ?? process.env.CODEX_HOME ?? join(homedir(), '.codex');
+    try {
+      const raw = await readFile(join(codexHome, 'models_cache.json'), 'utf-8');
+      return parseCodexModelsCache(raw);
+    } catch {
+      return [];
+    }
   }
 
   async preflight(): Promise<{ ok: boolean; version?: string; error?: string }> {

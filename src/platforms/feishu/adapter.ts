@@ -578,17 +578,7 @@ export class FeishuAdapter implements PlatformAdapter {
           tag: 'markdown',
           content: card.content,
         },
-        ...(card.buttons?.map((btn) => ({
-          tag: 'action',
-          actions: [
-            {
-              tag: 'button',
-              text: { tag: 'plain_text', content: btn.text },
-              type: btn.type ?? 'default',
-              value: { action: btn.value },
-            },
-          ],
-        })) ?? []),
+        ...buildFeishuButtonElements(card),
       ],
       header: card.title
         ? {
@@ -598,6 +588,25 @@ export class FeishuAdapter implements PlatformAdapter {
         : undefined,
     };
   }
+}
+
+function buildFeishuButtonElements(card: CardPayload): object[] {
+  const buttons = card.buttons ?? [];
+  if (buttons.length === 0) return [];
+  const rowSize = (card.type === 'session_list' || card.type === 'question' || buttons.length <= 4) ? 1 : 3;
+  const rows: object[] = [];
+  for (let i = 0; i < buttons.length; i += rowSize) {
+    rows.push({
+      tag: 'action',
+      actions: buttons.slice(i, i + rowSize).map((btn) => ({
+        tag: 'button',
+        text: { tag: 'plain_text', content: btn.text },
+        type: btn.type ?? 'default',
+        value: { action: btn.value },
+      })),
+    });
+  }
+  return rows;
 }
 
 function asCallbackRecord(value: unknown): Record<string, unknown> {

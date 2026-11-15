@@ -1509,6 +1509,7 @@ export function createHandoffSpawnResume(
       botConfig, workingDirectory: workDir,
       env: { ...(botConfig.larkCliConfigDir ? { LARKSUITE_CLI_CONFIG_DIR: botConfig.larkCliConfigDir } : {}), ...resolveSenderEnv?.(sessionKey) },
       model: prefs.model,
+      reasoningEffort: prefs.effort,
       autoApprove: botConfig.autoApprove, sandboxMode: botConfig.sandboxMode,
       turnTimeoutMs: botConfig.turnTimeoutMs, idleTimeoutMs: botConfig.idleTimeoutMs,
     });

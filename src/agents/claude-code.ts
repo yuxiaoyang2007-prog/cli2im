@@ -1,4 +1,6 @@
+import { readdir, readFile, stat } from 'node:fs/promises';
 import { homedir } from 'node:os';
+import { join } from 'node:path';
 import { agentChildEnv, claudeCheckOptions } from '../isolation/check-options.js';
 import { allowedClaudeTool, claudeIsolationOptions } from '../isolation/claude.js';
 import { buildChildEnv } from '../security/child-env.js';
@@ -719,7 +721,7 @@ export class ClaudeCodeVirtualProcess implements AgentProcess {
       systemPrompt: appendSystemPrompt
         ? { type: 'preset', preset: 'claude_code', append: appendSystemPrompt }
         : this.opts.systemPrompt,
-      effort: this.opts.reasoningEffort,
+      effort: this.opts.reasoningEffort === 'ultra' ? 'max' : this.opts.reasoningEffort,
       pathToClaudeCodeExecutable: this.opts.isolation ? this.opts.isolation.binaryPath : this.binary,
       canUseTool: this.canUseTool,
       // Raw CLI diagnostics can contain prompts, paths, or credentials.
@@ -796,6 +798,34 @@ export class ClaudeCodeVirtualProcess implements AgentProcess {
   }
 }
 
+export function parseClaudeModelCatalog(raw: string): string[] {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return [];
+  }
+  const models = (parsed as { catalog?: { config?: { models?: unknown } } } | null)?.catalog?.config?.models;
+  if (!Array.isArray(models)) return [];
+  const mainIds: string[] = [];
+  const overflowIds: string[] = [];
+  const seen = new Set<string>();
+  for (const item of models) {
+    if (!item || typeof item !== 'object') continue;
+    const id = (item as { id?: unknown }).id;
+    if (typeof id !== 'string') continue;
+    const trimmed = id.trim();
+    if (!trimmed || seen.has(trimmed)) continue;
+    seen.add(trimmed);
+    if ((item as { section?: unknown }).section === 'main') {
+      mainIds.push(trimmed);
+    } else {
+      overflowIds.push(trimmed);
+    }
+  }
+  return [...mainIds, ...overflowIds];
+}
+
 export class ClaudeCodePlugin implements AgentPlugin {
   name = 'claude-code';
   displayName = 'Claude Code';
@@ -814,6 +844,26 @@ export class ClaudeCodePlugin implements AgentPlugin {
 
   constructor(binary: string, private readonly queryFn: ClaudeQueryFn = query) {
     this.binary = binary;
+  }
+
+  async listModels(catalogDir?: string): Promise<string[]> {
+    const dir = catalogDir ?? join(process.env.CLAUDE_CONFIG_DIR ?? join(homedir(), '.claude'), 'cache', 'model-catalog');
+    try {
+      const files = (await readdir(dir)).filter((name) => name.endsWith('.json'));
+      if (files.length === 0) return [];
+      const stats = await Promise.all(
+        files.map(async (name) => {
+          const filePath = join(dir, name);
+          const info = await stat(filePath);
+          return { filePath, mtimeMs: info.mtimeMs };
+        }),
+      );
+      stats.sort((a, b) => b.mtimeMs - a.mtimeMs);
+      const raw = await readFile(stats[0].filePath, 'utf-8');
+      return parseClaudeModelCatalog(raw);
+    } catch {
+      return [];
+    }
   }
 
   async preflight(): Promise<{ ok: boolean; version?: string; error?: string }> {

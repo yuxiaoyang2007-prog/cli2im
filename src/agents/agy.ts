@@ -1,6 +1,6 @@
 import { buildChildEnv } from '../security/child-env.js';
 import { getCli2imDataDir } from '../util/data-dir.js';
-import { execFileSync, spawn as spawnProcess, type ChildProcess } from 'node:child_process';
+import { execFile, execFileSync, spawn as spawnProcess, type ChildProcess } from 'node:child_process';
 import { EventEmitter } from 'node:events';
 import { randomUUID } from 'node:crypto';
 import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
@@ -27,6 +27,29 @@ const BARE_EFFORT_MODEL_PATTERN =
 export function agyModelSupportsEffortFlag(model?: string): boolean {
   if (!model) return false;
   return BARE_EFFORT_MODEL_PATTERN.test(model.trim());
+}
+
+const ANSI_ESCAPE_RE = /\x1b\[[0-9;]*[A-Za-z]/g;
+const AGY_MODEL_ROW_RE = /^([a-z0-9][a-z0-9._-]{2,55})(?:\t|\s{2,})\S+/i;
+const AGY_MODELS_CACHE_TTL_MS = 5 * 60_000;
+
+/** Parse model IDs printed by `agy models`, stripping spinner CR frames and ANSI sequences. */
+export function parseAgyModelsOutput(output: string): string[] {
+  const cleaned = output.replace(ANSI_ESCAPE_RE, '');
+  const seen = new Set<string>();
+  const models: string[] = [];
+  for (const rawLine of cleaned.split(/[\r\n]+/)) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    const match = AGY_MODEL_ROW_RE.exec(line);
+    if (!match) continue;
+    const id = match[1];
+    if (!seen.has(id)) {
+      seen.add(id);
+      models.push(id);
+    }
+  }
+  return models;
 }
 
 function messageToPrompt(message: UserMessage, imageDirectory: () => string): string {
@@ -92,7 +115,7 @@ export function buildAgyBaseArgs(opts: SpawnOpts, extraDirs: string[] = []): str
   }
 
   if (opts.reasoningEffort && agyModelSupportsEffortFlag(opts.model)) {
-    args.push('--effort', opts.reasoningEffort);
+    args.push('--effort', opts.reasoningEffort === 'ultra' ? 'max' : opts.reasoningEffort);
   }
 
   if (opts.turnTimeoutMs && opts.turnTimeoutMs > 0) {
@@ -547,6 +570,8 @@ export class AgyPlugin implements AgentPlugin {
   name = 'agy';
   displayName = 'Antigravity CLI';
   private binary: string;
+  private modelsCache?: { items: string[]; expiresAt: number };
+  private modelsInflight?: Promise<string[]>;
 
   capabilities: AgentCapabilities = {
     streamJson: true,
@@ -558,6 +583,38 @@ export class AgyPlugin implements AgentPlugin {
 
   constructor(binary: string) {
     this.binary = binary;
+  }
+
+  async listModels(): Promise<string[]> {
+    const now = Date.now();
+    if (this.modelsCache && this.modelsCache.expiresAt > now) {
+      return this.modelsCache.items;
+    }
+    if (this.modelsInflight) {
+      return this.modelsInflight;
+    }
+    const task = new Promise<string[]>((resolve) => {
+      execFile(
+        this.binary,
+        ['models'],
+        { timeout: 8000, encoding: 'utf-8', env: buildChildEnv('agy') },
+        (err, stdout) => {
+          if (err || !stdout) {
+            resolve([]);
+            return;
+          }
+          const items = parseAgyModelsOutput(stdout);
+          if (items.length > 0) {
+            this.modelsCache = { items, expiresAt: Date.now() + AGY_MODELS_CACHE_TTL_MS };
+          }
+          resolve(items);
+        },
+      );
+    }).finally(() => {
+      this.modelsInflight = undefined;
+    });
+    this.modelsInflight = task;
+    return task;
   }
 
   async preflight(): Promise<{ ok: boolean; version?: string; error?: string }> {

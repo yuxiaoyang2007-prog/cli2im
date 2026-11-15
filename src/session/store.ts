@@ -57,7 +57,7 @@ export interface RuntimePreferences {
   memoryPrincipal?: string;
   memoryGeneration?: number;
   model?: string;
-  effort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max';
+  effort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';
   recentDirectories?: string[];
   taskState?: 'running' | 'completed' | 'failed' | 'interrupted';
   taskUpdatedAt?: number;

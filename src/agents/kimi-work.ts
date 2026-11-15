@@ -77,7 +77,7 @@ function messageToText(message: UserMessage): string {
 }
 
 function thinkingLevel(value: SpawnOpts['reasoningEffort']): 'low' | 'high' | 'max' {
-  if (value === 'max' || value === 'xhigh') return 'max';
+  if (value === 'ultra' || value === 'max' || value === 'xhigh') return 'max';
   if (value === 'high' || value === 'medium') return 'high';
   return 'low';
 }

@@ -6,7 +6,7 @@ CLI Agent remote bridge — control CLI-based AI agents via IM (Feishu/Telegram)
 
 - `npm run dev` — run with tsx (development)
 - `npm run build` — esbuild bundle to `dist/` (including `dist/agents/*.js` for hot-reload)
-- `npm test` — run vitest (1736 tests across 118 test files)
+- `npm test` — run vitest (1743 tests across 118 test files)
 - `npm run typecheck` — TypeScript type check
 - `node dist/cli2im.js bots reload <bot>` — hot-reload a bot's agent plugin (`dist/agents/<agent>.js`) and reset idle processes without restarting other active bots
 - `node dist/cli2im.js config reload` — zero-downtime reload of `~/.cli2im/config.yaml` & `.env` via `POST /api/config/reload` (also triggered by `SIGHUP` or `/bots config-reload`)

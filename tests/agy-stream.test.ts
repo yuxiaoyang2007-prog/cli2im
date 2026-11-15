@@ -9,7 +9,12 @@ vi.mock('node:child_process', async (original) => ({
   spawn: mocks.spawn,
 }));
 
-import { AgyPlugin, AgyStreamParser, agyModelSupportsEffortFlag } from '../src/agents/agy.js';
+import {
+  AgyPlugin,
+  AgyStreamParser,
+  agyModelSupportsEffortFlag,
+  parseAgyModelsOutput,
+} from '../src/agents/agy.js';
 
 class MockChild extends EventEmitter {
   pid = 4242;
@@ -284,5 +289,22 @@ describe('AgyStreamParser & persistent multi-turn stream-json', () => {
       permissionMode: 'bypass',
       sandboxMode: 'danger-full-access',
     })).not.toContain('--sandbox');
+  });
+
+  it('parses agy models output including hydrogen models while ignoring spinner CR frames and ANSI codes', () => {
+    const sample = [
+      '\r⠋ Fetching available models...\r⠙ Fetching available models...\r\x1b[32mgemini-4-carbon-high\x1b[0m           Gemini 4 Carbon (High)',
+      'gemini-4-hydrogen-high\tGemini 4 Hydrogen (High)',
+      'gemini-4-hydrogen-xhigh\tGemini 4 Hydrogen (XHigh)',
+      'gemini-pro-orchestrator-argon  Orchestrator (Argon)',
+      'gemini-4-hydrogen-high         Gemini 4 Hydrogen (High)',
+    ].join('\n');
+
+    expect(parseAgyModelsOutput(sample)).toEqual([
+      'gemini-4-carbon-high',
+      'gemini-4-hydrogen-high',
+      'gemini-4-hydrogen-xhigh',
+      'gemini-pro-orchestrator-argon',
+    ]);
   });
 });

@@ -448,6 +448,32 @@ describe('FeishuAdapter file handling', () => {
     });
   });
 
+  it('groups more than 4 card buttons into rows of up to 3 actions', async () => {
+    const adapter = new FeishuAdapter({ appId: 'app', appSecret: 'secret', botName: 'bot' });
+    const client = larkMocks.clients[0];
+
+    await adapter.sendCard('oc_1', {
+      type: 'final',
+      title: '切换模型',
+      content: '选择模型',
+      buttons: [
+        { text: 'm1', value: 'model:m1' },
+        { text: 'm2', value: 'model:m2' },
+        { text: 'm3', value: 'model:m3' },
+        { text: 'm4', value: 'model:m4' },
+        { text: 'm5', value: 'model:m5' },
+      ],
+    });
+
+    const createMock = client.im.message.create as ReturnType<typeof vi.fn>;
+    const raw = createMock.mock.calls[0]?.[0]?.data.content as string;
+    const parsed = JSON.parse(raw) as { elements: Array<{ tag: string; actions?: unknown[] }> };
+    const actionRows = parsed.elements.filter((el) => el.tag === 'action');
+    expect(actionRows).toHaveLength(2);
+    expect(actionRows[0].actions).toHaveLength(3);
+    expect(actionRows[1].actions).toHaveLength(2);
+  });
+
   it('sends image paths as image messages and other paths as file messages', async () => {
     const adapter = new FeishuAdapter({ appId: 'app', appSecret: 'secret', botName: 'bot' });
     const client = larkMocks.clients[0];

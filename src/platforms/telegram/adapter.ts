@@ -215,11 +215,16 @@ export class TelegramAdapter implements PlatformAdapter {
         text: button.text,
         callback_data: button.value,
       }));
-      payload.reply_markup = {
-        inline_keyboard: content.card.type === 'session_list' || content.card.type === 'question'
-          ? mapped.map((b) => [b])
-          : [mapped],
-      };
+      const rowSize = (content.card.type === 'session_list' || content.card.type === 'question')
+        ? 1
+        : mapped.length <= 4
+          ? mapped.length
+          : 2;
+      const inlineKeyboard = Array.from(
+        { length: Math.ceil(mapped.length / rowSize) },
+        (_, idx) => mapped.slice(idx * rowSize, (idx + 1) * rowSize),
+      );
+      payload.reply_markup = { inline_keyboard: inlineKeyboard };
     }
 
     let result: { message_id?: number | string };

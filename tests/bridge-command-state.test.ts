@@ -1,7 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { mkdtemp, mkdir, realpath, rm } from 'node:fs/promises';
+import { mkdtemp, mkdir, realpath, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
+import { CodexPlugin, parseCodexModelsCache } from '../src/agents/codex.js';
+import { ClaudeCodePlugin, parseClaudeModelCatalog } from '../src/agents/claude-code.js';
 import { SessionStore } from '../src/session/store.js';
 import { handleBridgeCommand, createHandoffSpawnResume, startAgentProcessForSession } from '../src/index.js';
 import type { BotConfig, PlatformAdapter, SessionKey } from '../src/types.js';
@@ -221,5 +223,158 @@ describe('persisted bridge choices and session boundaries', () => {
     await store.updatePreferences(scope, { taskState: 'completed' });
     await run('effort', ['default']);
     expect((await store.getPreferences(scope)).effort).toBeUndefined();
+  });
+
+  it('includes hydrogen fallback presets and dynamic plugin listModels() results for agy /model', async () => {
+    const agyBot: BotConfig = { ...bot, agent: 'agy' };
+    await handleBridgeCommand(
+      { command: 'model', args: [] },
+      scope,
+      'bot',
+      'chat',
+      adapter,
+      store,
+      manager as never,
+      { releaseHandoff: vi.fn() } as never,
+      undefined,
+      undefined,
+      new Map(),
+      { fastModeBySession: new Map() },
+      agyBot,
+      { platform: 'telegram', chatType: 'private', userId: 'user' },
+    );
+    expect(vi.mocked(adapter.send)).toHaveBeenLastCalledWith('chat', {
+      card: expect.objectContaining({
+        title: '切换模型',
+        buttons: expect.arrayContaining([
+          expect.objectContaining({ value: 'model:gemini-4-hydrogen-xhigh' }),
+          expect.objectContaining({ value: 'model:gemini-4-hydrogen-high' }),
+          expect.objectContaining({ value: 'model:default' }),
+        ]),
+      }),
+    });
+
+    vi.mocked(manager.getPlugin).mockReturnValueOnce({
+      capabilities: { sessionResume: true },
+      listModels: vi.fn(async () => ['gemini-4-hydrogen-xhigh', 'gemini-5-preview']),
+    } as never);
+    await handleBridgeCommand(
+      { command: 'model', args: [] },
+      scope,
+      'bot',
+      'chat',
+      adapter,
+      store,
+      manager as never,
+      { releaseHandoff: vi.fn() } as never,
+      undefined,
+      undefined,
+      new Map(),
+      { fastModeBySession: new Map() },
+      agyBot,
+      { platform: 'telegram', chatType: 'private', userId: 'user' },
+    );
+    expect(vi.mocked(adapter.send)).toHaveBeenLastCalledWith('chat', {
+      card: expect.objectContaining({
+        title: '切换模型',
+        buttons: expect.arrayContaining([
+          expect.objectContaining({ value: 'model:gemini-4-hydrogen-xhigh' }),
+          expect.objectContaining({ value: 'model:gemini-5-preview' }),
+        ]),
+      }),
+    });
+  });
+
+  it('discovers codex models from models_cache.json excluding hidden/unsupported entries sorted by priority', async () => {
+    const sample = JSON.stringify({
+      models: [
+        { slug: 'gpt-6-luna', visibility: 'list', supported_in_api: true, priority: 6 },
+        { slug: 'gpt-reserve', visibility: 'hide', supported_in_api: true, priority: 5 },
+        { slug: 'codex-auto-review', visibility: 'hide', supported_in_api: true, priority: 10 },
+        { slug: 'gpt-legacy-off', visibility: 'list', supported_in_api: false, priority: 3 },
+        { slug: 'gpt-6-astra', visibility: 'list', supported_in_api: true, priority: 2 },
+        { slug: 'gpt-6.1-sol', visibility: 'list', supported_in_api: true, priority: 1 },
+      ],
+    });
+    expect(parseCodexModelsCache(sample)).toEqual(['gpt-6.1-sol', 'gpt-6-astra', 'gpt-6-luna']);
+
+    const codexHome = join(dir, 'codex-home');
+    await mkdir(codexHome, { recursive: true });
+    await writeFile(join(codexHome, 'models_cache.json'), sample, 'utf-8');
+    const plugin = new CodexPlugin('codex', codexHome);
+    expect(await plugin.listModels()).toEqual(['gpt-6.1-sol', 'gpt-6-astra', 'gpt-6-luna']);
+  });
+
+  it('discovers claude-code models from model-catalog json with main models before overflow', async () => {
+    const sample = JSON.stringify({
+      catalog: {
+        config: {
+          models: [
+            { id: 'claude-opus-4-8', section: 'overflow' },
+            { id: 'claude-opus-5-5', section: 'main' },
+            { id: 'claude-fable-5-2', section: 'main' },
+            { id: 'claude-sonnet-5-5', section: 'main' },
+            { id: 'claude-opus-5-5', section: 'overflow' },
+          ],
+        },
+      },
+    });
+    expect(parseClaudeModelCatalog(sample)).toEqual([
+      'claude-opus-5-5',
+      'claude-fable-5-2',
+      'claude-sonnet-5-5',
+      'claude-opus-4-8',
+    ]);
+
+    const catalogDir = join(dir, 'claude-catalog');
+    await mkdir(catalogDir, { recursive: true });
+    await writeFile(join(catalogDir, 'catalog.json'), sample, 'utf-8');
+    const plugin = new ClaudeCodePlugin('claude');
+    expect(await plugin.listModels(catalogDir)).toEqual([
+      'claude-opus-5-5',
+      'claude-fable-5-2',
+      'claude-sonnet-5-5',
+      'claude-opus-4-8',
+    ]);
+  });
+
+  it('includes reasoning effort buttons (including ultra) inside /model for codex and supports /model <model> [effort]', async () => {
+    await run('model', []);
+    expect(vi.mocked(adapter.send)).toHaveBeenLastCalledWith('chat', {
+      card: expect.objectContaining({
+        title: '切换模型',
+        buttons: expect.arrayContaining([
+          expect.objectContaining({ value: 'model:gpt-6.1-sol' }),
+          expect.objectContaining({ value: 'effort:low' }),
+          expect.objectContaining({ value: 'effort:xhigh' }),
+          expect.objectContaining({ value: 'effort:ultra' }),
+          expect.objectContaining({ value: 'effort:default' }),
+        ]),
+        rawElements: expect.arrayContaining([
+          expect.objectContaining({ tag: 'hr' }),
+          expect.objectContaining({ tag: 'markdown', content: expect.stringContaining('推理级别 (Effort)') }),
+        ]),
+      }),
+    });
+
+    await run('model', ['gpt-6.1-sol', 'ultra']);
+    const saved = await store.getPreferences(scope);
+    expect(saved.model).toBe('gpt-6.1-sol');
+    expect(saved.effort).toBe('ultra');
+    expect(vi.mocked(adapter.send)).toHaveBeenLastCalledWith('chat', {
+      text: expect.stringContaining('gpt-6.1-sol'),
+    });
+
+    await run('model', ['gpt-6-astra']);
+    expect((await store.getPreferences(scope)).model).toBe('gpt-6-astra');
+    expect(vi.mocked(adapter.send)).toHaveBeenLastCalledWith('chat', {
+      card: expect.objectContaining({
+        title: '模型已切换',
+        buttons: expect.arrayContaining([
+          expect.objectContaining({ value: 'effort:ultra' }),
+          expect.objectContaining({ value: 'effort:default' }),
+        ]),
+      }),
+    });
   });
 });

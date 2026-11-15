@@ -24,7 +24,7 @@ import { canAccessSession, getBotAccessRejection, isBotAdmin } from '../security
 import type { HandoffService } from '../services/handoff.js';
 import type { ChatQueue } from '../session/queue.js';
 import type { RuntimePreferences, SessionStore } from '../session/store.js';
-import type { BotConfig, PlatformAdapter, SessionKey } from '../types.js';
+import type { BotConfig, CardButton, PlatformAdapter, SessionKey } from '../types.js';
 import type { SessionProvenance } from '../isolation/provenance.js';
 
 export interface RuntimeCommandState {
@@ -643,38 +643,109 @@ export async function handleBridgeCommand(
 
     case 'model': {
       const model = cmd.args[0];
+      const effortLevels = getAgentEffortLevels(botConfig.agent);
       if (!model) {
         const prefs = await store.getPreferences(sessionKey);
+        const fastMode = runtimeState.fastModeBySession.get(sessionKey) ?? false;
         const selected = prefs.model ?? controls.defaultModel ?? 'AI 默认模型';
-        const candidates = buildModelCandidates(botConfig.agent, controls.defaultModel, prefs.model);
+        const effectiveEffort = fastMode ? 'low (fast)' : (prefs.effort ?? controls.defaultEffort ?? '默认');
+        const dynamicModels = await agentManager.getPlugin?.(botConfig.agent)?.listModels?.().catch(() => []);
+        const candidates = buildModelCandidates(botConfig.agent, controls.defaultModel, prefs.model, dynamicModels);
+        const modelButtons: CardButton[] = candidates.map((item) => ({
+          text: item === 'default'
+            ? (prefs.model ? '恢复默认' : '✓ 默认')
+            : item === prefs.model
+              ? `✓ ${item}`
+              : item,
+          value: `model:${item}`,
+          type: (item === prefs.model || (item === 'default' && !prefs.model)) ? 'primary' : 'default',
+        }));
+
+        if (effortLevels.length === 0) {
+          await adapter.send(chatId, {
+            card: {
+              type: 'final',
+              title: '切换模型',
+              content: `当前选择：**${selected}**${controls.defaultModel ? `\n默认配置：\`${controls.defaultModel}\`` : ''}\n点击下方按钮切换，或发送 \`/model <模型名>\`（\`/model default\` 恢复默认）。`,
+              buttons: modelButtons,
+            },
+          });
+          break;
+        }
+
+        const feishuEffortButtons = buildEffortButtons(effortLevels, prefs.effort, false);
+        const inlineEffortButtons = buildEffortButtons(effortLevels, prefs.effort, true);
+        const modelContent = [
+          `当前模型：**${selected}** ｜ 推理级别：**${effectiveEffort}**`,
+          ...(controls.defaultModel || controls.defaultEffort
+            ? [`默认配置：模型 \`${controls.defaultModel ?? 'CLI 默认'}\`${controls.defaultEffort ? ` ｜ 推理 \`${controls.defaultEffort}\`` : ''}`]
+            : []),
+          '点击下方按钮切换模型或推理级别，也可发送 `/model <模型名> [推理级别]`（`/model default` 恢复默认）。',
+        ].join('\n');
+
         await adapter.send(chatId, {
           card: {
             type: 'final',
             title: '切换模型',
-            content: `当前选择：**${selected}**${controls.defaultModel ? `\n默认配置：\`${controls.defaultModel}\`` : ''}\n点击下方按钮切换，或发送 \`/model <模型名>\`（\`/model default\` 恢复默认）。`,
-            buttons: candidates.map((item) => ({
-              text: item === 'default'
-                ? (prefs.model ? '恢复默认' : '✓ 默认')
-                : item === prefs.model
-                  ? `✓ ${item}`
-                  : item,
-              value: `model:${item}`,
-              type: (item === prefs.model || (item === 'default' && !prefs.model)) ? 'primary' : 'default',
-            })),
+            content: modelContent,
+            buttons: [...modelButtons, ...inlineEffortButtons],
+            rawElements: [
+              { tag: 'markdown', content: modelContent },
+              ...chunkActionButtons(modelButtons, 3),
+              { tag: 'hr' },
+              { tag: 'markdown', content: `**推理级别 (Effort)** · 当前：**${effectiveEffort}**` },
+              ...chunkActionButtons(feishuEffortButtons, 4),
+            ],
           },
         });
         break;
       }
+
       if (!/^[A-Za-z0-9][A-Za-z0-9_.:/\[\]-]{0,127}$/.test(model)) {
         await adapter.send(chatId, { text: '模型名格式无效' });
         break;
       }
-      if ((await store.getPreferences(sessionKey)).taskState === 'running') {
+      const rawEffort = cmd.args[1]?.toLowerCase();
+      if (rawEffort && rawEffort !== 'default' && !VALID_EFFORT_LEVELS.has(rawEffort)) {
+        await adapter.send(chatId, { text: '无效的推理级别，可选值：low、medium、high、xhigh、max、ultra、default' });
+        break;
+      }
+      const prefsBefore = await store.getPreferences(sessionKey);
+      if (prefsBefore.taskState === 'running') {
         await adapter.send(chatId, { text: '请等待当前任务完成，或先 /stop 再切换模型' });
         break;
       }
-      await store.updatePreferences(sessionKey, { model: model === 'default' ? undefined : model });
+      const patch: Partial<RuntimePreferences> = {
+        model: model === 'default' ? undefined : model,
+      };
+      if (rawEffort) {
+        patch.effort = rawEffort === 'default' ? undefined : rawEffort as RuntimePreferences['effort'];
+      }
+      await store.updatePreferences(sessionKey, patch);
+      if (rawEffort && rawEffort !== 'default') {
+        runtimeState.fastModeBySession.delete(sessionKey);
+      }
       agentManager.killAgent(sessionKey);
+
+      if (rawEffort) {
+        await adapter.send(chatId, {
+          text: `模型与推理级别已保存：模型=${model === 'default' ? '默认模型' : model}，推理=${rawEffort === 'default' ? '默认' : rawEffort}；下一条消息启动时使用。`,
+        });
+        break;
+      }
+      if (effortLevels.length > 0 && model !== 'default') {
+        const fastMode = runtimeState.fastModeBySession.get(sessionKey) ?? false;
+        const effectiveEffort = fastMode ? 'low (fast)' : (prefsBefore.effort ?? controls.defaultEffort ?? '默认');
+        await adapter.send(chatId, {
+          card: {
+            type: 'final',
+            title: '模型已切换',
+            content: `模型已保存为 **${model}**（当前推理级别：**${effectiveEffort}**）。\n如需顺手调整推理级别，可直接点击下方按钮（下一条消息生效）：`,
+            buttons: buildEffortButtons(effortLevels, prefsBefore.effort, false),
+          },
+        });
+        break;
+      }
       await adapter.send(chatId, {
         text: `模型选择已保存：${model === 'default' ? '默认模型' : model}；下一条消息启动时使用。模型是否可用由该 AI 服务确认。`,
       });
@@ -687,12 +758,16 @@ export async function handleBridgeCommand(
         const prefs = await store.getPreferences(sessionKey);
         const fastMode = runtimeState.fastModeBySession.get(sessionKey) ?? false;
         const effective = fastMode ? 'low (fast)' : (prefs.effort ?? controls.defaultEffort ?? '默认');
-        const levels = ['low', 'medium', 'high', 'xhigh', 'max', 'default'] as const;
+        const configuredLevels = getAgentEffortLevels(botConfig.agent);
+        const displayLevels = configuredLevels.length > 0
+          ? configuredLevels
+          : ['low', 'medium', 'high', 'xhigh', 'max'];
+        const levels = [...displayLevels, 'default'];
         await adapter.send(chatId, {
           card: {
             type: 'final',
             title: '切换推理强度 (Effort)',
-            content: `当前推理强度：**${effective}**${controls.defaultEffort ? `\n默认配置：\`${controls.defaultEffort}\`` : ''}\n点击下方按钮切换，或发送 \`/effort <low|medium|high|xhigh|max|default>\`。`,
+            content: `当前推理强度：**${effective}**${controls.defaultEffort ? `\n默认配置：\`${controls.defaultEffort}\`` : ''}\n点击下方按钮切换，或发送 \`/effort <${displayLevels.join('|')}|default>\`。`,
             buttons: levels.map((item) => ({
               text: item === 'default'
                 ? (prefs.effort ? '恢复默认' : '✓ 默认')
@@ -707,7 +782,7 @@ export async function handleBridgeCommand(
         break;
       }
       if (rawLevel !== 'default' && !VALID_EFFORT_LEVELS.has(rawLevel)) {
-        await adapter.send(chatId, { text: '无效的推理强度，可选值：low、medium、high、xhigh、max、default' });
+        await adapter.send(chatId, { text: '无效的推理强度，可选值：low、medium、high、xhigh、max、ultra、default' });
         break;
       }
       if ((await store.getPreferences(sessionKey)).taskState === 'running') {
@@ -732,18 +807,100 @@ export async function handleBridgeCommand(
   }
 }
 
-const VALID_EFFORT_LEVELS = new Set(['low', 'medium', 'high', 'xhigh', 'max']);
+const VALID_EFFORT_LEVELS = new Set(['low', 'medium', 'high', 'xhigh', 'max', 'ultra']);
+
+export function getAgentEffortLevels(agent: string): string[] {
+  switch (agent) {
+    case 'codex':
+      return ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'];
+    case 'claude-code':
+      return ['low', 'medium', 'high', 'xhigh', 'max'];
+    case 'kimi-work':
+      return ['low', 'medium', 'high', 'max'];
+    case 'agy':
+      return [];
+    default:
+      return ['low', 'medium', 'high', 'xhigh', 'max'];
+  }
+}
+
+function buildEffortButtons(
+  effortLevels: string[],
+  currentEffort: string | undefined,
+  prefixed: boolean,
+): CardButton[] {
+  return [...effortLevels, 'default'].map((item) => {
+    const isCurrent = item === 'default' ? !currentEffort : item === currentEffort;
+    const text = item === 'default'
+      ? (prefixed ? (isCurrent ? '✓ 推理: 默认' : '推理: 默认') : (isCurrent ? '✓ 默认级别' : '默认级别'))
+      : (prefixed ? (isCurrent ? `✓ 推理: ${item}` : `推理: ${item}`) : (isCurrent ? `✓ ${item}` : item));
+    return {
+      text,
+      value: `effort:${item}`,
+      type: isCurrent ? 'primary' : 'default',
+    };
+  });
+}
+
+function chunkActionButtons(buttons: CardButton[], rowSize: number): object[] {
+  const rows: object[] = [];
+  for (let i = 0; i < buttons.length; i += rowSize) {
+    rows.push({
+      tag: 'action',
+      actions: buttons.slice(i, i + rowSize).map((btn) => ({
+        tag: 'button',
+        text: { tag: 'plain_text', content: btn.text },
+        type: btn.type ?? 'default',
+        value: { action: btn.value },
+      })),
+    });
+  }
+  return rows;
+}
 
 const AGENT_MODEL_PRESETS: Record<string, string[]> = {
-  'claude-code': ['claude-opus-5-5[1m]', 'claude-opus-5-5', 'claude-sonnet-5-5', 'claude-haiku-4-5'],
-  codex: ['gpt-6-astra', 'gpt-5.4', 'gpt-5.3-codex', 'o3'],
+  'claude-code': [
+    'claude-opus-5-5[1m]',
+    'claude-opus-5-5',
+    'claude-fable-5-2',
+    'claude-sonnet-5-5',
+    'claude-haiku-5-5',
+  ],
+  codex: [
+    'gpt-6.1-sol',
+    'gpt-6-astra',
+    'gpt-6.1-terra',
+    'gpt-6-sol',
+    'gpt-6-luna',
+    'gpt-5.6-sol',
+    'gpt-5.6-terra',
+    'gpt-5.6-luna',
+  ],
   gemini: ['gemini-2.5-pro', 'gemini-2.5-flash'],
-  agy: ['gemini-4-argon-high', 'gemini-4-carbon-high', 'gemini-3.8-flash-high', 'claude-opus-5-5-high'],
+  agy: [
+    'gemini-4-hydrogen-xhigh',
+    'gemini-4-hydrogen-high',
+    'gemini-4-hydrogen-medium',
+    'gemini-4-hydrogen-low',
+    'gemini-4-argon-high',
+    'gemini-4-argon-medium',
+    'gemini-4-carbon-high',
+    'gemini-4-carbon-medium',
+    'gemini-pro-orchestrator',
+    'gemini-3.8-flash-high',
+    'claude-opus-5-5-high',
+    'claude-sonnet-5-5-high',
+  ],
   'kimi-work': ['k3-agent'],
   zcode: [],
 };
 
-function buildModelCandidates(agent: string, defaultModel?: string, currentModel?: string): string[] {
+export function buildModelCandidates(
+  agent: string,
+  defaultModel?: string,
+  currentModel?: string,
+  dynamicModels?: string[],
+): string[] {
   const seen = new Set<string>();
   const ordered: string[] = [];
   const push = (item?: string) => {
@@ -754,8 +911,11 @@ function buildModelCandidates(agent: string, defaultModel?: string, currentModel
   };
   push(currentModel);
   push(defaultModel);
-  for (const preset of AGENT_MODEL_PRESETS[agent] ?? []) {
-    push(preset);
+  const discovered = dynamicModels && dynamicModels.length > 0
+    ? dynamicModels
+    : (AGENT_MODEL_PRESETS[agent] ?? []);
+  for (const model of discovered) {
+    push(model);
   }
   ordered.push('default');
   return ordered;

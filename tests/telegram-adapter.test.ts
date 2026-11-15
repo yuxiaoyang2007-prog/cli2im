@@ -688,6 +688,39 @@ describe('TelegramAdapter', () => {
     expect((err as Error).message).toBe('Telegram network request timed out');
     expect((err as Error).message).not.toMatch(/TOKEN|api\.telegram/);
   });
+
+  it('chunks regular card inline buttons into rows of 2 when there are more than 4 buttons', async () => {
+    const adapter = new TelegramAdapter({ token: 'TOKEN', botName: 'testbot' });
+    const fetchMock = vi.mocked(fetch);
+    fetchMock.mockResolvedValueOnce(jsonResponse({ ok: true, result: { message_id: 301 } }));
+
+    await adapter.send('1001', {
+      card: {
+        type: 'final',
+        content: 'Pick a model',
+        buttons: [
+          { text: 'm1', value: 'model:m1' },
+          { text: 'm2', value: 'model:m2' },
+          { text: 'm3', value: 'model:m3' },
+          { text: 'm4', value: 'model:m4' },
+          { text: 'm5', value: 'model:m5' },
+        ],
+      },
+    });
+
+    const body = JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body));
+    expect(body.reply_markup.inline_keyboard).toEqual([
+      [
+        { text: 'm1', callback_data: 'model:m1' },
+        { text: 'm2', callback_data: 'model:m2' },
+      ],
+      [
+        { text: 'm3', callback_data: 'model:m3' },
+        { text: 'm4', callback_data: 'model:m4' },
+      ],
+      [{ text: 'm5', callback_data: 'model:m5' }],
+    ]);
+  });
 });
 
 function jsonResponse(body: unknown): Response {
